@@ -1,12 +1,14 @@
 ---
 name: market-wave
-description: Executable runbook for quoting a wave of newly incentivized Kalshi markets with the IMM (elections, politics, awards, the "after economic events" metals / FX / crypto ladders, any series) without getting picked off, and for sizing a wave over the $1 payout floor. End to end: detect the new programs (wave_detect.py), choose scope by fixed rules, pass the gates (pvd_waves.py preflight: guards, capacity, shard cash, scan budget), list on the default preset (add + run), start the dashboard, verify quoting (whydark), watch pick-offs, then report and ask what to tune. Use when a wave or batch of programs launches, an upcoming-wave notice arrives or Jack asks what's coming, Jack names series to quote fast, he invokes /market-wave, or the 24/7 wave check reports a wave. Also for a live wave's follow-ups: pacing under $1, "size them up", stopping markets under $1, why a market isn't quoting, "am I getting baited", pick-off / dark / relight alerts, cost-bucket size-ups, new periods, switch files, the post-mortem.
+description: >-
+  Executable runbook for quoting a wave of newly incentivized Kalshi markets with the IMM (elections, politics, awards, the "after economic events" metals / FX / crypto ladders, sports props such as the NFL LADDER / ESCALATOR waves, any series) without getting picked off, and for sizing a wave over the $1 payout floor. End to end: detect (wave_detect.py), choose scope, pass the gates (pvd_waves.py preflight), list on the default preset, start the dashboard, verify quoting, watch pick-offs, report and ask what to tune. Use when a wave or batch of programs launches (sports too: NFL / NBA / NHL / MLB / esports props, head-to-heads, MVPs), an upcoming-wave notice arrives or Jack asks what's coming, Jack names series to quote fast, he invokes /market-wave, or the 24/7 wave check reports a wave. Also for a live wave's follow-ups: pacing under $1, "size them up", why a market isn't quoting, "am I getting baited", pick-off / dark / relight alerts, new periods, switch files, the post-mortem.
 ---
 
 # Market wave runbook
 
 What taught it (details and numbers: `history.md` beside this file):
 
+- **9/24-10/20 NFL LADDER / ESCALATOR waves** (before the registry; the bot's sports family): 1,509 player-prop markets over 48 games, $694k listed; we took $7.2k of credits against -$1.1k of fills. A 400-lot bought at 40c against a 5c fair on a dislocated escalator book -> no player props without a fair. The inactives and the contracts' non-participation rules -> the cutoffs. Other makers diluted us within hours, and our bids were the losing side. Type E: section 16 and `sports.md`.
 - **11/04 post-vote election wave** and **11/06 2028 election wave** (1,827 programs; ~1,880 markets; first quotes 25 min after the ask).
 - **11/07-11/08 pick-offs** (Jack: "the pickoffs yesterday were unacceptable"): baited thin books took ~$2.9k on the House night; 53 adding fills ~$4.3k that day. Section 1.
 - **Two auto-listed overnight batches turned off** (w1107-mixed, w1108-mixed): the 5+-event rule, the info-risk screen, the gates.
@@ -17,7 +19,7 @@ What taught it (details and numbers: `history.md` beside this file):
 - **11/14 crypto after-events strikes (w1114-cryptoev):** quoting around the crypto fair; listed strikes had to behave like wave books; the size model overpromised (45 of 108); bank early at 1,500 a side took 230 -> 469 of 498 strikes to $1+; dropping banked strikes to 300 cut ~$1.4k -> ~$0.6k/day until Jack kept 1,500; then jump holds and restarts took about a third of its hours. Sections 10-12.
 - **11/15 one name across states, and the ladders' protections:** a taker bought Mark Kelly YES state by state (KXDPRESPRIMARY, 7 states in 80 s) -> the candidate breaker and the batched fast pull (736cc94). None of that reached the crypto / FX ladders -> the fair hold pull (a held coin's or pair's orders all at once) and a cross-event group for every wave series (2063782); the $1-floor check reads the bot's own fair (crypto: offs only). Sections 1.2, 11, 12.
 
-Background reading, only when time allows: memories `jack-working-style`, `imm-quoting-triage`, `market-wave-playbook`. Lookup tables (tools, list fields, bot knobs, deploy safety, gotchas): `reference.md` beside this file.
+Background reading, only when time allows: memories `jack-working-style`, `imm-quoting-triage`, `market-wave-playbook`. Lookup tables (tools, list fields, bot knobs, deploy safety, gotchas): `reference.md` beside this file. Sports (type E): `sports.md` beside this file.
 
 ---
 
@@ -46,11 +48,13 @@ Keep Jack posted with one line per step. Before the first tool call, say what li
 | **B. Short-window live-price ladders** | "after economic events" `KX*EVENT` strikes (metals, FX, crypto, yields): 1-2 day programs, thousands of strikes, settle on a feed price at one minute | 0-4, then 12 (the fair and dates BEFORE listing), then 5-11 and 13-15 | a fair is required before anything lists; bank early; the floor protocol | w1113-fxmetals, w1114-cryptoev |
 | **C. New period of a registry wave** (a relight) | the same series' programs restart | nothing by hand: pass 7 relists and retunes (section 14) | inherits the registry's CURRENT args -- including any size-up Jack made; say so in the report | 2028 relight 11/11 |
 | **D. Hand-named one-off** | Jack names a series or market | 0-8 on his word (it overrides FEW / CHECK; report the verdict anyway) | default | w1109-control |
+| **E. Sports** (game props, season props, esports) | player-stat ladders / escalators, head-to-heads and game markets listed 1-3 days before a game; season props and MVPs; settle on a box score or a decided round | 2 (detect), then `sports.md` section 4: a sports family quotes it (`MEMBER`) or it is Jack's call (`CHECK`); never on the wave list (the families carry the game clock and the news rules) | the family's own (NFL ladders 400 a side, auto families x3); changing it is Jack's word | NFL LADDER / ESCALATOR 9/24-10/20 (`sports.md` section 5) |
 
 **Known shapes run by default; a new shape is Jack's call** (Jack 2026-11-14: "yes for upcoming new shapes, notify me and it's my call so dont default to turning it on e.g. KXYTVIEWSHIGH. but default to running the wave for elections, after economic events, and things of similar shapes to what's been run on waves so far"):
 - **Type A:** auto mode lists the detector's FIT / NEAR series with 5+ events (its NEAR group included), and FIT / NEAR now need a KNOWN SHAPE: a Kalshi category Jack has run as waves and kept (`KNOWN_SHAPES` in `wave_detect.py`: Elections, Politics; the auto waves he turned off, w1107-mixed / w1108-mixed, don't count). Any other category that would be FIT / NEAR is `NEW`: held for him and TEXTED, never auto-listed (KXYTVIEWSHIGH: Entertainment, settles on charts.youtube.com). Adding a shape is his word: add the category to `KNOWN_SHAPES`.
 - **Type B relights itself:** the after-economic-events registry waves list each new batch of their own series in pass 7 (the detector calls those series LISTED): w1113-fxmetals with no stop cap, any time its programs run (Jack 11/14: "after-economic events can quote anytime not just when markets are shut, but need a fair value"), on `wave_fair.py`'s fair (its Friday close rolled each weekend; the weekday mode while FX and metals trade, section 12); w1114-cryptoev with no stop cap, gated by the bot's crypto fair. Nothing rests on a strike without a fair. Each relight starts on the wave's current args (bank-early, floor_auto, margins). A ladder no registry wave lists (yields, a new asset) is CHECK: Jack's call. Auto mode never creates a type B wave.
 - On 11/13 the metals came back FIT (Commodities) and only the auto run's own judgment kept them off a no-fair default listing: since 11/14 every `KX<asset>EVENT` ladder is LISTED (its wave relights it) or CHECK.
+- **Type E (sports) is never a known shape.** Sports is a risky category, so a sports series reads `MEMBER` or `CHECK`. `MEMBER`: a sports family in the bot quotes it on its own clock, fair and news rules (the ladder / escalator name pattern, the NFL and league auto families, the MLB MVPs). `CHECK`: Jack's call. Auto mode lists neither, and no sports series goes on the wave list, which has no kickoff clock, news hold or player fair (`sports.md`).
 
 **What the skill may do on its own (manual or auto mode):**
 - List FIT series on the `default` preset, and NEAR series as the wave's NEAR group (the 11/04 midterm treatment).
@@ -66,6 +70,7 @@ Keep Jack posted with one line per step. Before the first tool call, say what li
 - The `2028` preset.
 - Extra budget above +$100k (auto mode: never above +$50k).
 - Quoting SOON, CHECK, NEW or FEW series, an info-risk title, or a type B ladder outside its registry wave's own relight (a new asset, yields).
+- Anything that changes how a sports family quotes (type E): its size, its asks or cash switch, a cutoff, its fair or news gate, enrolling or cutting a series, quoting a `CHECK` sports series.
 - Adding a shape to `KNOWN_SHAPES` (a NEW shape he runs and wants by default from then on).
 - Lifting a market he turned off ("Keep them off", FX 11/14: don't re-offer the lift for that wave).
 - Removing a pick-off stand-down (a market pin or a series pin).
@@ -168,6 +173,7 @@ Keep Jack posted with one line per step. Before the first tool call, say what li
 - **One-event news risk isn't detected:** e.g. a pending appointment decides a nominee event (KXSENATENOM-TNR-28 waits on Blackburn's appointee: its 12 markets are pinned at 0 on w1111-statenom since 11/14, Jack's "Yes, do 1-5", until she names someone).
 - **A sweep's fills can trip a series stand-down hours later:** the pick-off watch's 6 h lookback flags a fill the first time its mark is 5c+ and $25+ against us, so three of the 11/12 sweep's fills crossing the bar as the books drifted pinned ALL of KXSENATENOM at 200 a side (01:30Z 11/13, a series trip), so his tiers stopped reaching the series until he lifted it on 11/14 ("Yes, do 1-5"; the per-market pins stayed). Removing a stand-down is his word.
 - **Heightened bait mode is dry; the wave dashboards' marks include our quotes.**
+- **Sports ladders outside the NFL have no fair.** The name pattern admits NBA / NHL / MLB / college ladders and escalators at the NFL size with only safe-join between them and the touch: the 10/03 failure mode. NFL single-game members fail closed while no ladders are listed. The sports families have no pick-off watch (`sports.md` section 7).
 
 ---
 
@@ -181,9 +187,9 @@ python wave_detect.py --since <ISO: 30 min before the first new program, or the 
 - **Per series:** markets, events, pool $/day, median horizon, days out, listed / quoted counts, median spread, category, title. Horizon = the EARLIER of `close_time` and `expected_expiration_time`.
 - **Verdicts, in order:**
   - `LISTED` / `QUOTED`: already handled. LISTED = on the list, or a series of an ENABLED registry wave whose stop cap hasn't passed (pass 7 lists its new periods; a relight after a gap says so in `why`). A wave Jack turned off no longer counts (its series are judged like any other).
-  - `MEMBER`: the bot's own family admits it; its gates decide (triage with `imm-quoting-triage`).
+  - `MEMBER`: the bot's own family admits it; its gates decide (triage with `imm-quoting-triage`; the sports families: `sports.md` section 2).
   - `FEW`: fewer than 5 events lit. Never listed or alerted.
-  - `CHECK`: Jack's call -- a high-info-risk category (Sports, Crypto, Financials, Climate and Weather, Economics), a mention series, an info-risk title (`INFO_RISK`), a known shape settling on a live feed (the bot's own `SCAN_LIVE_SOURCE_KEYWORDS`; Jack 09/24), an after-economic-events ladder no registry wave lists, or blocklisted.
+  - `CHECK`: Jack's call -- a high-info-risk category (Sports, Crypto, Financials, Climate and Weather, Economics), a mention series, an info-risk title (`INFO_RISK`), a known shape settling on a live feed (the bot's own `SCAN_LIVE_SOURCE_KEYWORDS`; Jack 09/24), an after-economic-events ladder no registry wave lists, or blocklisted. A sports `CHECK`: `sports.md` section 4.
   - `SOON`: settles within a day, or no date. Jack's call.
   - `NEAR`: settles in 1-14 days. Quotable as the NEAR group.
   - `NEW`: would be NEAR / FIT, but its category isn't a known shape (`KNOWN_SHAPES`): Jack's call, texted (its tags and any live-feed source in `why`; `dated` says which it would be), never auto-listed.
@@ -541,6 +547,21 @@ Kalshi's "after economic events" series: will gold / silver / copper, USD/JPY, E
 - **Fills and cash by price band;** open P&L by fill time.
 - **Update** the wave's memory file, `history.md`, and this runbook.
 
+## 16. Sports (type E)
+
+The playbook, the shapes, the bot's sports families and the worked example (the NFL LADDER / ESCALATOR waves, 9/24-10/20) are in `sports.md` beside this file. In brief:
+
+1. **A family or Jack, never the list.** A sports series reads `MEMBER`: its family's rules quote it, and you check that the family is fit for the batch (`sports.md` section 4). Or it reads `CHECK`: Jack's call, with the checklist there. Nothing sports goes on the wave list.
+2. **No fair, no player props.** The 10/03 Robinson escalator (6c to 45c overnight; 400 bought at 40c against a 5c fair) is what following the bare touch does on a prop book. NFL props have quoted inside `nfl_prop_fair`'s band since 10/04. No other league has a fair.
+3. **The clock is the league's schedule.**
+   - Cut off at the scheduled start, read from ESPN: Kalshi's dates run hours past kickoff.
+   - Out 90 min early where a player who never plays pays $0 (the fantasy ladder; the inactives post then).
+   - Season props are out while their league plays, and out for good once their round is decided.
+   - Nothing rests in-game.
+4. **News holds the whole team for 15 min, and a missing read stands the market aside.**
+5. **Cash comes before size.** A ladder ask locks ~95c a contract, so the family's asks follow shard 0's free cash ($3,500 on, $1,500 off). Baseball, basketball and tennis need shard-3 cash: without it the MLB MVPs rested nothing for two days.
+6. **Report each slate:** credits against fills at settlement value (props settle scalar), our share of Kalshi's pool, and paid against the estimate (escalators paid 1.6-1.7x the estimate). Expect other makers to dilute us within hours, and programs to stop without notice.
+
 ---
 
 ## Talking to Jack
@@ -554,7 +575,7 @@ Kalshi's "after economic events" series: will gold / silver / copper, USD/JPY, E
 - **Commits:** only on "commit". Quote him in commit messages and list notes.
 - **"What's coming?" / "any waves tomorrow?":** `wave_detect.py --upcoming --preflight` (no `--update-state`), then each window: when (ET), what would be greenlit, held for him (a NEW shape: say so) or relit, preflight now. Kalshi usually lists a start about a day ahead.
 
-## Open questions for Jack (as of 11/15; closed ones in `history.md`)
+## Open questions for Jack (as of 11/16; closed ones in `history.md`)
 
 1. 1c bid / 99c ask edges for crypto tail strikes worth under 1c (offered 11/14); ranking dark sides by $/day in the placement queue (offered 11/14).
 2. A wave-level loss stop (e.g. -$500 in an hour of pick-offs) in the bot.
@@ -565,3 +586,6 @@ Kalshi's "after economic events" series: will gold / silver / copper, USD/JPY, E
 7. KXYTVIEWSHIGH (YouTube highest daily views, 140 markets, $1,000/day, from 11/15 16:00Z): NEW, held; recommended off.
 8. USD/MXN's dark spells (Bitso's wide book refused twice 11/14-15): a second source, or accept them.
 9. A per-coin jump-hold trigger (HYPE held 30% of 11/14-15, BTC 8%): measure what the holds avoided first (offered 11/15).
+10. Non-NFL sports ladders / escalators (NBA, NHL, MLB, college) are admitted by name with no fair. Block those leagues until a fair exists? (`sports.md` section 7, gap 1)
+11. If the NFL ladder programs return: pull escalators 60 min before single-game kickoffs, put the sniper's data-gap guards into the IMM's gate, and lower the bid cap on reward-inflated books (`sports.md` section 5.4).
+12. NFL single-game members (H2H, auto game families) need the ladders' ESPN roster read, so with no ladders listed they rest nothing. Give them their own read? (`sports.md` section 7, gap 2)

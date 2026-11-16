@@ -2,6 +2,20 @@
 
 What each wave taught, with the numbers behind the runbook's rules (`SKILL.md` beside this file). Newest last. Memories with more detail: `imm-pickoffs-1107`, `market-wave-playbook`, `imm-statenom-sweep-1112`, `imm-fxmetals-wave-1113`, `imm-crypto-event-fair`, `imm-restart-diagnosis`.
 
+## 9/24-10/20: the NFL LADDER / ESCALATOR waves (before the registry)
+
+- **What:** Kalshi's per-game player props (ladders, escalators, fantasy ladders): 1,509 markets over 48 games of NFL Weeks 3-6, with $694k listed. The bot quoted them as a code family, allowlisted by name on 9/24, and Jack sized it up slate by slate (family x2 -> x5, then the hour part x3 -> x4, every hour).
+- **Result:** $7,248 of credits (escalators $4,280, ladders $2,188, fantasy $780) against -$1,148 of fills at settlement value (173,111 contracts). Net ~+$6.1k, about 1.0% of the pool. By slate (credits / fills): Week 4 (10/1-10/5) $4,146 / -$394; Week 5 (10/8-10/12) $2,801 / -$777.
+- **What it taught:**
+  - No player props without a fair: on 10/03 the Robinson escalator bid followed a dislocated book, and 400 were bought at 40c against a 5c fair (-$160).
+  - The contracts' non-participation clauses set the cutoffs.
+  - Other makers diluted our share within hours (10/06).
+  - Our bids lost 2.1c a contract while our asks made 0.3c.
+  - The last hour before a single prime-time game lost.
+  - The programs stopped without notice after 10/12.
+
+  Full account: `sports.md` section 5.
+
 ## 11/04-11/06: the first waves
 
 - **11/04 post-vote election wave:** ~5,300 programs, ~480 markets quoted (memory `imm-post-vote-dead-books`).
