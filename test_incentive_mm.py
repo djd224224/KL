@@ -45783,6 +45783,122 @@ class TestNationalNomineeFloor(unittest.TestCase):
         self.assertEqual(sum("! national nominee floor: read" in s for s in lines), 1, lines[-20:])
 
 
+class TestNameBidCap(unittest.TestCase):
+    """Jack 2026-11-16: "Bids-only $1.5k cap". A candidate's YES bids across
+    a per-state series' states cost at most NAME_BID_CAP_USD: the states with
+    the best modeled reward per $ keep theirs, the boundary state is trimmed
+    from its deepest rung, the rest rest no bid. Short-YES markets and asks
+    are untouched."""
+
+    def test_the_cap_keeps_the_best_states_and_trims_the_boundary(self):
+        q = imm.Quote
+        quotes = [
+            # Beshear's bids in three states: $4.00 + $4.00 + $2.00 = $10.00
+            q("KXDPRESPRIMARY-28KY-ABES", "bid", 10, 40),
+            q("KXDPRESPRIMARY-28AL-ABES", "bid", 4, 50),
+            q("KXDPRESPRIMARY-28AL-ABES", "bid", 2, 100),
+            q("KXDPRESPRIMARY-28CA-ABES", "bid", 2, 100),
+            # his asks, another name and a non-candidate market stand
+            q("KXDPRESPRIMARY-28KY-ABES", "ask", 14, 200),
+            q("KXDPRESPRIMARY-28KY-GNEW", "bid", 13, 50),
+            q("KXGOLDEVENT-26NOV1517-T390000", "bid", 40, 5000),
+        ]
+        # reward per $ of bids: CA 1.0/2 > KY 1.5/4 > AL 1.0/4
+        value = {"KXDPRESPRIMARY-28KY-ABES": 1.5, "KXDPRESPRIMARY-28AL-ABES": 1.0,
+                 "KXDPRESPRIMARY-28CA-ABES": 1.0}
+        out, rep = imm.name_bid_cap(quotes, value, set(), 7.0)
+        got = [(x.ticker.split("-", 1)[1], x.book_side, x.price_cents, x.count) for x in out]
+        # CA ($2) and KY ($4) whole; AL gets the last $1: its best rung (4c) 25 of 50,
+        # its 2c rung off; GNEW's $6.50 is its own name, under the cap
+        self.assertEqual(got, [
+            ("28KY-ABES", "bid", 10, 40), ("28AL-ABES", "bid", 4, 25),
+            ("28CA-ABES", "bid", 2, 100), ("28KY-ABES", "ask", 14, 200),
+            ("28KY-GNEW", "bid", 13, 50), ("26NOV1517-T390000", "bid", 40, 5000)])
+        self.assertEqual(rep, {("KXDPRESPRIMARY", "ABES"): {
+            "usd": 10.0, "kept_usd": 7.0, "states": 3, "kept": 2, "trimmed": 1,
+            "off": 0, "cut_ct": 125}})
+        # a tighter cap: the states past the budget rest no bid
+        out, rep = imm.name_bid_cap(quotes, value, set(), 2.0)
+        self.assertEqual([x.ticker for x in out if x.book_side == "bid" and "ABES" in x.ticker],
+                         ["KXDPRESPRIMARY-28CA-ABES"])
+        self.assertEqual((rep[("KXDPRESPRIMARY", "ABES")]["kept"],
+                          rep[("KXDPRESPRIMARY", "ABES")]["off"]), (1, 2))
+        # a short-YES market is left out: its bids buy the position back
+        out, rep = imm.name_bid_cap(quotes, value, {"KXDPRESPRIMARY-28KY-ABES"}, 5.0)
+        self.assertIn(q("KXDPRESPRIMARY-28KY-ABES", "bid", 10, 40), out)
+        self.assertEqual(rep[("KXDPRESPRIMARY", "ABES")]["usd"], 6.0)
+        # under the cap: nothing moves
+        self.assertEqual(imm.name_bid_cap(quotes, value, set(), 10.0), (quotes, {}))
+
+    def test_a_sub_penny_bid_costs_its_exact_price(self):
+        q = imm.Quote
+        quotes = [q("KXRPRESPRIMARY-28AL-TMAS", "bid", 2, 1000, price_exact=2.2),
+                  q("KXRPRESPRIMARY-28AK-TMAS", "bid", 2, 1000, price_exact=2.2)]
+        out, rep = imm.name_bid_cap(quotes, {}, set(), 30.0)
+        # $22 + $22, no modeled reward and the same cost: by ticker, AK whole, AL
+        # gets the last $8 = 363 at 2.2c
+        self.assertEqual([(x.ticker[-7:], x.count) for x in out], [("AL-TMAS", 363), ("AK-TMAS", 1000)])
+        self.assertEqual(rep[("KXRPRESPRIMARY", "TMAS")]["kept_usd"], 29.99)
+
+    def _cycle(self, mode, cap):
+        _clean_persist()
+        tickers = ("KXFOOPRIM-28AL-RDES", "KXFOOPRIM-28AK-RDES")
+
+        class _PrimClient(FakeClient):
+            def __init__(self_):
+                super().__init__()
+                now = datetime.now(timezone.utc)
+                start = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                end = (now + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                self_.programs = [
+                    {"market_ticker": t, "incentive_type": "liquidity",
+                     "period_reward": 7000000, "target_size_fp": "1000.00",
+                     "discount_factor_bps": 5000, "paid_out": False,
+                     "start_date": start, "end_date": end} for t in tickers]
+                self_.markets = {t: {
+                    "ticker": t, "event_ticker": t.rsplit("-", 1)[0], "status": "active",
+                    "close_time": far, "yes_bid_dollars": "0.1200",
+                    "yes_ask_dollars": "0.1300", "volume_fp": "3000.00"} for t in tickers}
+                self_.books = {t: {"orderbook_fp": {
+                    "yes_dollars": [["0.11", "2000"], ["0.12", "1500"]],
+                    "no_dollars": [["0.86", "2000"], ["0.87", "1500"]]}} for t in tickers}
+
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "NAME_BID_CAP_MODE", mode), \
+                mock.patch.object(imm, "NAME_BID_CAP_USD", cap), \
+                mock.patch.object(imm, "NATNOM_EVENTS", {}), \
+                mock.patch.object(imm, "LONE_REF_GUARD_MODE", "off"), \
+                mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
+            bot = IncentiveMarketMaker(client=_PrimClient(), live=False)
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+        bid_usd = sum(o["yes_price"] * o["remaining_count"] / 100.0
+                      for o in bot.state.sim_orders.values() if o["book_side"] == "bid")
+        asks = sum(o["remaining_count"] for o in bot.state.sim_orders.values()
+                   if o["book_side"] == "ask")
+        return bot, bid_usd, asks, lines
+
+    def test_the_cycle_rests_bids_within_the_cap(self):
+        _bot, full, asks_full, _l = self._cycle("off", 3.0)
+        self.assertGreater(full, 3.0)
+        _bot, capped, asks_cap, lines = self._cycle("on", 3.0)
+        self.assertLessEqual(capped, 3.0 + 1e-9)
+        self.assertGreater(capped, 0.0)
+        self.assertEqual(asks_cap, asks_full)
+        self.assertTrue(any("name bid cap KXFOOPRIM RDES: bids $" in s for s in lines),
+                        [s for s in lines if "bid cap" in s])
+        _bot, dry, _a, lines = self._cycle("dry", 3.0)
+        self.assertEqual(dry, full)
+        self.assertTrue(any("name bid cap (dry) KXFOOPRIM RDES" in s for s in lines))
+
+
 class TestOscarsWinnersBand(unittest.TestCase):
     """OSCARS 1-99c (Jack 2026-11-13: "be open to quoting oscars when they
     launch KXOSCARS-EDIT27, KXOSCARS-SOUND27, etc"): the KXOSCARS winners

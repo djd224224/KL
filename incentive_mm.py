@@ -15018,6 +15018,8 @@ _CONFIG_CODE_KNOBS = (
     # the national nominee floor on state-primary asks (2026-11-16)
     "NATNOM_FLOOR_MODE", "NATNOM_EVENTS", "NATNOM_FLOOR_ADJ_C", "NATNOM_TTL_SECS",
     "NATNOM_NAMES_TTL_SECS",
+    # the name bid cap across a per-state series' states (2026-11-16)
+    "NAME_BID_CAP_MODE", "NAME_BID_CAP_USD",
     # heightened bait mode, dry (2026-11-13)
     "HEIGHTENED_MODE", "HEIGHTENED_FLASH_MAX_SECS", "HEIGHTENED_MIN_C",
     "HEIGHTENED_WINDOW_MIN", "HEIGHTENED_PULLS", "HEIGHTENED_HOLD_MIN",
@@ -26793,6 +26795,119 @@ def natnom_ask_floor(ticker: str, names: Dict[str, str],
     return float(p[1]) + adj, p[0], float(p[1])
 
 
+# NAME BID CAP (Jack 2026-11-16: "Bids-only $1.5k cap", after a what-if on the
+# 2028 state primaries).
+#
+# The risk: a candidate's YES bids rest in every state of a per-state series
+# (cand_key_of). On 11/16, before the cap:
+#   * Beshear had $7.2k of bids (146,566 contracts at 1-10c in 51 states);
+#     Shapiro $7.0k, Harris $6.5k, Massie $5.8k.
+#   * A dropout sends every state to ~0 at once, and no breaker outruns that.
+#
+# The rule: per (series, name), our resting YES bids cost at most
+# NAME_BID_CAP_USD (price x contracts, pads included).
+#   * Over the cap, the states keep their bids in order of the market's
+#     modeled reward per $ of bids (est_dollars_per_day / bid $, cheaper
+#     first on a tie).
+#   * The state that crosses the line is trimmed from its deepest rung up;
+#     the states after it rest no bid.
+#   * A market where we are SHORT YES is left out: its bids buy the position
+#     back.
+#   * Asks are untouched.
+#   * It runs on the whole cycle's `desired`, after every filter, right
+#     before the diff.
+#
+# What-if on the 17:47Z books: 17 names over $1.5k; ~973k contracts cut,
+# almost all 1-4c long-shot bids; -$45/day of the series' ~$630/day modeled
+# reward.
+#
+# Knobs:
+#   * IMM_NAME_BID_CAP: "on" (default), "dry" (logged, nothing cut), "off".
+#   * IMM_NAME_BID_CAP_USD: the cap, default 1500.
+NAME_BID_CAP_MODE = os.environ.get("IMM_NAME_BID_CAP", "on").strip().lower()
+if NAME_BID_CAP_MODE not in ("on", "dry", "off"):
+    NAME_BID_CAP_MODE = "on"
+NAME_BID_CAP_USD = max(0.0, _env_float("IMM_NAME_BID_CAP_USD", 1500.0))
+
+
+def name_bid_cap(quotes: List["Quote"], value_per_day: Dict[str, float],
+                 exempt: Set[str], cap_usd: float
+                 ) -> Tuple[List["Quote"], Dict[Tuple[str, str], dict]]:
+    """THE NAME BID CAP on a cycle's quotes.
+
+    Inputs:
+      * `value_per_day`: ticker -> modeled reward $/day.
+      * `exempt`: tickers left out (short YES).
+
+    Returns (quotes, report). In the quotes, the YES bids of every
+    (series, name) whose bids cost over `cap_usd` are cut to fit; every other
+    quote is kept as is, in order. The report is keyed by (series, name) for
+    each capped name:
+    {usd, kept_usd, states, kept, trimmed, off, cut_ct}."""
+    def px(q: "Quote") -> float:
+        return float(q.price_exact if q.price_exact is not None else q.price_cents)
+
+    groups: Dict[Tuple[str, str], Dict[str, List[int]]] = {}
+    for i, q in enumerate(quotes):
+        if q.book_side != "bid" or q.ticker in exempt:
+            continue
+        k = cand_key_of(q.ticker)
+        if k is not None:
+            groups.setdefault(k, {}).setdefault(q.ticker, []).append(i)
+    new: Dict[int, Optional["Quote"]] = {}
+    report: Dict[Tuple[str, str], dict] = {}
+    for k, by_t in groups.items():
+        cost = {t: sum(px(quotes[i]) * quotes[i].count for i in idx) / 100.0
+                for t, idx in by_t.items()}
+        total = sum(cost.values())
+        if total <= cap_usd + 1e-9:
+            continue
+        order = sorted(by_t, key=lambda t: (
+            -(float(value_per_day.get(t) or 0.0) / cost[t]) if cost[t] > 0 else 0.0,
+            cost[t], t))
+        left = float(cap_usd)
+        kept = trimmed = off = 0
+        cut_ct = 0
+        for t in order:
+            n_keep = 0
+            part = False
+            for i in sorted(by_t[t], key=lambda i: -px(quotes[i])):   # best rung first
+                q = quotes[i]
+                c = px(q) * q.count / 100.0
+                if c <= left + 1e-9:
+                    left -= c
+                    n_keep += 1
+                    continue
+                n = int(math.floor(left * 100.0 / px(q) + 1e-9)) if px(q) > 0 else 0
+                if n >= 1:
+                    new[i] = replace(q, count=n)
+                    left -= n * px(q) / 100.0
+                    n_keep += 1
+                else:
+                    new[i] = None
+                part = True
+                cut_ct += int(q.count) - max(n, 0)
+            if n_keep == 0:
+                off += 1
+            elif part:
+                trimmed += 1
+            else:
+                kept += 1
+        report[k] = {"usd": round(total, 2), "kept_usd": round(cap_usd - left, 2),
+                     "states": len(by_t), "kept": kept, "trimmed": trimmed,
+                     "off": off, "cut_ct": cut_ct}
+    if not new:
+        return quotes, report
+    out = []
+    for i, q in enumerate(quotes):
+        if i in new:
+            if new[i] is not None:
+                out.append(new[i])
+        else:
+            out.append(q)
+    return out, report
+
+
 def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
                       easier: List[Tuple[List[List[float]], List[List[float]]]],
                       harder: List[Tuple[List[List[float]], List[List[float]]]],
@@ -28849,6 +28964,8 @@ class IncentiveMarketMaker:
         self._natnom_missing: Dict[str, Set[str]] = {}
         self._natnom_noted: Dict[str, tuple] = {}
         self._natnom_summary: Optional[tuple] = None
+        # NAME BID CAP: (series, name) -> (kept, trimmed, off) last logged
+        self._namecap_noted: Dict[Tuple[str, str], tuple] = {}
         # a flip-through entry's (bid, ask) rung as the quote loop sized it this
         # cycle (pvd_side_sizes on the position it judged) -- place_with_caps'
         # side cap reads it, so a 400 ask beside a long 200 isn't "blocked at 0/200"
@@ -37849,6 +37966,48 @@ class IncentiveMarketMaker:
                 "side": side, "from": a, "to": b, "cap": cap, "floor": floor,
                 "sibs": len(sibs), "books": n_books})
 
+    # ---- name bid cap (2026-11-16, NAME_BID_CAP_MODE) ------------------------
+
+    def _name_bid_cap(self, desired: List["Quote"], managed: Dict[str, "MarketMeta"],
+                      now_ts: float) -> List["Quote"]:
+        """THE NAME BID CAP on the cycle's `desired` (name_bid_cap): states
+        ranked by their modeled reward per $ of bids, the bot's short-YES
+        markets left out. "dry" logs what it would cut and returns `desired`
+        as is. A name is logged (and sunk, name_bid_cap_<date>.jsonl) when
+        its kept / trimmed / off state count changes, and "clear" once it is
+        under the cap. Never raises: a failure leaves `desired` as is
+        (logged once)."""
+        try:
+            short = {t for t, p in self.pnl.pos.items() if p < -1e-9}
+            value = {t: float(getattr(m, "est_dollars_per_day", 0.0) or 0.0)
+                     for t, m in managed.items()}
+            out, rep = name_bid_cap(desired, value, short, NAME_BID_CAP_USD)
+            tag = "" if NAME_BID_CAP_MODE == "on" else " (dry)"
+            for k in sorted(set(self._namecap_noted) - set(rep)):
+                self._namecap_noted.pop(k, None)
+                log(f"{self.tag} name bid cap{tag} {k[0]} {k[1]}: clear (bids under "
+                    f"${NAME_BID_CAP_USD:,.0f})")
+            for k, r in sorted(rep.items()):
+                key = (r["kept"], r["trimmed"], r["off"])
+                if self._namecap_noted.get(k) == key:
+                    continue
+                self._namecap_noted[k] = key
+                log(f"{self.tag} name bid cap{tag} {k[0]} {k[1]}: bids ${r['usd']:,.0f} in "
+                    f"{r['states']} state(s) over ${NAME_BID_CAP_USD:,.0f} -> {r['kept']} "
+                    f"state(s) keep theirs, {r['trimmed']} trimmed, {r['off']} rest no bid "
+                    f"(${r['kept_usd']:,.0f} kept, {r['cut_ct']:,} contracts cut; best "
+                    f"reward per $ first)")
+                self._sink("name_bid_cap", dict(
+                    {"ts": round(now_ts, 3), "mode": NAME_BID_CAP_MODE, "series": k[0],
+                     "name": k[1], "cap": NAME_BID_CAP_USD}, **r))
+            return out if NAME_BID_CAP_MODE == "on" else desired
+        except Exception as e:  # noqa: BLE001 -- a guard's failure never costs the cycle
+            if not getattr(self, "_namecap_err_logged", False):
+                self._namecap_err_logged = True
+                log(f"{self.tag} ! name bid cap failed ({e!r}); the cycle's bids rest "
+                    f"as built (logged once)")
+            return desired
+
     # ---- national nominee floor (2026-11-16, NATNOM_FLOOR_MODE) --------------
 
     def _natnom_refresh(self, now_ts: float, force: bool = False) -> None:
@@ -44620,6 +44779,10 @@ class IncentiveMarketMaker:
         # 2026-11-15): a hold that began after its gate read the strike
         if FAIR_HOLD_PULL and self._fair_holds(now_ts):
             desired = [q for q in desired if not self.fair_held(q.ticker, now_ts)]
+        # NAME BID CAP (NAME_BID_CAP_MODE, 2026-11-16): a candidate's YES bids
+        # across a per-state series' states cost at most NAME_BID_CAP_USD
+        if NAME_BID_CAP_MODE in ("on", "dry"):
+            desired = self._name_bid_cap(desired, managed, now_ts)
 
         # Fast tick: non-fast managed markets built no `desired` this tick —
         # preserve their resting orders through the diff or it would cancel
@@ -48295,6 +48458,14 @@ class IncentiveMarketMaker:
                + ("" if NATNOM_FLOOR_MODE == "on" else " (dry: logged, nothing re-priced)")
                if NATNOM_FLOOR_MODE in ("on", "dry") and NATNOM_EVENTS
                else " (IMM_NATNOM_FLOOR=off)"))
+        log(f"name bid cap (2026-11-16): {NAME_BID_CAP_MODE}"
+            + (f" -- a candidate's YES bids across a per-state series' states (KXDPRESPRIMARY-"
+               f"28AK-MKEL shape) cost at most ${NAME_BID_CAP_USD:,.0f}; over it the states "
+               f"with the best modeled reward per $ keep theirs, the boundary state is "
+               f"trimmed from its deepest rung, the rest rest no bid; short-YES markets left "
+               f"out; asks untouched"
+               + ("" if NAME_BID_CAP_MODE == "on" else " (dry: logged, nothing cut)")
+               if NAME_BID_CAP_MODE in ("on", "dry") else " (IMM_NAME_BID_CAP=off)"))
         log(f"unwind-only waves scope (2026-11-08): "
             + ("existing waves -- UNWIND_ONLY_WAVES covers the waves listed before the switch "
                "file appeared; a wave added after it quotes as usual"
