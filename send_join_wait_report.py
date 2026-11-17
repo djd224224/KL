@@ -21,7 +21,24 @@ ONE EMAIL per ET day, ending in OK / WATCH / PROBLEM:
   reward    what the waits gave up: on every managed book snapshot of a
             waiting side, our top rung moved to the wanted price and scored
             with the bot's own share model against the book as it was
-  net       kept out + better - reward, for the day and running since launch
+  net       kept out + better - reward, for the day, the last 7 days (the
+            PROBLEM bar) and running since launch
+
+THE SCORING FIXES (Jack 2026-11-17: "Yes, fix the report", to "Fix the
+join-wait report's scoring?"). The 11/16 email read PROBLEM on a quiet day
+(-$2.39) because:
+  - the PROBLEM bar was the net SINCE LAUNCH. Election night alone (11/03,
+    -$156) kept it under -$50 every day from 11/09. It is now the net of the
+    last 7 days, so a bad stretch clears after a week.
+  - a day's tape read cut short by its time budget stayed in the store as it
+    was. 11/14 was stored at -$203. Its read stopped partway through the
+    alphabet, past one -$143 AUDUSD miss and before a +$229 KXLOWTPERIOD save;
+    read in full on 11/17 it came to +$93. Each run now reads again any stored
+    day of the last RESCORE_MAX_AGE_DAYS whose read did not finish (up to
+    RESCORE_MAX_DAYS a run, newest first) and keeps the new numbers once that
+    read finishes.
+  - the read went through markets in ticker order. It now starts with the
+    markets that had the most $ at risk on their waits.
 
 SOURCES, all read-only: the bot's join_wait_<UTC date>.jsonl sink and day logs
 (the hold lines' numbers, the startup mode line, "join wait failed" errors),
@@ -38,6 +55,7 @@ USAGE:
   python send_join_wait_report.py --test            # send now, ignore the marker
   python send_join_wait_report.py --day 2026-11-03  # a specific ET day
   python send_join_wait_report.py --no-tape         # skip the Kalshi reads
+  python send_join_wait_report.py --no-rescore      # skip re-reading cut-short days
 Scheduled daily as "KL imm join-wait" (register_imm_join_wait.ps1), 08:20 local.
 Sends every morning, so a quiet day is distinguishable from a broken task.
 All console output is ASCII (the task console is cp1252).
@@ -68,8 +86,10 @@ COST_WATCH = 5.0                # ~3.5x the replay's reward cost
 COST_PROBLEM = 15.0             # ~10x
 KEPT_OUT_GOOD_WATCH = 25.0      # profits the waits kept us out of
 DAY_NET_WATCH = -10.0
-RUN_NET_PROBLEM = -50.0         # the running net once RUN_MIN_DAYS have passed
-RUN_MIN_DAYS = 7
+WEEK_NET_PROBLEM = -50.0        # the net of the last WEEK_DAYS stored days
+WEEK_DAYS = 7
+RESCORE_MAX_AGE_DAYS = 14       # re-read a cut-short day's tape for this long
+RESCORE_MAX_DAYS = 2            # at most this many re-reads a run (each up to TAPE_BUDGET_SECS)
 LONG_WAIT_WATCH_SECS = 2 * 3600  # one side behind a better price this long
 FLAP_WATCH = 30                 # one side waiting this many times in a day
 LEVELS = ("OK", "WATCH", "PROBLEM")
@@ -309,9 +329,18 @@ def _trades(t: str, a: float, b: float) -> list:
             return trades
 
 
+def at_risk(e: dict) -> float:
+    """A wait's $ at risk: its hold line's, else size x the gap to where it
+    rested (a re-read skips the day logs)."""
+    v = e.get("at_risk")
+    return float(v) if v is not None else e["size"] * abs(e["want"] - e["rest"]) / 100.0
+
+
 def kept_out(eps: list, fills: list, mids: dict) -> dict:
     """The fills the waits kept us out of, from one public trades read per
-    market, marked to the current mid. saved = -(what they would have made)."""
+    market, marked to the current mid. saved = -(what they would have made).
+    The markets with the most $ at risk on their waits are read first, so a
+    read cut short by its time budget misses the smallest ones."""
     by_t = defaultdict(list)
     for e in eps:
         by_t[e["ticker"]].append(e)
@@ -320,7 +349,8 @@ def kept_out(eps: list, fills: list, mids: dict) -> dict:
         ours[(f["ticker"], f["our_book_side"])].append(float(f["ts"]))
     res = dict(trades=0, contracts=0.0, saved=0.0, good=0.0, top=[], done=True)
     stop = time.time() + TAPE_BUDGET_SECS
-    for t, es in sorted(by_t.items()):
+    order = sorted(by_t.items(), key=lambda kv: (-sum(at_risk(e) for e in kv[1]), kv[0]))
+    for t, es in order:
         if time.time() > stop:
             res["done"] = False
             break
@@ -382,6 +412,49 @@ def save_store(data: dict) -> None:
     os.replace(tmp, store_path())
 
 
+def rescore_cut_short(store: dict, skip_day: str, now: datetime) -> list:
+    """Read the public trades again for each stored day whose read did not
+    finish (cut short by its time budget, or never run), at most
+    RESCORE_MAX_DAYS of them, newest first, from the last RESCORE_MAX_AGE_DAYS.
+    Once a read finishes, the day takes its kept-out numbers and its net;
+    reward and better fills stay as stored (the book snapshots behind the
+    reward may be gone by now). Returns (day, old net, new net, finished) for
+    each day it read, and updates `store` in place."""
+    oldest = (now.astimezone(imm.ET).date() - timedelta(days=RESCORE_MAX_AGE_DAYS)).isoformat()
+    due = sorted((k for k, v in store.items()
+                  if k != skip_day and k >= oldest
+                  and not (v.get("tape_read") and v.get("tape_done"))), reverse=True)
+    out = []
+    for k in due[:RESCORE_MAX_DAYS]:
+        v = store[k]
+        a_ts, b_ts = float(v["a_ts"]), float(v["b_ts"])
+        eps = episodes(sink_rows(a_ts, b_ts), a_ts, b_ts)
+        kept = kept_out(eps, slr.maker_fills(a_ts, b_ts), {}) if eps else \
+            dict(trades=0, contracts=0.0, saved=0.0, good=0.0, done=True)
+        old = float(v.get("net", 0.0))
+        if kept["done"]:
+            v.update(saved=kept["saved"], good=kept["good"], kept_trades=kept["trades"],
+                     kept_contracts=kept["contracts"], tape_read=True, tape_done=True,
+                     rescored=now.isoformat())
+            v["net"] = v["saved"] + v.get("better", 0.0) - v.get("cost", 0.0)
+        log(f"join-wait report: re-read {k}'s public trades "
+            f"({'finished' if kept['done'] else 'cut short again; kept as stored'}): "
+            f"net {money(old)} -> {money(v['net'])}")
+        out.append((k, old, float(v["net"]), bool(kept["done"])))
+    return out
+
+
+def window(store: dict, day: str, n: int = WEEK_DAYS) -> dict:
+    """The stored days in the n days ending on `day`: their net and count."""
+    first = (datetime.strptime(day, "%Y-%m-%d").date() - timedelta(days=n - 1)).isoformat()
+    ks = sorted(k for k in store if first <= k <= day)
+    return dict(n=n, days=len(ks), first=ks[0] if ks else first, last=day,
+                net=sum(store[k]["net"] for k in ks),
+                saved=sum(store[k]["saved"] for k in ks),
+                better=sum(store[k]["better"] for k in ks),
+                cost=sum(store[k]["cost"] for k in ks))
+
+
 def verdict(d: dict, run: dict) -> tuple:
     """(level, reasons): PROBLEM / WATCH / OK for one day and the running
     totals; the reward bars scale with the share of the day it covered."""
@@ -412,12 +485,14 @@ def verdict(d: dict, run: dict) -> tuple:
         flag(1, f"{d['max_side']} waited {dur(d['max_s'])} behind a better price")
     if d["max_flaps"] >= FLAP_WATCH:
         flag(1, f"{d['max_flaps_side']} waited {d['max_flaps']} times (flapping)")
-    if run["days"] >= RUN_MIN_DAYS and run["net"] <= RUN_NET_PROBLEM:
-        flag(2, f"running net {money(run['net'])} over {run['days']:.1f} days")
+    week = run.get("week") or {}
+    if week.get("days") and week["net"] <= WEEK_NET_PROBLEM:
+        flag(2, f"the last {week['n']} days' net {money(week['net'])} "
+                f"({week['first']} to {week['last']}; bar {money(WEEK_NET_PROBLEM)})")
     return LEVELS[level], reasons
 
 
-def build_report(day, with_tape: bool = True, now=None, rows=None) -> dict:
+def build_report(day, with_tape: bool = True, now=None, rows=None, rescore: bool = True) -> dict:
     now = now or datetime.now(timezone.utc)
     a_ts, b_ts = slr.day_window(day)
     a_ts = max(a_ts, LIVE_TS)
@@ -454,6 +529,7 @@ def build_report(day, with_tape: bool = True, now=None, rows=None) -> dict:
              tape_done=kept["done"], tape_read=bool(with_tape))
     d["net"] = d["saved"] + d["better"] - d["cost"]
     store = load_store()
+    rescored = rescore_cut_short(store, d["day"], now) if (with_tape and rescore) else []
     store[d["day"]] = d
     run = dict(days=sum(v["hours"] for v in store.values()) / 24.0,
                net=sum(v["net"] for v in store.values()),
@@ -461,12 +537,14 @@ def build_report(day, with_tape: bool = True, now=None, rows=None) -> dict:
                saved=sum(v["saved"] for v in store.values()),
                better=sum(v["better"] for v in store.values()),
                waits=sum(v["waits"] for v in store.values()),
-               gone=sum(v["gone"] for v in store.values()))
+               gone=sum(v["gone"] for v in store.values()),
+               week=window(store, d["day"]))
     level, reasons = verdict(d, run)
     d["level"] = level
     top = sorted(eps, key=lambda e: -e.get("at_risk", 0.0))
     return dict(d=d, run=run, level=level, reasons=reasons, store=store, top=top,
-                kept_top=kept["top"][:6], better_top=sorted(better["top"], reverse=True)[:4])
+                kept_top=kept["top"][:6], better_top=sorted(better["top"], reverse=True)[:4],
+                rescored=rescored)
 
 
 def subject_for(ctx) -> str:
@@ -489,8 +567,9 @@ def render_text(ctx) -> str:
     b = datetime.fromtimestamp(d["b_ts"], timezone.utc).astimezone(imm.ET)
     exp = REPLAY_COST_PER_DAY * d["hours"] / 24.0
     tape = ("" if d["tape_read"] and d["tape_done"] else
-            " (public trades not read)" if not d["tape_read"] else
-            " (public trades read cut short by its time budget)")
+            " (public trades not read; the next run reads them)" if not d["tape_read"] else
+            " (public trades read cut short by its time budget; the next run reads them "
+            "again)")
     if d.get("mode") == "dry":
         head = (f"{ctx['level']}: the join wait is DRY -- nothing was held; these are the "
                 f"waits it would have made. ")
@@ -517,6 +596,19 @@ def render_text(ctx) -> str:
             f"still waiting at the day's end. Median {dur(d['median_s'])}, longest "
             f"{dur(d['max_s'])} ({d['max_side']}).",
         ]
+    wk = run.get("week")
+    if wk and wk["days"]:
+        lines.append(
+            f"Last {wk['n']} days ({datetime.strptime(wk['first'], '%Y-%m-%d'):%m/%d}-"
+            f"{datetime.strptime(wk['last'], '%Y-%m-%d'):%m/%d}, the PROBLEM bar "
+            f"{money(WEEK_NET_PROBLEM)}): net {money(wk['net'])} -- kept out "
+            f"{money(wk['saved'])}, better fills {money(wk['better'])}, reward "
+            f"{money(-wk['cost'])}.")
+    for k, old, new, done in ctx.get("rescored") or ():
+        lines.append(
+            f"Re-read {datetime.strptime(k, '%Y-%m-%d'):%m/%d}'s public trades (its first read "
+            f"did not finish): " + (f"net {money(old)} -> {money(new)}." if done else
+                                    f"cut short again; kept at {money(old)}."))
     since = datetime.fromtimestamp(LIVE_TS, timezone.utc).astimezone(imm.ET)
     lines.append(
         f"Running since {since:%m/%d %H:%M} ET: net {money(run['net'])} over "
@@ -557,6 +649,8 @@ def main(argv=None) -> int:
     ap.add_argument("--day", help="ET day to report (YYYY-MM-DD); default yesterday")
     ap.add_argument("--no-tape", action="store_true",
                     help="skip the Kalshi public reads (no kept-out fills)")
+    ap.add_argument("--no-rescore", action="store_true",
+                    help="do not re-read stored days whose public-trades read did not finish")
     args = ap.parse_args(argv)
     slr.low_priority()
 
@@ -568,7 +662,8 @@ def main(argv=None) -> int:
     if not (args.test or args.dry or args.day) and os.path.exists(marker):
         log(f"join-wait email already sent for {today_et}; exiting")
         return 0
-    ctx = build_report(day, with_tape=not args.no_tape, now=now_utc)
+    ctx = build_report(day, with_tape=not args.no_tape, now=now_utc,
+                       rescore=not args.no_rescore)
     text, subject = render_text(ctx), subject_for(ctx)
     log("join-wait email: " + subject + "\n" + text)
     if args.dry:

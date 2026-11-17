@@ -137,6 +137,32 @@ class TestFills(unittest.TestCase):
         got = jw.classify_trades([self._e()], [_tr(_ts(14, 40, 50), 55, "no", 10)], {}, mid=None)
         self.assertEqual(got[0][1:], (10.0, 0.0))
 
+    def test_the_tape_is_read_most_at_risk_first(self):
+        # 11/14's read went in ticker order and its budget ran out before the
+        # KXLOWTPERIOD bid that saved $229; now the biggest waits go first
+        def e(t, risk, **kw):
+            d = dict(ticker=t, side="bid", start=_ts(14), end=_ts(15), want=55, rest=43,
+                     size=100.0, at_risk=risk)
+            d.update(kw)
+            return d
+        eps = [e("KXAUDUSDEVENT-A", 50.0), e("KXLOWTPERIOD-B", 400.0),
+               e("KXAUDUSDEVENT-A", 60.0, side="ask"),
+               # no hold line: size x the gap, 1,000 x 12c = $120
+               e("KXBTCEVENT-C", None, size=1000.0)]
+        eps[3].pop("at_risk")
+        read = []
+        with mock.patch.object(jw, "_trades", side_effect=lambda t, a, b: read.append(t) or []):
+            got = jw.kept_out(eps, [], {})
+        self.assertTrue(got["done"])
+        self.assertEqual(read, ["KXLOWTPERIOD-B", "KXBTCEVENT-C", "KXAUDUSDEVENT-A"])
+        # out of time after the first read: the smallest are the ones missed
+        read.clear()
+        with mock.patch.object(jw, "_trades", side_effect=lambda t, a, b: read.append(t) or []), \
+                mock.patch.object(jw.time, "time", side_effect=[0.0, 0.0, 1e9]):
+            got = jw.kept_out(eps, [], {})
+        self.assertFalse(got["done"])
+        self.assertEqual(read, ["KXLOWTPERIOD-B"])
+
     def test_our_own_fills_at_the_resting_price(self):
         fills = [{"ticker": T, "our_book_side": "bid", "ts": _ts(14, 42, 1),
                   "our_price_cents": 43, "count": 500},
@@ -167,9 +193,29 @@ class TestVerdict(unittest.TestCase):
                           (dict(mode="dry"), "WATCH"), (dict(mode="off"), "PROBLEM"),
                           (dict(mode=None), "PROBLEM"), (dict(errors=2), "PROBLEM")):
             self.assertEqual(jw.verdict(self._d(**kw), self.RUN)[0], level, kw)
-        # the running net, once a week has passed
-        self.assertEqual(jw.verdict(self._d(), dict(days=7.0, net=-51.0))[0], "PROBLEM")
-        self.assertEqual(jw.verdict(self._d(), dict(days=6.0, net=-51.0))[0], "OK")
+        # the PROBLEM bar is the last 7 days' net, not the net since launch
+        # (Jack 2026-11-17: "Yes, fix the report"): election night's -$156 on
+        # 11/03 had held every email at PROBLEM from 11/09
+        wk = dict(n=7, days=7, first="2026-11-10", last="2026-11-16")
+        self.assertEqual(jw.verdict(self._d(), dict(days=14.0, net=-389.0,
+                                                    week=dict(wk, net=-2.0)))[0], "OK")
+        level, why = jw.verdict(self._d(), dict(days=14.0, net=0.0, week=dict(wk, net=-51.0)))
+        self.assertEqual(level, "PROBLEM")
+        self.assertEqual(why, ["the last 7 days' net -$51 (2026-11-10 to 2026-11-16; bar -$50)"])
+        # no stored day in the window: nothing to judge
+        self.assertEqual(jw.verdict(self._d(), dict(days=1.0, net=-60.0,
+                                                    week=dict(wk, days=0, net=0.0)))[0], "OK")
+
+    def test_the_week_window(self):
+        def day(net):
+            return dict(net=net, saved=0.0, better=0.0, cost=-net if net < 0 else 0.0)
+        store = {"2026-11-03": day(-156.0), "2026-11-09": day(-1.0), "2026-11-10": day(-0.5),
+                 "2026-11-14": day(93.0), "2026-11-16": day(-2.5), "2026-11-17": day(-9.0)}
+        w = jw.window(store, "2026-11-16")
+        self.assertEqual((w["days"], w["first"], w["last"]), (3, "2026-11-10", "2026-11-16"))
+        self.assertAlmostEqual(w["net"], 90.0)
+        self.assertAlmostEqual(w["cost"], 3.0)
+        self.assertEqual(jw.window({}, "2026-11-16")["days"], 0)
 
     def test_money(self):
         self.assertEqual([jw.money(x) for x in (-0.0001, 1.234, -3.5, 400.0, -1234.4)],
@@ -215,6 +261,71 @@ class TestReport(unittest.TestCase):
         self.assertIn("wanted 55c, rested 43c; 4,000 contracts, $520 at risk, must stand 16 min "
                       "-> went away after 49s", text)
         self.assertIn("2026-11-03", ctx["store"])
+
+    def _stored(self, day, net, done=True, **kw):
+        a = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() + 5 * 3600
+        d = dict(day=day, a_ts=a, b_ts=a + 86400, hours=24.0, net=net, cost=1.0, better=0.0,
+                 saved=net + 1.0, good=0.0, kept_trades=0, kept_contracts=0.0, waits=5, gone=1,
+                 tape_read=True, tape_done=done)
+        d.update(kw)
+        return d
+
+    def test_cut_short_days_are_read_again(self):
+        # the 11/14 shape: stored at -$203 with its read cut short
+        store = {"2026-11-14": self._stored("2026-11-14", -202.77, done=False, cost=49.79,
+                                            better=-10.18, saved=-142.80),
+                 "2026-11-13": self._stored("2026-11-13", -22.99, done=False),
+                 "2026-11-12": self._stored("2026-11-12", -1.74, done=False),
+                 "2026-11-10": self._stored("2026-11-10", -0.33),
+                 "2026-11-02": self._stored("2026-11-02", -5.0, done=False),   # too old
+                 "2026-11-16": self._stored("2026-11-16", -2.39, done=False)}  # today's own
+        reads = []
+
+        def kept(eps, fills, mids):
+            reads.append(len(eps))
+            done = len(reads) == 1
+            return dict(trades=3, contracts=400.0, saved=153.40, good=88.18, top=[], done=done)
+
+        now = datetime(2026, 11, 17, 13, 20, tzinfo=timezone.utc)
+        with mock.patch.object(jw, "kept_out", side_effect=kept), \
+                mock.patch.object(jw, "sink_rows", side_effect=lambda a, b: [_row(a + 3600)]), \
+                mock.patch.object(jw.slr, "maker_fills", return_value=[]):
+            got = jw.rescore_cut_short(store, "2026-11-16", now)
+        # newest first, at most RESCORE_MAX_DAYS; 11/02 is past RESCORE_MAX_AGE_DAYS
+        self.assertEqual([(k, done) for k, _o, _n, done in got],
+                         [("2026-11-14", True), ("2026-11-13", False)])
+        v = store["2026-11-14"]
+        self.assertAlmostEqual(v["net"], 153.40 - 10.18 - 49.79)
+        self.assertEqual((v["tape_done"], v["kept_trades"], v["good"], v["cost"]),
+                         (True, 3, 88.18, 49.79))
+        self.assertIn("rescored", v)
+        # cut short again: kept as stored, read again next run
+        self.assertEqual((store["2026-11-13"]["net"], store["2026-11-13"]["tape_done"]),
+                         (-22.99, False))
+        self.assertEqual(store["2026-11-12"]["net"], -1.74)
+        self.assertNotIn("rescored", store["2026-11-02"])
+
+    def test_the_email_shows_the_week_and_a_re_read(self):
+        with open(jw.store_path(), "w", encoding="utf-8") as f:
+            json.dump({"2026-11-02": self._stored("2026-11-02", -60.0, done=False, cost=2.0,
+                                                  better=-1.0, saved=-57.0)}, f)
+        with mock.patch.object(jw.slr, "day_log_lines", side_effect=lambda a, b: iter([MODE_LINE])):
+            ctx = jw.build_report(date(2026, 11, 3), with_tape=True,
+                                  now=datetime(2026, 11, 4, 13, 0, tzinfo=timezone.utc))
+        # 11/02 had no waits in the sink: the finished re-read finds nothing kept out
+        self.assertEqual(ctx["rescored"], [("2026-11-02", -60.0, -3.0, True)])
+        self.assertEqual(ctx["level"], "OK")
+        text = jw.render_text(ctx)
+        self.assertIn("Re-read 11/02's public trades (its first read did not finish): "
+                      "net -$60 -> -$3.00.", text)
+        self.assertIn("Last 7 days (11/02-11/03, the PROBLEM bar -$50): net -$3.00", text)
+        # --no-rescore leaves a stored day as it was
+        with open(jw.store_path(), "w", encoding="utf-8") as f:
+            json.dump({"2026-11-02": self._stored("2026-11-02", -60.0, done=False)}, f)
+        with mock.patch.object(jw.slr, "day_log_lines", side_effect=lambda a, b: iter([MODE_LINE])):
+            ctx = jw.build_report(date(2026, 11, 3), with_tape=True, rescore=False,
+                                  now=datetime(2026, 11, 4, 13, 0, tzinfo=timezone.utc))
+        self.assertEqual((ctx["rescored"], ctx["level"]), ([], "PROBLEM"))
 
     def test_a_quiet_day_and_a_dry_run(self):
         with mock.patch.object(jw.slr, "day_log_lines", side_effect=lambda a, b: iter([MODE_LINE])):
