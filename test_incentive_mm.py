@@ -190,6 +190,7 @@ def setUpModule():
     imm.CRYPTO_EVENT_STOP_FILE = os.path.join(tmp, "crypto_event_stop.json")
     imm.FX_EVENT_FAIR_FILE = os.path.join(tmp, "fx_event_fair.json")
     imm.LISTED_COMBO_FAIR_FILE = os.path.join(tmp, "listed_combo_fair.json")
+    imm.LISTED_COMBO_SEEN_FILE = os.path.join(tmp, "listed_combo_seen.json")
     # the family source verdicts (2026-09-22) load from the live file at
     # import: redirect the path AND forget what was loaded, or membership
     # tests would depend on the trading box's verdict file
@@ -48078,6 +48079,50 @@ class TestListedComboFair(unittest.TestCase):
         self.assertTrue(all(px >= 12 for side, px in rest if side == "ask"), rest)
         self.assertIn(("ask", 30), rest)
         self.assertNotIn(("bid", 8), rest)                 # the list's limit alone allowed it
+
+    def test_new_combo_notices_once_each(self):
+        # Jack 2026-11-17: "Yes, build it" -- auto-mapping plus an alert for new combos
+        snap = {
+            "events": {
+                "KXIRANWTICOMBO-28JAN": {"mapping": "hand", "n_priced": 8, "sum_p": 1.0},
+                "KXIRANWTICOMBO-28JUL": {"mapping": "auto", "n_priced": 2, "sum_p": 1.0},
+                "KXFEDCOMBO-26DEC": {"mapping": None, "err": "unmapped: not one yes/no leg"},
+                "KXCPICOMBO-26DEC": {"mapping": None, "err": "unmapped: not one yes/no leg"}},
+            "markets": {"KXIRANWTICOMBO-28JUL-AGR0-0": {"event": "KXIRANWTICOMBO-28JUL", "p": 0.11,
+                                                        "p_lo": 0.09, "p_hi": 0.14},
+                        "KXIRANWTICOMBO-28JUL-NOT1-0": {"event": "KXIRANWTICOMBO-28JUL", "p": 0.89,
+                                                        "p_lo": 0.85, "p_hi": 0.91}},
+            "auto": {"KXIRANWTICOMBO-28JUL": {
+                "binary_label": "Iran deal",
+                "binary": {"Agreed": ["KXUSAIRANAGREEMENT-27", True],
+                           "Not agreed": ["KXUSAIRANAGREEMENT-27", False]},
+                "number_label": "WTI", "number": {"model": "lognormal", "fwd": ["CLQ27.NYM"]},
+                "delta": -0.08, "delta_band": [-0.2, 0.0]}},
+            "unmapped_why": {"KXFEDCOMBO-26DEC": "not one yes/no leg and one number",
+                             "KXCPICOMBO-26DEC": "not one yes/no leg and one number"},
+            "unmapped_detail": {"KXFEDCOMBO-26DEC": {"cells": 6, "titles": ["Rate: No change, Dissents: 0"],
+                                                     "components": ["Federal Funds Rate Decision (FEDDECISION)",
+                                                                    "Dissents (FOMCDISSENTCOUNT)"],
+                                                     "close": "2026-12-09T18:55:00Z"}}}
+        blocked = lambda ev: IncentiveMarketMaker._blocked(f"{ev}-X")
+        seen, notes = imm.listed_combo_notices(snap, {}, blocked, "2026-11-17T16:00:00+00:00")
+        subj = [s for s, _b in notes]
+        self.assertEqual(subj, ["IMM: new combo needs a mapping -- KXFEDCOMBO-26DEC",
+                                "IMM: new combo auto-mapped -- KXIRANWTICOMBO-28JUL (2 cells)"])
+        body = dict(notes)["IMM: new combo auto-mapped -- KXIRANWTICOMBO-28JUL (2 cells)"]
+        self.assertIn("Agreed: KXUSAIRANAGREEMENT-27 (yes)", body)
+        self.assertIn("KXIRANWTICOMBO-28JUL-AGR0-0: 11.0c (band 9.0-14.0)", body)
+        fed = dict(notes)["IMM: new combo needs a mapping -- KXFEDCOMBO-26DEC"]
+        self.assertIn("Federal Funds Rate Decision (FEDDECISION)", fed)
+        # every event recorded -- the hand row and the blocked pure-CPI combo silently
+        self.assertEqual({e: v["status"] for e, v in seen.items()},
+                         {"KXIRANWTICOMBO-28JAN": "hand", "KXIRANWTICOMBO-28JUL": "auto",
+                          "KXFEDCOMBO-26DEC": "unmapped", "KXCPICOMBO-26DEC": "unmapped"})
+        # nothing twice; a change of state is news again
+        self.assertEqual(imm.listed_combo_notices(snap, seen, blocked, "x")[1], [])
+        snap["events"]["KXFEDCOMBO-26DEC"] = {"mapping": "hand", "n_priced": 6}
+        seen2, notes2 = imm.listed_combo_notices(snap, seen, blocked, "x")
+        self.assertEqual((notes2, seen2["KXFEDCOMBO-26DEC"]["status"]), ([], "hand"))
 
     def test_leads_wait_for_jack(self):
         now = time.time()

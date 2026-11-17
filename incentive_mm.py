@@ -20706,9 +20706,10 @@ def fx_event_wave_limits(ticker: str, now_ts: float) -> Optional[Tuple[int, int]
 #     KXUSAIRANAGREEMENT-27-28), the number off its model -- WTI lognormal on the named CME
 #     contract's delayed price (CLG28), the 2029-30 prints and the S&P window priors -- linked
 #     by the number's shift between the two worlds (a deal: WTI ~8% lower). BAND: each input
-#     alone at its low and high, the moves in quadrature. A new combo event prices only once
-#     its legs are mapped (listed_combo_fair.EVENTS); until then it is "unmapped" in the status
-#     file and stands aside.
+#     alone at its low and high, the moves in quadrature. A new combo event is AUTO-MAPPED
+#     from its own rules when both legs are kinds already priced (listed_combo_fair.auto_map);
+#     otherwise it is "unmapped" in the status file and stands aside until a hand row
+#     (listed_combo_fair.EVENTS) maps it. Both are emailed once (NEW-COMBO NOTICES).
 #   GATE (listed_combo_gate): every bid at most p_lo - LISTED_COMBO_TOL_CENTS, every ask at
 #     least p_hi + it (mort_cap_quotes, LAST). STAND ASIDE (cancel, fail closed): any listed
 #     combo series with no fair (no read, an unmapped event, a grid that does not parse), a
@@ -20831,6 +20832,67 @@ def listed_combo_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
         return (f"no side {LISTED_COMBO_TOL_CENTS}c clear of the band {lo_c:.1f}-{hi_c:.1f}c",
                 dict(inputs, reason="decided"), None)
     return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
+
+
+# NEW-COMBO NOTICES (Jack 2026-11-17: "Yes, build it", to auto-mapping new combos plus an
+# alert). listed_combo_fair.py maps a combo event with no hand row from its own rules when both
+# legs are kinds it already prices; each event's first sight as AUTO-MAPPED (now quoting behind
+# the gate) or UNMAPPED (dark, with the reason and what was parsed) is emailed once through the
+# bot's alert route. Hand-mapped events are recorded silently; an unmapped event the bot blocks
+# anyway (the pure-CPI KXCPICOMBO) is not emailed. Seen state: LISTED_COMBO_SEEN_FILE, so a
+# restart does not repeat a notice.
+LISTED_COMBO_NOTICES = os.environ.get("IMM_LISTED_COMBO_NOTICES", "1") == "1"
+LISTED_COMBO_SEEN_FILE = os.environ.get(
+    "IMM_LISTED_COMBO_SEEN_FILE", os.path.join(STATUS_DIR, "listed_combo_seen.json"))
+
+
+def listed_combo_notices(snap: dict, seen: dict, blocked: Callable[[str], bool],
+                         now_iso: str) -> Tuple[dict, List[Tuple[str, str]]]:
+    """(the seen state after this snapshot, [(subject, body)] to email): one notice the first
+    time an event reads auto-mapped or unmapped. Pure."""
+    out = dict(seen)
+    notes: List[Tuple[str, str]] = []
+    mk = snap.get("markets") or {}
+    for ev, e in sorted((snap.get("events") or {}).items()):
+        if not isinstance(e, dict):
+            continue
+        st = e.get("mapping") or "unmapped"
+        if (seen.get(ev) or {}).get("status") == st:
+            continue
+        out[ev] = {"status": st, "at": now_iso}
+        if st == "auto":
+            a = (snap.get("auto") or {}).get(ev) or {}
+            num = a.get("number") or {}
+            cells = sorted((t, v) for t, v in mk.items() if v.get("event") == ev and "p" in v)
+            lines = [f"{ev} was auto-mapped from its own rules and now quotes behind the combo "
+                     f"gate (bids at least {LISTED_COMBO_TOL_CENTS}c under the fair band, asks "
+                     f"{LISTED_COMBO_TOL_CENTS}c over it), sized like the other combos.", "",
+                     f"Yes/no leg ({a.get('binary_label')}):"]
+            lines += [f"  {o}: {t} ({'yes' if y else 'not'})"
+                      for o, (t, y) in sorted((a.get("binary") or {}).items())]
+            lines += [f"Number leg ({a.get('number_label')}): " + ", ".join(
+                f"{k} {v}" for k, v in num.items()),
+                f"Link: {a.get('delta')} (band {a.get('delta_band')})", "",
+                f"Fair now ({len(cells)} cells, grid sums to {e.get('sum_p')}):"]
+            lines += [f"  {t}: {100 * v['p']:.1f}c (band {100 * v['p_lo']:.1f}-"
+                      f"{100 * v['p_hi']:.1f})" for t, v in cells]
+            lines += ["", "To drop it or change a leg, tell Claude (listed_combo_fair.EVENTS takes "
+                      "a hand row over the auto map)."]
+            notes.append((f"IMM: new combo auto-mapped -- {ev} ({len(cells)} cells)",
+                          "\n".join(lines)))
+        elif st == "unmapped" and not blocked(ev):
+            why = (snap.get("unmapped_why") or {}).get(ev) or e.get("err") or "?"
+            d = (snap.get("unmapped_detail") or {}).get(ev) or {}
+            lines = [f"{ev} has a reward program but no fair, so the bot keeps it dark.",
+                     f"Why it could not be auto-mapped: {why}", "",
+                     f"Legs per its rules: {', '.join(d.get('components') or []) or '(none read)'}",
+                     f"Cells: {d.get('cells')}, e.g. " + " | ".join(d.get("titles") or []),
+                     f"Closes: {d.get('close')}", "",
+                     "To quote it, tell Claude to map it (a hand row in "
+                     "listed_combo_fair.EVENTS: the Kalshi market for the yes/no leg, a model "
+                     "for the number)."]
+            notes.append((f"IMM: new combo needs a mapping -- {ev}", "\n".join(lines)))
+    return out, notes
 
 
 def listed_combo_fair_c(ticker: str, now_ts: float) -> Optional[float]:
@@ -47719,10 +47781,32 @@ class IncentiveMarketMaker:
                     fair_reader() or listed_combo_fair.public_get, _events)
                 last = None
                 status_at = 0.0
+                try:
+                    with open(LISTED_COMBO_SEEN_FILE, encoding="utf-8") as fh:
+                        seen = json.load(fh) or {}
+                except (OSError, ValueError):
+                    seen = {}
                 while True:
                     try:
                         snap = watch.refresh()
                         _listed_combo_state["snap"] = snap
+                        if LISTED_COMBO_NOTICES:
+                            # NEW-COMBO NOTICES: an auto-mapped or unmapped event, once
+                            try:
+                                seen2, notes = listed_combo_notices(
+                                    snap, seen, lambda ev: IncentiveMarketMaker._blocked(f"{ev}-X"),
+                                    datetime.now(timezone.utc).isoformat(timespec="seconds"))
+                                for subj, body in notes:
+                                    log(f"{self.tag} listed-combo notice: {subj}")
+                                    self.alerter.send_message(body, subject=subj)
+                                if seen2 != seen:
+                                    seen = seen2
+                                    tmp = LISTED_COMBO_SEEN_FILE + ".tmp"
+                                    with open(tmp, "w", encoding="utf-8") as fh:
+                                        json.dump(seen, fh, indent=1, sort_keys=True)
+                                    os.replace(tmp, LISTED_COMBO_SEEN_FILE)
+                            except Exception as e:
+                                log(f"{self.tag} ! listed-combo notice: {type(e).__name__}: {str(e)[:120]}")
                         evs = snap.get("events") or {}
                         n_ok = sum(1 for e in (snap.get("markets") or {}).values() if "p" in e)
                         holds = sorted(ev for ev, v in evs.items()
@@ -47730,7 +47814,7 @@ class IncentiveMarketMaker:
                         bad = sorted(ev for ev, v in evs.items()
                                      if v.get("err") and ev not in (snap.get("unmapped") or []))
                         key = (n_ok, tuple(sorted(evs)), tuple(holds), tuple(bad),
-                               tuple(snap.get("unmapped") or []))
+                               tuple(snap.get("unmapped") or []), tuple(sorted(snap.get("auto") or {})))
                         if last != key:
                             legs = snap.get("legs") or {}
                             log(f"{self.tag} listed-combo fair: {n_ok} cells priced in "
@@ -47741,6 +47825,7 @@ class IncentiveMarketMaker:
                                           if v.get("fwd"))
                                 + (f"; LEG HOLD {', '.join(holds)}" if holds else "")
                                 + (f"; NO FAIR {', '.join(bad)}: {evs[bad[0]].get('err')}" if bad else "")
+                                + (f"; AUTO-MAPPED {', '.join(sorted(snap['auto']))}" if snap.get("auto") else "")
                                 + (f"; UNMAPPED {', '.join(snap['unmapped'])}" if snap.get("unmapped") else "")
                                 + (f"; {'; '.join(snap['errors'])[:200]}" if snap.get("errors") else ""))
                         last = key

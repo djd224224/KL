@@ -204,7 +204,8 @@ class TestWatch(unittest.TestCase):
         w, _k = self._watch(events=[self.EV, "KXNEWCOMBO-28MAR"])
         snap = w.refresh(NOW)
         self.assertEqual(snap["unmapped"], ["KXNEWCOMBO-28MAR"])
-        self.assertIn("no leg map", snap["events"]["KXNEWCOMBO-28MAR"]["err"])
+        self.assertIn("unmapped: no open markets", snap["events"]["KXNEWCOMBO-28MAR"]["err"])
+        self.assertEqual(snap["unmapped_why"], {"KXNEWCOMBO-28MAR": "no open markets"})
         self.assertNotIn("KXNEWCOMBO", snap["priced_series"])
 
     def test_a_leg_never_read_fails_the_grid_closed(self):
@@ -306,6 +307,182 @@ class TestWatch(unittest.TestCase):
         self.assertAlmostEqual(rep, 0.325, places=3)
         self.assertEqual(snap["priced_series"], ["KXINXPARTYCOMBO"])
         self.assertEqual(e["legs"], ["KXPRESPARTY-2028-D", "KXPRESPARTY-2028-R"])
+
+
+import json
+import os
+
+# the live grids' own rules (11/17 public reads) and their cells
+RULES = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "test_listed_combo_fair_rules.json"), encoding="utf-8"))
+
+
+def _grid(binary_label, outcomes, number_label, bins):
+    return {f"{o[:3].upper()}{i}-{j}": f"{binary_label}: {o}, {number_label}: {b}"
+            for i, o in enumerate(outcomes) for j, b in enumerate(bins)}
+
+
+GRIDS = {
+    "KXIRANWTICOMBO-28JAN": _grid("Iran deal", ("Agreed", "Not agreed"), "WTI",
+                                  ("Below $60", "$60 to $74.99", "$75 to $89.99", "$90 or above")),
+    "KXHORMUZGASCOMBO-27AUG": _grid("Hormuz traffic", ("Back to normal", "Not back to normal"),
+                                    "Gas price", ("Below $3.40", "$3.40 to $3.79",
+                                                  "$3.80 to $4.19", "$4.20 or above")),
+    "KXINXPARTYCOMBO-30JAN": _grid("Party", ("Democratic", "Republican"), "S&P 500 change",
+                                   ("Below -10%", "-10% to 0%", "0% to 10%", "10% to 20%",
+                                    "20% or above")),
+    "KXCPIPARTYCOMBO-30MAR": _grid("Party", ("Democratic", "Republican"), "CPI inflation",
+                                   ("1.9% or below", "2.0% to 2.9%", "3.0% to 3.9%",
+                                    "4.0% or above")),
+    "KXGDPPARTYCOMBO-30MAR": _grid("Party", ("Democratic", "Republican"), "GDP growth",
+                                   ("0.0% or below", "0.1% to 1.0%", "1.1% to 2.0%",
+                                    "2.1% to 2.5%", "2.6% to 3.0%", "3.1% or above")),
+    "KXLEPENEURCOMBO-27JUN": _grid("French president", ("Marine Le Pen", "Not Marine Le Pen"),
+                                   "EUR/USD change", ("Below -3%", "-3% to -1%", "-1% to 1%",
+                                                      "1% to 3%", "3% or above")),
+}
+LEG_LISTS = {
+    ("event_ticker", "KXPRESPARTY-2028"): [("KXPRESPARTY-2028-D", "Democratic party"),
+                                           ("KXPRESPARTY-2028-R", "Republican party")],
+    ("event_ticker", "KXFRENCHPRES-27"): [("KXFRENCHPRES-27-MLEP", "Marine Le Pen"),
+                                          ("KXFRENCHPRES-27-JBAR", "Jordan Bardella")],
+    ("series_ticker", "KXUSAIRANAGREEMENT"): [("KXUSAIRANAGREEMENT-27", "Before Jan 1, 2027"),
+                                              ("KXUSAIRANAGREEMENT-27-28", "Before Jan 1, 2028")],
+    ("series_ticker", "KXHORMUZNORM"): [("KXHORMUZNORM-26MAR17-B270601", "Before Jun 1, 2027"),
+                                        ("KXHORMUZNORM-26MAR17-B270701", "Before Jul 1, 2027")],
+}
+LEG_BOOKS = {"KXPRESPARTY-2028-D": (0.67, 0.68), "KXPRESPARTY-2028-R": (0.32, 0.33),
+             "KXFRENCHPRES-27-MLEP": (0.52, 0.53), "KXUSAIRANAGREEMENT-27-28": (0.26, 0.27),
+             "KXHORMUZNORM-26MAR17-B270701": (0.36, 0.37)}
+FUT = {"CLG28.NYM": 71.54, "CL=F": 86.86, "RBQ27.NYM": 2.6119, "RB=F": 2.5277}
+
+
+class FakeKalshiFull(FakeKalshi):
+    """The combo grids with their rules, plus the leg events / series the auto-mapper reads."""
+
+    def __init__(self, grids=None, rules=None, legs=None):
+        super().__init__({}, dict(LEG_BOOKS if legs is None else legs))
+        self.grids, self.rules = GRIDS if grids is None else grids, RULES if rules is None else rules
+
+    def __call__(self, path, params):
+        self.calls.append((path, dict(params or {})))
+        if path == "/markets":
+            for key in ("event_ticker", "series_ticker"):
+                if (key, params.get(key)) in LEG_LISTS:
+                    return {"markets": [{"ticker": t, "yes_sub_title": s, "status": "active"}
+                                        for t, s in LEG_LISTS[(key, params[key])]]}
+            ev = params.get("event_ticker")
+            r = self.rules.get(ev) or {}
+            return {"markets": [
+                {"ticker": f"{ev}-{k}", "event_ticker": ev, "yes_sub_title": title,
+                 "status": "active", "close_time": "2029-12-31T21:00:00Z", **r}
+                for k, title in (self.grids.get(ev) or {}).items()]}
+        return super().__call__(path, params)
+
+
+class TestAutoMap(unittest.TestCase):
+    """AUTO-MAPPING (Jack 2026-11-17: "Yes, build it"): a combo event with no hand row is mapped
+    from its own rules when both legs are kinds already priced; the six live grids, read with
+    no hand rows at all, map to exactly the hand rows' legs."""
+
+    def test_every_live_grid_maps_to_the_hand_rows_legs(self):
+        k = FakeKalshiFull()
+        for ev in GRIDS:
+            mk = k("/markets", {"event_ticker": ev})["markets"]
+            a = lcf.auto_map(ev, mk, k, NOW)
+            h = lcf.EVENTS[ev]
+            self.assertEqual({o: tuple(v) for o, v in a["binary"]["outcomes"].items()},
+                             {o: tuple(v) for o, v in h["binary"]["outcomes"].items()}, ev)
+            self.assertEqual(a["binary"]["yes"], h["binary"]["yes"], ev)
+            self.assertEqual(a["number"]["model"], h["number"]["model"], ev)
+            self.assertEqual((a["delta"], tuple(a["delta_band"])),
+                             (h["delta"], tuple(h["delta_band"])), ev)
+            if h["number"]["model"] == "lognormal":
+                self.assertEqual(a["number"]["fwd"][0], h["number"]["fwd"][0], ev)
+                self.assertEqual(a["number"].get("fwd_add"), h["number"].get("fwd_add"), ev)
+            else:
+                self.assertAlmostEqual(a["number"]["sd"], h["number"]["sd"], delta=0.1, msg=ev)
+                self.assertAlmostEqual(a["number"]["mean"], h["number"]["mean"], delta=0.4, msg=ev)
+
+    def test_auto_and_hand_price_the_same(self):
+        evs = sorted(GRIDS)
+        hand = lcf.ListedComboWatch(FakeKalshiFull(), lambda: evs, http=fake_yahoo(FUT))
+        auto = lcf.ListedComboWatch(FakeKalshiFull(), lambda: evs, http=fake_yahoo(FUT),
+                                    event_map={})
+        sh, sa = hand.refresh(NOW), auto.refresh(NOW)
+        self.assertEqual(sa["unmapped"], [])
+        self.assertEqual(sorted(sa["auto"]), evs)
+        self.assertEqual({e["mapping"] for e in sa["events"].values()}, {"auto"})
+        self.assertEqual({e["mapping"] for e in sh["events"].values()}, {"hand"})
+        self.assertEqual(sa["priced_series"], sh["priced_series"])
+        for t, m in sh["markets"].items():
+            self.assertAlmostEqual(sa["markets"][t]["p"], m["p"], delta=0.006, msg=t)
+
+    def test_a_new_date_of_a_known_grid_maps_itself(self):
+        """Another Iran x WTI expiry -- no hand row -- reads its own deal market and contract."""
+        ev = "KXIRANWTICOMBO-28JUL"
+        rules = {"rules_secondary": RULES["KXIRANWTICOMBO-28JAN"]["rules_secondary"]
+                 .replace("Before Jan 1, 2028", "Before Jan 1, 2027")
+                 .replace("Dec 31, 2027 at 2:30 PM ET", "Jun 30, 2027 at 2:30 PM ET")
+                 .replace("February 2028 contract", "August 2027 contract")}
+        k = FakeKalshiFull(grids={ev: GRIDS["KXIRANWTICOMBO-28JAN"]}, rules={ev: rules},
+                           legs=dict(LEG_BOOKS, **{"KXUSAIRANAGREEMENT-27": (0.04, 0.05)}))
+        w = lcf.ListedComboWatch(k, lambda: [ev], http=fake_yahoo({"CLQ27.NYM": 74.0, "CL=F": 86.86}))
+        snap = w.refresh(NOW)
+        e = snap["events"][ev]
+        self.assertEqual((e["mapping"], e["n_priced"], e["err"]), ("auto", 8, None))
+        a = snap["auto"][ev]
+        self.assertEqual(a["binary"]["Agreed"], ["KXUSAIRANAGREEMENT-27", True])
+        self.assertEqual(a["number"]["fwd"][0], "CLQ27.NYM")
+        self.assertEqual(a["number"]["at"], "2027-06-30T18:30:00Z")
+        deal = sum(m["p"] for t, m in snap["markets"].items() if "-AGR" in t)
+        self.assertAlmostEqual(deal, 0.045, places=3)
+
+    def test_what_cannot_be_mapped_says_why(self):
+        k = FakeKalshiFull()
+        # two yes/no legs (the Fed decision x dissents)
+        fed = [{"ticker": "KXFEDCOMBO-26DEC-0-0", "yes_sub_title": "Rate: No change, Dissents: 0",
+                "status": "active", **RULES["KXFEDCOMBO-26DEC"]}]
+        with self.assertRaisesRegex(ValueError, "not one yes/no leg and one number"):
+            lcf.auto_map("KXFEDCOMBO-26DEC", fed, k, NOW)
+        # an S&P window already running
+        inx = k("/markets", {"event_ticker": "KXINXPARTYCOMBO-30JAN"})["markets"]
+        late = lcf._parse_iso("2029-01-10T00:00:00Z").timestamp()
+        with self.assertRaisesRegex(ValueError, "within 30 days"):
+            lcf.auto_map("KXINXPARTYCOMBO-30JAN", inx, k, late)
+        # a leg market that is not listed
+        iran = [dict(m, rules_secondary=m["rules_secondary"].replace("Before Jan 1, 2028",
+                                                                     "Before Jan 1, 2029"))
+                for m in k("/markets", {"event_ticker": "KXIRANWTICOMBO-28JAN"})["markets"]]
+        with self.assertRaisesRegex(ValueError, "no KXUSAIRANAGREEMENT market 'Before Jan 1, 2029'"):
+            lcf.auto_map("KXIRANWTICOMBO-28JAN", iran, k, NOW)
+        # a ruleset nothing prices
+        odd = [dict(m, rules_secondary=m["rules_secondary"].replace("(AGREEMENT)", "(TREATY)"))
+               for m in iran]
+        with self.assertRaisesRegex(ValueError, r"no pricer for the yes/no leg 'Iran deal' \(TREATY\)"):
+            lcf.auto_map("KXIRANWTICOMBO-28JAN", odd, k, NOW)
+        with self.assertRaisesRegex(ValueError, "no two Kalshi rulesets"):
+            lcf.auto_map("X", [{"yes_sub_title": "A: b, C: 1% to 2%", "rules_secondary": "?"}], k, NOW)
+
+    def test_the_watch_names_an_unmappable_event_and_a_hand_row_wins(self):
+        ev = "KXFEDCOMBO-26DEC"
+        grids = dict(GRIDS, **{ev: {"0-0": "Rate: No change, Dissents: 0",
+                                    "0-T0": "Rate: No change, Dissents: 1 or more"}})
+        k = FakeKalshiFull(grids=grids, rules=dict(RULES))
+        w = lcf.ListedComboWatch(k, lambda: [ev, "KXIRANWTICOMBO-28JAN"], http=fake_yahoo(FUT))
+        snap = w.refresh(NOW)
+        self.assertEqual(snap["unmapped"], [ev])
+        self.assertIn("not one yes/no leg", snap["unmapped_why"][ev])
+        d = snap["unmapped_detail"][ev]
+        self.assertEqual(d["cells"], 2)
+        self.assertEqual(d["components"], ["Federal Funds Rate Decision (FEDDECISION)",
+                                           "Dissents (FOMCDISSENTCOUNT)"])
+        self.assertEqual(snap["events"]["KXIRANWTICOMBO-28JAN"]["mapping"], "hand")
+        self.assertNotIn("KXIRANWTICOMBO-28JAN", snap["auto"])
+        # an unmappable event is retried only after META_REFRESH_S
+        n = len(k.calls)
+        w.refresh(NOW + 30)
+        self.assertFalse(any(p == "/markets" and q.get("series_ticker") for p, q in k.calls[n:]))
 
 
 if __name__ == "__main__":
