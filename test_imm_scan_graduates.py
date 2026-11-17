@@ -30,11 +30,13 @@ class ScanGraduateTests(unittest.TestCase):
         # incentive_mm.SELL_BACK_ONLY_SERIES.)
         cut = set(imm._CUT_LOSERS_1101_SERIES)
         self.assertEqual(sorted(imm.SCAN_GRADUATE_SERIES & cut), ["KXNETFLIXTOPVIEWSTV"])
-        # ...and the gas and diesel graduates, cut by prefix on 2026-11-16
-        # (Jack: "turn off gas and diesel markets from IMM"), the same way
+        # ...and the gas, diesel and natural gas graduates, cut on 2026-11-16
+        # (Jack: "turn off gas and diesel markets from IMM", then "Block
+        # natural gas too"), the same way
         fuel = {s for s in imm.SCAN_GRADUATE_SERIES
                 if any(f"{s}-X".startswith(e) for e in imm._CUT_FUEL_ENTRIES)}
-        self.assertEqual(sorted(fuel), ["KXAAAGASEOYNJ", "KXAAAGASMTX", "KXDIESELYE"])
+        self.assertEqual(sorted(fuel), ["KXAAAGASEOYNJ", "KXAAAGASMTX", "KXDIESELYE",
+                                        "KXMARCELLUSGAS", "KXPAGAS"])
         cut |= fuel
         for s in sorted(imm.SCAN_GRADUATE_SERIES - cut):
             self.assertTrue(M._allowed(f"{s}-X"), s)

@@ -9319,8 +9319,9 @@ class TestNextSpeakerCut(unittest.TestCase):
 
 
 class TestFuelCut(unittest.TestCase):
-    """Jack 2026-11-16: "turn off gas and diesel markets from IMM" -- every
-    gasoline and diesel price market is frozen, whatever path admits it."""
+    """Jack 2026-11-16: "turn off gas and diesel markets from IMM", then "Block
+    natural gas too" -- every gasoline, diesel and natural gas market is
+    frozen, whatever path admits it."""
 
     def test_every_gas_and_diesel_price_series_is_frozen(self):
         blocked = imm.IncentiveMarketMaker._blocked
@@ -9340,11 +9341,26 @@ class TestFuelCut(unittest.TestCase):
         for s in ("KXAAAGASDCT", "KXDIESELYE", "KXGAS", "KXTRUFGAS", "GAS"):
             self.assertTrue(imm.series_blocklisted(s), s)
 
-    def test_the_georgia_elections_and_natural_gas_stay(self):
+    def test_natural_gas_is_frozen_too(self):
+        # Jack 2026-11-16, the same evening: "Block natural gas too"
+        blocked = imm.IncentiveMarketMaker._blocked
+        for t in ("KXNATGASD-26NOV17-T3.10", "KXNATGASW-26NOV20-T3.10",
+                  "KXNATGASMON-26NOV-T3.10", "KXNATGAS15M-26NOV172215-T3.10",
+                  "KXNGAS-26NOV-T4", "KXNGASW-26NOV20-T4", "KXNGASMAX-26-T5",
+                  "KXNGASMIN-26-T2", "NGASW-26NOV20-T4", "KXTTFD-26NOV17-T30",
+                  "KXTTFW-26NOV20-T30", "KXTTFMON-26NOV-T30",
+                  "KXMARCELLUSGAS-27MAR31-T9.75", "KXPAGAS-26-T7",
+                  "KXQATARLNGPROD-27-JAN"):
+            self.assertTrue(blocked(t), t)
+        for s in ("KXNATGASD", "KXTTFW", "KXMARCELLUSGAS", "KXPAGAS", "KXQATARLNGPROD"):
+            self.assertTrue(imm.series_blocklisted(s), s)
+
+    def test_the_georgia_elections_and_the_rest_stay(self):
         # the EIA KXGAS weekly is an exact series: a bare KXGAS prefix would
-        # also freeze the Georgia election series
+        # also freeze the Georgia election series; the TTF prefix misses ITTF
+        # table tennis
         for s in ("KXGASEN1R", "KXGASTATELEG", "KXGASCHOOLSUPER", "KXGASENGOVCOMBO",
-                  "KXNATGASD", "KXNGASW", "KXMARCELLUSGAS", "KXPAGAS", "KXTTFD",
+                  "KXITTFMEN", "KXITTFWOMENMATCH", "KXLAOILGASEMP",
                   "KXJETFUEL", "KXEIAGASINVM", "KXGASTAX", "KXRUSDIESELGL"):
             self.assertFalse(any(f"{s}-26NOV17-T1".startswith(e)
                                  for e in imm._CUT_FUEL_ENTRIES), s)

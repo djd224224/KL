@@ -5800,10 +5800,10 @@ _CUT_AAA_MONTHLY_SERIES = ("KXAAAGASM",)
 # (Hormuz traffic x a 2027 gas price). Not a bare KXGAS prefix: that would
 # freeze the Georgia election series (KXGASEN1R, KXGASTATELEG, ...). A prefix
 # entry wins over the AS test's gas family and a gas-state daily pick, which
-# stand aside only the state PATTERN block (_blocked). Left as they are:
-# natural gas (KXNATGAS*, KXNGAS*, the TTF, Marcellus and PA production),
-# jet fuel, gasoline inventories, gas-tax bills and the Russian-diesel policy
-# questions; the CPI-gas series sit under the CPI pattern already. The
+# stand aside only the state PATTERN block (_blocked). Left as they are: jet
+# fuel, gasoline inventories, gas-tax bills and the Russian-diesel policy
+# questions (natural gas joined the same evening, below); the CPI-gas series
+# sit under the CPI pattern already. The
 # piecemeal cuts above (_CUT_AAA_SERIES, _CUT_GAS_TRIAL_SERIES,
 # _CUT_AAA_MONTHLY_SERIES, the launcher's KXAAAGASW,KXDIESELW) stay, so
 # lifting this entry restores exactly what they had cut. Standard semantics:
@@ -5813,7 +5813,20 @@ _CUT_AAA_MONTHLY_SERIES = ("KXAAAGASM",)
 _CUT_FUEL_PREFIXES = ("KXAAAGAS", "AAAGAS", "KXDIESEL", "DIESEL")
 _CUT_FUEL_SERIES = ("KXGAS", "KXGASD", "KXGASMAX", "KXGASMIN", "GAS", "GASD",
                     "GASMAX", "GASMIN", "KXTRUFGAS", "KXHORMUZGASCOMBO")
-_CUT_FUEL_ENTRIES = _CUT_FUEL_PREFIXES + tuple(f"{_s}-" for _s in _CUT_FUEL_SERIES)
+# NATURAL GAS TOO (Jack 2026-11-16, the same evening: "Block natural gas too",
+# to "Also turn off the natural-gas markets?"). By prefix: KXNATGAS (the
+# daily, weekly, monthly and 15-minute contracts), KXNGAS and its legacy
+# NGAS (price max/min weekly, monthly, annual) and KXTTF (the Dutch TTF
+# daily, weekly, monthly; table tennis is KXITTF, which it misses). As exact
+# series, the production and LNG questions: KXMARCELLUSGAS and KXPAGAS (scan
+# graduates; the bot held Marcellus short that night) and KXQATARLNGPROD.
+# Same semantics as the fuel cut, and part of it (_CUT_FUEL_ENTRIES), so one
+# entry lifts both. KXLAOILGASEMP (Louisiana oil and gas extraction
+# employment, a jobs count) stays.
+_CUT_NATGAS_PREFIXES = ("KXNATGAS", "KXNGAS", "NGAS", "KXTTF")
+_CUT_NATGAS_SERIES = ("KXMARCELLUSGAS", "KXPAGAS", "KXQATARLNGPROD")
+_CUT_FUEL_ENTRIES = (_CUT_FUEL_PREFIXES + _CUT_NATGAS_PREFIXES
+                     + tuple(f"{_s}-" for _s in _CUT_FUEL_SERIES + _CUT_NATGAS_SERIES))
 # OPENROUTER SHARE FAMILY OFF (Jack 2026-10-09: "yes do both", after "is it
 # still underperforming after the latest changes around breaks and control
 # measures?"). The ten KX<AUTHOR>SHARE series (_DEFAULT_OR_SHARE_SERIES)
@@ -5940,7 +5953,7 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + [f"{_s}-" for _s in _CUT_GAS_TRIAL_SERIES]
     # the national AAA monthly (2026-10-25, above)
     + [f"{_s}-" for _s in _CUT_AAA_MONTHLY_SERIES]
-    # every gasoline and diesel price market (2026-11-16, above)
+    # every gasoline, diesel and natural gas market (2026-11-16, above)
     + list(_CUT_FUEL_ENTRIES)
     # the OpenRouter share family (2026-10-09, above)
     + [f"{_s}-" for _s in _CUT_OR_SHARE_SERIES]
