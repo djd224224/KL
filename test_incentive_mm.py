@@ -20037,16 +20037,23 @@ class TestOpenScanTier(unittest.TestCase):
         # members behind the GasBuddy gate -- still never scan universe.
         # (2026-10-01, the gas trial: blocked again unless IMM_GB_STATE_QUOTE=1;
         # 2026-10-26, the opportunistic AS test's five states are back)
-        self.assertEqual(r("KXAAAGASDTX-26SEP08-4.14"),
-                         "allowed" if (imm.GB_STATE_QUOTE
-                                       or imm.astest_gas_series("KXAAAGASDTX")) else "blocked")
-        self.assertEqual(r("KXAAAGASDNYC-26SEP08-4.14"), "blocked")
-        self.assertEqual(r("KXAAAGASD-26SEP08-4.14"), "blocked")   # gas trial ended 10/08
-        # the national AAA monthly, cut 2026-10-25 (Jack: "Cut KXAAAGASM");
-        # the state monthly is a different series
-        self.assertEqual(r("KXAAAGASM-26OCT31-3.10"), "blocked")
-        self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASM-26OCT31-3.10"))
-        self.assertFalse(IncentiveMarketMaker._blocked("KXAAAGASMTX-26OCT31-2.80"))
+        # The gas machinery as an un-block of the 2026-11-16 fuel cut would leave
+        # it (_without_fuel_cut, as 26b35ef runs its other dormant-gas tests)
+        with _without_fuel_cut():
+            self.assertEqual(r("KXAAAGASDTX-26SEP08-4.14"),
+                             "allowed" if (imm.GB_STATE_QUOTE
+                                           or imm.astest_gas_series("KXAAAGASDTX")) else "blocked")
+            self.assertEqual(r("KXAAAGASDNYC-26SEP08-4.14"), "blocked")
+            self.assertEqual(r("KXAAAGASD-26SEP08-4.14"), "blocked")   # gas trial ended 10/08
+            # the national AAA monthly, cut 2026-10-25 (Jack: "Cut KXAAAGASM");
+            # the state monthly is a different series
+            self.assertEqual(r("KXAAAGASM-26OCT31-3.10"), "blocked")
+            self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASM-26OCT31-3.10"))
+            self.assertFalse(IncentiveMarketMaker._blocked("KXAAAGASMTX-26OCT31-2.80"))
+        # ...and with the fuel cut on (Jack 2026-11-16: "turn off gas and diesel
+        # markets from IMM"), the state monthly is frozen too (TestFuelCut)
+        self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASMTX-26OCT31-2.80"))
+        self.assertEqual(r("KXAAAGASDTX-26SEP08-4.14"), "blocked")
         # blocklist wins over everything (other bots' books)
         # (the KXHIGH dailies: the IMM's own high-temperature family since
         # 2026-10-23, the high bot's block only with the family off)
