@@ -1537,6 +1537,91 @@ class TestScreen(unittest.TestCase):
             "KXRTTV", "KXRTTV-VIS", None, close_time=tv_close),
             tv_close - timedelta(days=7))
 
+    def test_kxart_sale_date_from_the_rules(self):
+        # Jack 2026-11-17: "why is KXART-CHR45A17NOV26, KXART-CHR45B19NOV26
+        # ... not quoting", then "Also fix the parser". Kalshi's rules and
+        # closes as read that morning.
+        def mk(rules, close):
+            return {"rules_primary": rules, "close_time": close}
+
+        def midnight(d):                                   # 00:00 EST, Nov
+            return utc(2026, 11, d, 5, 0)
+
+        def cut(ev, market, raw=None):
+            return imm.apply_series_cutoff_adjustments(
+                "KXART", ev, raw,
+                close_time=imm.parse_iso_utc(market["close_time"]),
+                market=market)
+
+        chr_b = mk("If the sale price including buyer's premium of the "
+                   "Braided Bun (2022; lot 45B) by Ewa Juszkiewicz on Artnet "
+                   "is above $600K during Christie's New York 21st Century "
+                   "Evening Sale (sale 24499), beginning November 19, 2026 at "
+                   "7:00 PM EST, then the market resolves to Yes.",
+                   "2026-11-20T15:00:00Z")
+        klimt = mk("If the sale price including buyer's premium of the "
+                   "Litzlbergkeller by Gustav Klimt on Artnet is above $50M "
+                   "at the Christie's New York auction on November 17, 2026, "
+                   "then the market resolves to Yes.", "2026-11-18T15:00:00Z")
+        koch = mk("If the sale price including buyer’s premium of the "
+                  "Champ d'avoine et coquelicots by Claude Monet is above $8M "
+                  "at the Christie’s auctions of the William I. Koch "
+                  "Collection in New York on November 17–18, 2026, then "
+                  "the market resolves to Yes.", "2026-11-19T15:00:00Z")
+        phillips = mk("If the sale price including buyer's premium of the "
+                      "JUUL Smoke (2021; lot 22) by Avery Singer on Artnet is "
+                      "above $400K during Phillips New York's November 2026 "
+                      "Modern & Contemporary Art Evening Sale (sale NY010726), "
+                      "then the market resolves to Yes.",
+                      "2026-11-19T15:00:00Z")
+        for ev in ("KXART-PHI22NOV26", "KXART-PHI11NOV26"):
+            imm._config_gaps.pop(ev, None)
+            imm._release_guard_warned.discard(ev)
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, clear=True):
+            # a lot letter reads (16 of 60 events stood down from 11/11)
+            for ev, d in (("KXART-CHR45A17NOV26", 17),
+                          ("KXART-CHR45B19NOV26", 19),
+                          ("KXART-CHR5B19NOV26", 19),
+                          ("KXART-SOT4A16NOV26", 16),
+                          ("KXART-CHR71920NOV26", 20)):
+                self.assertEqual(imm.auction_event_date(ev), midnight(d), ev)
+            # ... so the B lot quotes again, to the midnight before its sale
+            self.assertEqual(cut("KXART-CHR45B19NOV26", chr_b), midnight(19))
+            # the rules beat a LATER ticker day: the Klimt sells the 17th
+            self.assertEqual(imm.auction_event_date("KXART-KLILIT18NOV26"),
+                             midnight(18))
+            self.assertEqual(cut("KXART-KLILIT18NOV26", klimt), midnight(17))
+            # a range counts from its first day (ticker: the 20th)
+            self.assertEqual(imm.auction_rules_date(koch), midnight(17))
+            self.assertEqual(cut("KXART-KOCHMON20NOV26", koch), midnight(17))
+            # no date in the rules, no row: stood down -- the Phillips
+            # ticker's "22" is lot 22, which read as a Nov 22 sale
+            self.assertIsNone(imm.auction_rules_date(phillips))
+            self.assertEqual(cut("KXART-PHI22NOV26", phillips),
+                             imm.RELEASE_GUARD_UNKNOWN)
+            self.assertIn("rules or an event_start_overrides row",
+                          imm._config_gaps["KXART-PHI22NOV26"]["msg"])
+            # the day before close bounds a rules date past it
+            late = mk("... beginning November 22, 2026 at 7:00 PM EST ...",
+                      "2026-11-19T15:00:00Z")
+            self.assertEqual(imm.auction_sale_day("KXART-X22NOV26", late),
+                             midnight(18))
+            # never loosens an earlier cutoff
+            self.assertEqual(cut("KXART-CHR45B19NOV26", chr_b, midnight(10)),
+                             midnight(10))
+        # a hand row dates the sale and replaces the ticker read (lot 11 is
+        # no Nov 11 sale; lot 22 no Nov 22 one)
+        row = imm.ET.localize(datetime(2026, 11, 18, 17, 0)).astimezone(
+            timezone.utc)
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES,
+                             {"KXART-PHI11NOV26": row,
+                              "KXART-PHI22NOV26": row}, clear=True):
+            self.assertEqual(cut("KXART-PHI11NOV26", phillips), midnight(18))
+            self.assertEqual(cut("KXART-PHI22NOV26", phillips), midnight(18))
+            # ... but never past the rules' own date
+            self.assertEqual(imm.auction_sale_day("KXART-PHI22NOV26", klimt),
+                             midnight(17))
+
     def test_kxart_auction_day_cutoff_and_three_per_event(self):
         # Jack 2026-09-25: "allowlist KXART, max 3 markets per event".
         # KXART-SOT10107OCT26 = Sotheby's lot 101, live auction beginning
@@ -1557,22 +1642,31 @@ class TestScreen(unittest.TestCase):
                     "KXART-SOT10107XXX26", "KXART"):
             self.assertIsNone(imm.auction_event_date(bad), bad)
         # the shared tightener (both producers + the quote-gaps mirror)
-        # anchors on the sale day and never loosens an earlier cutoff
-        self.assertEqual(imm.apply_series_cutoff_adjustments(
-            "KXART", ev, None, close_time=close), sale_midnight)
-        self.assertEqual(imm.apply_series_cutoff_adjustments(
-            "KXART", ev, sale_midnight - timedelta(days=2), close_time=close),
-            sale_midnight - timedelta(days=2))
-        # unreadable segment: stood down, fail closed
-        self.assertEqual(imm.apply_series_cutoff_adjustments(
-            "KXART", "KXART-SOTHEBYS", None, close_time=close),
-            imm.RELEASE_GUARD_UNKNOWN)
+        # anchors on the sale day and never loosens an earlier cutoff; since
+        # 2026-11-17 the sale date must ALSO be in the market's rules (or a
+        # hand row) -- the ticker alone is no proof
+        sot = {"rules_primary": "If the lot sold price of lot 101 on "
+               "Sotheby's is above $30,000 during the live auction beginning "
+               "October 7, 2026 at 11:00 AM, then the market resolves to Yes."}
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, clear=True):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXART", ev, None, close_time=close, market=sot), sale_midnight)
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXART", ev, sale_midnight - timedelta(days=2),
+                close_time=close, market=sot),
+                sale_midnight - timedelta(days=2))
+            # no date in the rules (or no market) and no row: stood down
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXART", "KXART-SOTHEBYS", None, close_time=close),
+                imm.RELEASE_GUARD_UNKNOWN)
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXART", ev, None, close_time=close), imm.RELEASE_GUARD_UNKNOWN)
         # other series never see the rule
         self.assertIsNone(imm.apply_series_cutoff_adjustments(
             "KXRT", "KXRT-HEA", None, close_time=None))
         with mock.patch.object(imm, "AUCTION_DATE_SERIES", frozenset()):
             self.assertIsNone(imm.apply_series_cutoff_adjustments(
-                "KXART", ev, None, close_time=close))
+                "KXART", ev, None, close_time=close, market=sot))
         # screen: quotable the evening before, out from midnight ET
         m = _meta(ticker=f"{ev}-30000", event_ticker=ev, series="KXART",
                   close_time=close, cutoff=sale_midnight)
@@ -29188,6 +29282,11 @@ class TestArtFloorBoost(unittest.TestCase):
         client.markets[self.T] = {
             "ticker": self.T, "event_ticker": self.EV, "status": "active",
             "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            # the sale date the auction cutoff requires (2026-11-17)
+            "rules_primary": "If the lot sold price of lot 106 on Sotheby's "
+                             "is above $10M during the live auction beginning "
+                             "November 16, 2068 at 7:00 PM EST, then the "
+                             "market resolves to Yes.",
             "yes_bid_dollars": f"{yes[-1][0] / 100:.4f}",
             "yes_ask_dollars": f"{(100 - no[-1][0]) / 100:.4f}",
             "volume_fp": "0.00"}

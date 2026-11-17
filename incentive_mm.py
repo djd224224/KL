@@ -23159,16 +23159,91 @@ _write_config_gaps()           # the live bot starts the file empty
 # not parse gets RELEASE_GUARD_UNKNOWN (stood down, fail closed), logged
 # once. Env IMM_AUCTION_DATE_SERIES (comma list); empty disables the rule,
 # which means quoting through the hammer -- do not.
+#
+# THE SALE DATE FROM THE RULES (Jack 2026-11-17: "why is
+# KXART-CHR45A17NOV26, KXART-CHR45B19NOV26 ... not quoting", then "Also fix
+# the parser"). The ticker's trailing date is wrong in BOTH directions:
+#   - a lot letter (Christie's CHR45A17NOV26 / CHR5B19NOV26, Sotheby's
+#     SOT4A16NOV26) never matched the segment pattern, so 16 of the 60 open
+#     events stood down from their listing (11/11) and never quoted;
+#   - Phillips tickers carry the lot and NO day (PHI22NOV26 = lot 22, read
+#     as Nov 22 on a market closing 11/19), and some tickers name a later
+#     day than the sale (KLILIT18NOV26 and PICBAI18NOV26 sell Nov 17 per
+#     their rules; KOCHMON20NOV26 sells Nov 17-18 and closes 11/19). On
+#     11/17 the bot was quoting six such events on their sale day, 51
+#     orders resting through the hammer.
+# So the sale day is the EARLIEST of: every date in the market's own
+# rules_primary ("beginning November 19, 2026 at 7:00 PM EST"; "on November
+# 17-18, 2026" -> the 17th), an event_start_overrides row's ET day (a
+# human's check -- it replaces the ticker read, which on a Phillips lot is a
+# lot number), the ticker's trailing date (lot letter now allowed), and the
+# day before Kalshi's close (every dated lot closes 15:00Z the day after its
+# sale). A date in the rules OR a row is REQUIRED: with neither (Phillips
+# states none) the event stands down, fail closed, logged once; a row
+# (imm_earnings_overrides.py --set EVENT ISO) brings it back.
 AUCTION_DATE_SERIES = frozenset(
     s.strip() for s in os.environ.get(
         "IMM_AUCTION_DATE_SERIES", "KXART").split(",") if s.strip())
-_AUCTION_SEG_RE = re.compile(r"^[A-Z]+\d*?(\d{2})([A-Z]{3})(\d{2})$")
+_AUCTION_SEG_RE = re.compile(r"^[A-Z]+(?:\d+[A-Z]?)?(\d{2})([A-Z]{3})(\d{2})$")
+_AUCTION_RULES_DATE_RE = re.compile(
+    r"\b(January|February|March|April|May|June|July|August|September|October"
+    r"|November|December)\s+(\d{1,2})(?:\s*[-–—]\s*\d{1,2})?,\s*"
+    r"(\d{4})\b")
+_MONTH_NAMES = {m: i + 1 for i, m in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July",
+     "August", "September", "October", "November", "December"])}
+
+
+def _et_day_start(y: int, mo: int, d: int) -> datetime:
+    """00:00 ET of a calendar day, as UTC."""
+    return ET.localize(datetime(y, mo, d)).astimezone(timezone.utc)
+
+
+def auction_rules_date(market: Optional[dict]) -> Optional[datetime]:
+    """00:00 ET (as UTC) of the EARLIEST date the market's rules_primary
+    names (a range counts from its first day); None when it names none."""
+    best: Optional[datetime] = None
+    for mon, dd, yyyy in _AUCTION_RULES_DATE_RE.findall(
+            (market or {}).get("rules_primary") or ""):
+        try:
+            d = _et_day_start(int(yyyy), _MONTH_NAMES[mon], int(dd))
+        except (KeyError, ValueError):
+            continue
+        best = d if best is None else min(best, d)
+    return best
+
+
+def auction_sale_day(event_ticker: str, market: Optional[dict] = None,
+                     close_time: Optional[datetime] = None) -> Optional[datetime]:
+    """00:00 ET (as UTC) of the earliest day the lot can sell -- the rules'
+    dates, an event_start_overrides row, the ticker's trailing date (only
+    without a row) and the day before close, earliest wins. None (stand
+    down) when neither the rules nor a row dates the sale."""
+    rules = auction_rules_date(market)
+    row = EVENT_START_OVERRIDES.get(event_ticker)
+    if rules is None and row is None:
+        return None
+    days = [rules] if rules is not None else []
+    if row is not None:
+        r = row.astimezone(ET)
+        days.append(_et_day_start(r.year, r.month, r.day))
+    else:
+        td = auction_event_date(event_ticker)
+        if td is not None:
+            days.append(td)
+    close = close_time or parse_iso_utc((market or {}).get("close_time", ""))
+    if close is not None:
+        c = (close.astimezone(ET) - timedelta(days=1)).date()
+        days.append(_et_day_start(c.year, c.month, c.day))
+    return min(days)
 
 
 def auction_event_date(event_ticker: str) -> Optional[datetime]:
     """00:00 ET (as UTC) of the auction day embedded at the END of a
-    KXART-style event segment: 'KXART-SOT10107OCT26' -> 2026-10-07. None
-    when the segment carries no trailing DDMMMYY or the date is invalid."""
+    KXART-style event segment: 'KXART-SOT10107OCT26' -> 2026-10-07, a lot
+    letter allowed ('KXART-CHR45B19NOV26' -> 2026-11-19). None when the
+    segment carries no trailing DDMMMYY or the date is invalid. Not proof of
+    the sale day on its own -- see auction_sale_day."""
     parts = event_ticker.split("-")
     if len(parts) < 2:
         return None
@@ -24515,15 +24590,16 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         cutoff = guard if cutoff is None else min(cutoff, guard)
     if series in AUCTION_DATE_SERIES:
         # AUCTION-DAY CUTOFF (2026-09-25, see AUCTION_DATE_SERIES): out at
-        # 00:00 ET on the sale day read from the event segment's trailing
-        # DDMMMYY; unreadable -> stood down (fail closed), logged once.
-        ad = auction_event_date(event_ticker)
+        # 00:00 ET on the earliest sale day the rules, a hand row, the
+        # ticker and the close allow (2026-11-17); no date in the rules and
+        # no row -> stood down (fail closed), logged once.
+        ad = auction_sale_day(event_ticker, market, close_time)
         if ad is None:
             ad = RELEASE_GUARD_UNKNOWN
             _config_gap(series, event_ticker,
-                        f"auction-day cutoff needs a trailing "
-                        f"DDMMMYY date in {event_ticker} -- standing it down "
-                        f"(fail closed)")
+                        f"auction-day cutoff needs the sale date in "
+                        f"{event_ticker}'s rules or an event_start_overrides "
+                        f"row -- standing it down (fail closed)")
         cutoff = ad if cutoff is None else min(cutoff, ad)
     if ov and ov.pre_event_days is not None:
         # AWARDS PRE-EVENT STAND-DOWN (2026-09-25, see AWARDS_SERIES): out
