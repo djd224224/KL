@@ -172,6 +172,8 @@ class TestCoverage(unittest.TestCase):
                                   lambda s: None if s == "KXNEWTSY" else {"inst": "x"}), \
                 mock.patch.object(tf, "strike_of", lambda t: 5.17), \
                 mock.patch.object(imm, "vercel_series", lambda s: s == "KXNEWVREQ"), \
+                mock.patch.object(imm, "VERCEL_SERIES_FILE",
+                                  os.path.join(self.dir, "no_vercel_series.json")), \
                 mock.patch.object(imm, "ytw_series", lambda s: s == "KXYTVIEWSW"), \
                 mock.patch.object(imm, "YTW_ARTISTS", frozenset({"KAT"})):
             gaps = mc.find_gaps(progs, self.now, [mc.check_treasury, mc.check_vercel,
@@ -181,6 +183,32 @@ class TestCoverage(unittest.TestCase):
             "Vercel labs (vercel_fair)|KXNEWVREQ: no lab for this series in vercel_fair.LAB_SERIES",
             "YouTube weekly pilot (yt_weekly_fair)|ARI"])
         self.assertTrue(gaps["YouTube weekly pilot (yt_weekly_fair)|ARI"]["once"])
+
+    def test_the_bots_discovered_vercel_series_are_covered(self):
+        # Jack 2026-11-17: "Yes, fix both" -- the watch read every series the
+        # Vercel family discovered as "no lab" while the bot quoted it
+        import vercel_fair as vf
+        series_file = os.path.join(self.dir, "vercel_series.json")
+        _write(series_file, {"at": "2026-11-13T23:08:13+00:00",
+                             "series": {"KXZAIVSPEND": ["lab", "zai", "spend"],
+                                        "KXOSSPEND": ["open", "cost"]}})
+        progs = {"KXZAIVSPEND-20NOV26-T11P7": {}, "KXOSSPEND-20NOV26-T20P2": {},
+                 "KXNEWVREQ-20NOV26-T5": {}}
+        enrolled = ("KXZAIVSPEND", "KXOSSPEND", "KXNEWVREQ")
+        nolab = "Vercel labs (vercel_fair)|{}: no lab for this series in vercel_fair.LAB_SERIES"
+        with mock.patch.dict(vf.LAB_SERIES), mock.patch.dict(vf.OPEN_SPECS), \
+                mock.patch.object(vf, "ALL_SERIES", vf.ALL_SERIES), \
+                mock.patch.object(vf, "DOW_SERIES", vf.DOW_SERIES), \
+                mock.patch.object(imm, "vercel_series", lambda s: s in enrolled):
+            with mock.patch.object(imm, "VERCEL_SERIES_FILE",
+                                   os.path.join(self.dir, "missing.json")):
+                before = mc.find_gaps(progs, self.now, [mc.check_vercel])
+            with mock.patch.object(imm, "VERCEL_SERIES_FILE", series_file):
+                after = mc.find_gaps(progs, self.now, [mc.check_vercel])
+        self.assertEqual(sorted(before), sorted(nolab.format(s) for s in enrolled))
+        # the bot's two discoveries are covered; a series it never saved is not
+        self.assertEqual(sorted(after), [nolab.format("KXNEWVREQ")])
+        self.assertNotIn("KXZAIVSPEND", vf.ALL_SERIES)      # nothing leaks
 
     def test_datacenter_and_unmodelled_sports_ladders(self):
         dc = os.path.join(self.dir, "datacenter_fair.json")

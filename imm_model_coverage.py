@@ -388,8 +388,19 @@ def check_treasury(progs: Dict[str, dict], now_ts: float) -> List[dict]:
 def check_vercel(progs: Dict[str, dict], now_ts: float) -> List[dict]:
     """Vercel AI-gateway labs (vercel_fair.LAB_SERIES + the open-weights
     share): FAIL-CLOSED -- an enrolled series the model has no lab for, or
-    an event it can't date, never gets a read."""
+    an event it can't date, never gets a read.
+
+    The family DISCOVERS its series (2026-11-13), and the bot registers what
+    it finds in its refresher thread only, so in this process vercel_fair
+    has the base eight. Its saved discoveries (VERCEL_SERIES_FILE) are
+    registered here first, so "covered" means what the live gate means.
+    Before that, every discovered series read "no lab" while the bot quoted
+    it (Jack 2026-11-17: "Yes, fix both", after the 11/13, 11/14 and 11/17
+    alerts on KXGOOGVSPEND / KXOSSPEND / KXZAIVREQ / KXZAIVSPEND)."""
     import vercel_fair as vf
+    path = getattr(imm, "VERCEL_SERIES_FILE", None)
+    if path and hasattr(vf, "load_specs"):
+        vf.register(vf.load_specs(path))
     groups: Dict[tuple, List[str]] = defaultdict(list)
     for t in progs:
         s = _series(t)

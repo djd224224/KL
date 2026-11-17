@@ -207,6 +207,44 @@ class TestGapAlert(unittest.TestCase):
         self.assertAlmostEqual(items["gap:KXA-26"]["est"], 2000 * fw.GAP_CAPTURE, places=2)
         self.assertAlmostEqual(items["new:KXNEW"]["est"], 900 * fw.GAP_CAPTURE, places=2)
 
+    def test_each_config_gap_names_its_own_fix(self):
+        # Jack 2026-11-17: "Yes, fix both" -- KXART-PHI17NOV26's item said to
+        # add an election / award row to an auction lot
+        gaps = {
+            "KXA-26": {"msg": "KXA-26 has no verified election day in ELECTION_DATES "
+                              "-- standing it down (fail closed)"},
+            "KXART-PHI17NOV26": {"msg": "auction-day cutoff needs the sale date in "
+                                        "KXART-PHI17NOV26's rules or an "
+                                        "event_start_overrides row -- standing it "
+                                        "down (fail closed)"},
+            "KXGGNOM-27": {"msg": "no hand-table row for KXGGNOM-27 -- on its family's "
+                                  "earliest date for the show, 2026-12-08"},
+            "KXOSCARNOM-27": {"msg": "pre-event stand-down needs the event start but "
+                                     "KXOSCARNOM-27 has no usable date"},
+            "KXNYCMARATHON-26": {"msg": "KXNYCMARATHON-26 has no race start on file "
+                                        "(EVENT_START_OVERRIDES) -- standing it down"},
+            "KXBIGSKY-26": {"msg": "Big Sky stop needs the month in KXBIGSKY-26 "
+                                   "(<YYMON>) -- standing it down (fail closed)"},
+            "KXB-26": {"series": "KXB"},
+        }
+        items = fw.gap_items(self.PROGS, gaps, {}, set())
+        fix = {k[len("gap:"):]: it["fix"] for k, it in items.items()}
+        self.assertEqual(fix["KXA-26"], "by hand: python imm_rows.py election add KXA-26 "
+                                        "YYYY-MM-DD --source A --source B")
+        self.assertTrue(fix["KXART-PHI17NOV26"].startswith(
+            "by hand: python imm_earnings_overrides.py --set KXART-PHI17NOV26 "
+            "\"YYYY-MM-DDT00:00:00-05:00\" (00:00 ET on the sale day"), fix["KXART-PHI17NOV26"])
+        for ev in ("KXGGNOM-27", "KXOSCARNOM-27"):
+            self.assertEqual(fix[ev], f"by hand: python imm_rows.py award add {ev} "
+                                      "YYYY-MM-DD --source A --source B")
+        self.assertIn("imm_earnings_overrides.py --set KXNYCMARATHON-26 ",
+                      fix["KXNYCMARATHON-26"])
+        self.assertEqual(fix["KXBIGSKY-26"], fw.GAP_FIX_OTHER)
+        self.assertEqual(fix["KXB-26"], fw.GAP_FIX_OTHER)
+        for f in fix.values():
+            self.assertNotIn("election|award", f)
+            f.encode("ascii")          # the task console is cp1252
+
     def test_a_new_weather_series_is_sent_whatever_its_estimate(self):
         # Jack 2026-10-31: "make sure new markets with 'RAIN', 'TEMP', etc are
         # always considered for auto-quoting as part of these families"

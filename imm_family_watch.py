@@ -261,6 +261,39 @@ def date_us_general(client, progs: Dict[str, dict], dry: bool) -> List[Tuple[str
     return out
 
 
+# THE HAND FIX FOR A CONFIG GAP, by the kind the bot's message names (Jack
+# 2026-11-17: "Yes, fix both", after KXART-PHI17NOV26's item told him to add an
+# election / award row to an auction lot). Only the election and awards
+# tables take an imm_rows.py row; an auction lot or a race takes an
+# event_start_overrides row; every other kind reads its date from the ticker
+# or the rules, and no row brings it back (a hand row only ever tightens).
+_GAP_FIXES = (
+    ("verified election day",
+     "by hand: python imm_rows.py election add {ev} YYYY-MM-DD --source A --source B"),
+    ("hand-table row",
+     "by hand: python imm_rows.py award add {ev} YYYY-MM-DD --source A --source B"),
+    ("pre-event stand-down",
+     "by hand: python imm_rows.py award add {ev} YYYY-MM-DD --source A --source B"),
+    ("auction-day cutoff",
+     "by hand: python imm_earnings_overrides.py --set {ev} \"YYYY-MM-DDT00:00:00-05:00\" "
+     "(00:00 ET on the sale day, from the auction house's own sale page; -04:00 in "
+     "daylight time)"),
+    ("no race start",
+     "by hand: python imm_earnings_overrides.py --set {ev} \"YYYY-MM-DDTHH:MM:00-05:00\" "
+     "(the division's start; -04:00 in daylight time)"),
+)
+GAP_FIX_OTHER = ("no row brings this kind back: the bot reads its date from the "
+                 "ticker or the rules (a code fix, or leave it dark)")
+
+
+def gap_fix(ev: str, msg: str) -> str:
+    """The hand fix for event `ev`'s config gap, read off the bot's message."""
+    for needle, fix in _GAP_FIXES:
+        if needle in (msg or ""):
+            return fix.format(ev=ev)
+    return GAP_FIX_OTHER
+
+
 def gap_items(progs: Dict[str, dict], gaps: dict, not_allowed: Dict[str, float],
               baseline: set, starts: Dict[str, dict] = None) -> Dict[str, dict]:
     """What is dark for want of admission or a row, keyed for the alert state:
@@ -280,8 +313,7 @@ def gap_items(progs: Dict[str, dict], gaps: dict, not_allowed: Dict[str, float],
         items[f"gap:{ev}"] = {
             "est": round(pools.get(ev, 0.0) * GAP_CAPTURE, 2),
             "what": f"{ev}: {g.get('msg') or 'config gap'}",
-            "fix": "by hand: python imm_rows.py election|award add EVENT "
-                   "YYYY-MM-DD --source A --source B"}
+            "fix": gap_fix(ev, g.get("msg"))}
     for s, dpd in sorted(not_allowed.items()):
         if s in baseline:
             continue
