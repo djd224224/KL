@@ -47986,6 +47986,99 @@ class TestListedComboFair(unittest.TestCase):
             self._snap(ev_err="no read", ev_hold=now + 600)    # no fair: left to the gate
             self.assertEqual(imm.fair_underlying_holds(now), {})
 
+    def test_every_path_is_gated(self):
+        # Jack 2026-11-17: "can you gate combos picked up by other things e.g. market-wave?"
+        now = time.time()
+        inx = "KXINXPARTYCOMBO-30JAN-REP-0-10"
+        listed = {}
+        with mock.patch.object(imm, "pvd_entry", lambda tk, now_utc=None: listed.get(tk)):
+            self.assertTrue(imm.listed_combo_gated(self.T))
+            self.assertFalse(imm.listed_combo_gated(inx))           # the election family alone
+            self.assertIsNone(imm.fair_underlying_of(inx))
+            self.assertFalse(imm.listed_combo_gated("KXMVECROSSCATEGORY-S1-A"))
+            listed[inx] = {"stop": None}                             # a wave picked it up
+            self.assertTrue(imm.listed_combo_gated(inx))
+            self.assertEqual(imm.fair_underlying_of(inx), "lcombo KXINXPARTYCOMBO-30JAN")
+            # a wave-listed combo takes the same caps as any other, and never leads
+            self._snap()
+            listed[self.T] = {"stop": None}
+            why, _inputs, caps = imm.listed_combo_gate(self.T, now, 23, 63)
+            self.assertEqual((why, caps), ("", (13, 25)))
+            self.assertIsNone(imm.listed_combo_fair_c(self.T, now))
+        with mock.patch.object(imm, "LISTED_COMBO_FAIR", False):
+            self.assertFalse(imm.listed_combo_gated(self.T))
+
+    def test_a_wave_listed_ungated_combo_rests_outside_its_band(self):
+        """An ungated grid's market on the wave list goes through the gate in the quote loop:
+        KXINXPARTYCOMBO-30JAN-REP-0-10 (7.6c, band 6.4-9.2: bids <= 4, asks >= 12) on an 8x30
+        book, listed with limits that would join the 8c bid: the bid is held to 4c, the offer
+        rests at the 30c touch."""
+        t, ev = "KXINXPARTYCOMBO-30JAN-REP-0-10", "KXINXPARTYCOMBO-30JAN"
+        now = time.time()
+        imm._listed_combo_state["snap"] = {
+            "checked_ts": now, "legs": {}, "errors": [], "unmapped": [], "priced_series": [],
+            "events": {ev: {"legs": ["KXPRESPARTY-2028-D", "KXPRESPARTY-2028-R"], "ts": now,
+                            "hold_until": None, "n": 10, "n_priced": 10, "err": None}},
+            "markets": {t: {"event": ev, "outcome": "Republican", "bin": "0% to 10%",
+                            "p": 0.076, "p_lo": 0.064, "p_hi": 0.092, "ts": now,
+                            "hold_until": None, "cut": False}}}
+        with open(imm.pvd_path(), "w", encoding="utf-8") as f:
+            json.dump({"stop": (datetime.now(timezone.utc) + timedelta(hours=6)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+                       "markets": {t: {"bid_max": 8, "ask_min": 9, "size": 200}}}, f)
+
+        def unlist():
+            try:
+                os.remove(imm.pvd_path())
+            except FileNotFoundError:
+                pass
+            imm._pvd_state["mtime"] = 0.0
+            imm.load_pvd_markets()
+            imm.PVD_REMOVED.clear()
+        self.addCleanup(unlist)
+        imm._pvd_state["mtime"] = 0.0
+        imm.load_pvd_markets()
+        self.assertIsNotNone(imm.pvd_entry(t))
+        self.assertTrue(imm.listed_combo_gated(t))
+        client = FakeClient()
+        close = "2029-12-31T21:00:00Z"
+        client.programs.append(
+            {"market_ticker": t, "incentive_type": "liquidity", "period_reward": 90000000,
+             "target_size_fp": "1000.00", "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[t] = {"ticker": t, "event_ticker": ev, "status": "active",
+                             "close_time": close, "expected_expiration_time": close,
+                             "yes_bid_dollars": "0.08", "yes_ask_dollars": "0.3000",
+                             "volume_fp": "0.00"}
+        client.books[t] = {"orderbook_fp": {"yes_dollars": [["0.08", "5000"]],
+                                            "no_dollars": [["0.70", "5000"]]}}
+        for p_ in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                   mock.patch.object(imm, "LADDER_MODE", "atref"),
+                   mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99),
+                   mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"),
+                   mock.patch.object(imm, "PVD_OFF_USUAL_COLD", False),
+                   mock.patch.object(imm, "SERIES_HOUR_MULTS", [])):
+            p_.start()
+            self.addCleanup(p_.stop)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            for _ in range(3):
+                for v in imm._listed_combo_state["snap"]["markets"].values():
+                    v["ts"] = time.time()
+                imm._listed_combo_state["snap"]["events"][ev]["ts"] = time.time()
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+        rest = sorted((o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
+                      if o["ticker"] == t and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS)
+        self.assertTrue(rest, [s_ for s_ in lines if t in s_ or "universe" in s_
+                               or "KXINX" in s_ or "post-vote" in s_][-15:])
+        self.assertTrue(all(px <= 4 for side, px in rest if side == "bid"), rest)
+        self.assertTrue(all(px >= 12 for side, px in rest if side == "ask"), rest)
+        self.assertIn(("ask", 30), rest)
+        self.assertNotIn(("bid", 8), rest)                 # the list's limit alone allowed it
+
     def test_leads_wait_for_jack(self):
         now = time.time()
         self._snap()

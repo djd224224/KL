@@ -20738,8 +20738,10 @@ _LISTED_COMBO_RE = _COMBO_NAME_RE
 # THE COMBOS ALREADY QUOTING STAY AS THEY ARE (Jack 2026-11-17: "leave the combos, that are
 # already quoting e.g. french election"): the election-family grids quoting before this gate
 # -- Le Pen x EUR/USD, party x S&P / CPI, and party x GDP (quoting 11/12-11/15 until its
-# program ended) -- keep the election family's own quoting, no gate, no hold pull; the fair
-# still prices them in the status file. Every other listed combo goes through the gate.
+# program ended) -- keep the election family's own quoting, no gate, no hold pull, while the
+# family alone quotes them (a wave- or cheap-listed market of theirs is gated:
+# listed_combo_gated); the fair still prices them in the status file. Every other listed combo
+# goes through the gate.
 LISTED_COMBO_UNGATED = frozenset(s_.strip().upper() for s_ in os.environ.get(
     "IMM_LISTED_COMBO_UNGATED",
     "KXLEPENEURCOMBO,KXINXPARTYCOMBO,KXCPIPARTYCOMBO,KXGDPPARTYCOMBO").split(",") if s_.strip())
@@ -20751,6 +20753,19 @@ def listed_combo_series(series: str) -> bool:
     only off the listed combo fair -- all but the ones already quoting (LISTED_COMBO_UNGATED)."""
     return LISTED_COMBO_FAIR and bool(_LISTED_COMBO_RE.match(series or "")) \
         and series not in LISTED_COMBO_UNGATED
+
+
+# EVERY OTHER PATH IS GATED TOO (Jack 2026-11-17: "can you gate combos picked up by other
+# things e.g. market-wave?"). The gate is per MARKET: a listed combo market goes through it
+# whichever path picked it up -- a family, the market-wave list or the cheap-side list (both
+# pvd_entry) -- and an ungated series' market (LISTED_COMBO_UNGATED) is ungated only while the
+# election family alone quotes it: once a wave or the cheap-side list takes it, it is gated.
+def listed_combo_gated(ticker: str) -> bool:
+    """Does this market quote only off the listed combo fair?"""
+    s = series_of(ticker)
+    if not (LISTED_COMBO_FAIR and _LISTED_COMBO_RE.match(s or "")):
+        return False
+    return s not in LISTED_COMBO_UNGATED or pvd_entry(ticker) is not None
 
 
 def listed_combo_event(ticker: str) -> str:
@@ -20807,17 +20822,8 @@ def listed_combo_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
         return (f"book {ext_bid}x{ext_ask} vs fair {fair:.1f}c (band {lo_c:.1f}-{hi_c:.1f}, "
                 f"tol {LISTED_COMBO_BAND_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side)",
                 dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad), None)
-    if pvd_entry(ticker) is not None:
-        # WAVE BOOK (as the crypto strikes'): the wave's reference both sides, bounded by the
-        # band itself -- never a bid over p_hi, never an ask under p_lo
-        bid_cap = int(math.floor(hi_c + 1e-9))
-        ask_floor = int(math.ceil(lo_c - 1e-9))
-        caps = (min(bid_cap, 99) if bid_cap >= 1 else None,
-                max(ask_floor, 1) if ask_floor <= 99 else None)
-        if caps == (None, None):
-            return (f"no side inside 1-99c of the band {lo_c:.1f}-{hi_c:.1f}c",
-                    dict(inputs, reason="decided", wave=True), None)
-        return "", dict(inputs, wave=True, bid_cap=caps[0], ask_floor=caps[1]), caps
+    # one rule on every path (EVERY OTHER PATH IS GATED TOO): a wave- or cheap-listed combo
+    # takes the same caps as any other, not the crypto wave books' band edges
     bid_cap = int(math.floor(lo_c - LISTED_COMBO_TOL_CENTS + 1e-9))
     ask_floor = int(math.ceil(hi_c + LISTED_COMBO_TOL_CENTS - 1e-9))
     caps = (bid_cap if bid_cap >= 1 else None, ask_floor if ask_floor <= 99 else None)
@@ -20861,7 +20867,7 @@ def fair_underlying_of(ticker: str) -> Optional[str]:
     if crypto_event_series(s):
         m = _CRYPTO_EVENT_RE.match(s)
         return f"crypto {m.group(1)}" if m else None
-    if listed_combo_series(s):
+    if listed_combo_gated(ticker):
         return f"lcombo {listed_combo_event(ticker)}"
     return None
 
@@ -40378,7 +40384,7 @@ class IncentiveMarketMaker:
                 # FX event gate: the same, inside the live limits
                 _fw, _fi, _fc = fx_event_gate(meta.ticker, _now.timestamp())
                 out = [] if (_fw or _fc is None) else mort_cap_quotes(out, *_fc)
-            if listed_combo_series(meta.series):
+            if listed_combo_gated(meta.ticker):
                 # listed combo gate: the same, the band plus LISTED_COMBO_TOL_CENTS
                 _lw, _li, _lc = listed_combo_gate(meta.ticker, _now.timestamp(), eb, ea)
                 out = [] if (_lw or _lc is None) else mort_cap_quotes(out, *_lc)
@@ -43315,7 +43321,7 @@ class IncentiveMarketMaker:
             # touch fights the band; otherwise every rung below stays LISTED_COMBO_TOL_CENTS
             # outside the band (bids <= p_lo - tol, asks >= p_hi + tol).
             lcv_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
-            if listed_combo_series(meta.series):
+            if listed_combo_gated(t):
                 lc_why, lc_in, lcv_caps = listed_combo_gate(t, now_ts, ext_bid, ext_ask)
                 if lc_why or lcv_caps is None:
                     if t not in self._lcv_stood:
@@ -44592,6 +44598,11 @@ class IncentiveMarketMaker:
                                     f"{'-' if own_pos > 0 else '+'} {PVD_CLOSE_CLAMP_C:g}c, "
                                     f"or cost), no lead {_u_nolead}c")
                             self._unwind_past_cost_noted[t] = _u_ck
+            # LISTED COMBO GATE again, after every path that adds or replaces a rung since the
+            # caps above (the cheap-side rung, the breakeven offset, the unwind): on a combo
+            # nothing rests inside the fair band, whatever path built it
+            if lcv_caps is not None:
+                mq = mort_cap_quotes(mq, *lcv_caps)
             # TWIN CHECK (TWIN_CHECK_MODE): LAST, after every path that adds or
             # moves a rung -- in a mutually exclusive event no bid over what the
             # siblings' bids leave this market worth, and in a two-market
