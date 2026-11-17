@@ -45990,6 +45990,14 @@ class TestNameBidCap(unittest.TestCase):
     from its deepest rung, the rest rest no bid. Short-YES markets and asks
     are untouched."""
 
+    def test_the_default_cap_is_5000(self):
+        # Jack 2026-11-17: "raise the name bid cap to $3k", then "raise to $5K"
+        # (was $1,500)
+        if "IMM_NAME_BID_CAP_USD" in os.environ:
+            self.skipTest("IMM_NAME_BID_CAP_USD set in this environment")
+        self.assertEqual(imm.NAME_BID_CAP_USD, 5000.0)
+        self.assertEqual(imm.NAME_BID_CAP_MODE, "on")
+
     def test_the_cap_keeps_the_best_states_and_trims_the_boundary(self):
         q = imm.Quote
         quotes = [

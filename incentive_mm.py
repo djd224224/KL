@@ -26940,13 +26940,23 @@ def natnom_ask_floor(ticker: str, names: Dict[str, str],
 # almost all 1-4c long-shot bids; -$45/day of the series' ~$630/day modeled
 # reward.
 #
+# RAISED TO $5,000 (Jack 2026-11-17: "raise the name bid cap to $3k", after
+# KXRPRESPRIMARY-28NV rested no YES bid on any name; then, shown that every
+# bid comes back at ~$7.1k (Beshear's 50 states), "raise to $5K"). What-if on
+# the 13:12Z books (the cycle log's wanted bids, states ranked by modeled
+# reward per $): the primaries' bids ~$26k / 631k contracts at $1.5k -> ~$69k
+# / 1.49M at $5k; Nevada gets Vance, Rubio, Carlson and Massie back. The
+# bot's own full totals then: Beshear $7,108, Shapiro $6,904, Harris $6,315,
+# Massie $5,812 ... Warnock $5,376 still trimmed; Vance $4,821, Rubio $4,696
+# and the rest whole.
+#
 # Knobs:
 #   * IMM_NAME_BID_CAP: "on" (default), "dry" (logged, nothing cut), "off".
-#   * IMM_NAME_BID_CAP_USD: the cap, default 1500.
+#   * IMM_NAME_BID_CAP_USD: the cap, default 5000 (1500 from 11/16 to 11/17).
 NAME_BID_CAP_MODE = os.environ.get("IMM_NAME_BID_CAP", "on").strip().lower()
 if NAME_BID_CAP_MODE not in ("on", "dry", "off"):
     NAME_BID_CAP_MODE = "on"
-NAME_BID_CAP_USD = max(0.0, _env_float("IMM_NAME_BID_CAP_USD", 1500.0))
+NAME_BID_CAP_USD = max(0.0, _env_float("IMM_NAME_BID_CAP_USD", 5000.0))
 
 
 def name_bid_cap(quotes: List["Quote"], value_per_day: Dict[str, float],
