@@ -189,6 +189,7 @@ def setUpModule():
     imm.CRYPTO_EVENT_FAIR_FILE = os.path.join(tmp, "crypto_event_fair.json")
     imm.CRYPTO_EVENT_STOP_FILE = os.path.join(tmp, "crypto_event_stop.json")
     imm.FX_EVENT_FAIR_FILE = os.path.join(tmp, "fx_event_fair.json")
+    imm.LISTED_COMBO_FAIR_FILE = os.path.join(tmp, "listed_combo_fair.json")
     # the family source verdicts (2026-09-22) load from the live file at
     # import: redirect the path AND forget what was loaded, or membership
     # tests would depend on the trading box's verdict file
@@ -9429,11 +9430,27 @@ class TestFuelCut(unittest.TestCase):
                   "KXDIESEL-26NOV23-3.70", "KXDIESELEXPORTBAN-27",
                   "KXGAS-26NOV23-3.10", "KXGASD-26NOV17-3.10",
                   "KXGASMAX-26-4.00", "KXGASMIN-26-2.80",
-                  "KXTRUFGAS-26NOV-T1", "KXHORMUZGASCOMBO-27JUL31-A",
+                  "KXTRUFGAS-26NOV-T1",
                   "AAAGASD-26NOV17-3.10", "DIESELM-26NOV-3.70", "GASD-26NOV17-3.10"):
             self.assertTrue(blocked(t), t)
         for s in ("KXAAAGASDCT", "KXDIESELYE", "KXGAS", "KXTRUFGAS", "GAS"):
             self.assertTrue(imm.series_blocklisted(s), s)
+
+    def test_a_combo_with_a_gas_leg_is_no_gas_market(self):
+        # Jack 2026-11-17: "allow gas markets on combos" -- the fuel cut stands aside for a
+        # listed combo (the combo fair gates it); the gas markets themselves stay frozen
+        blocked = imm.IncentiveMarketMaker._blocked
+        self.assertFalse(blocked("KXHORMUZGASCOMBO-27AUG-BACK-LT3.40"))
+        self.assertFalse(imm.series_blocklisted("KXHORMUZGASCOMBO"))
+        self.assertTrue(imm.fuel_cut_waived("KXHORMUZGASCOMBO"))
+        self.assertFalse(imm.fuel_cut_waived("KXMVEGASCOMBO"))          # the RFQ combos
+        self.assertFalse(imm.fuel_cut_waived("KXAAAGASD"))
+        # a combo whose NAME starts like a fuel prefix is waived too
+        self.assertFalse(blocked("KXAAAGASPARTYCOMBO-28-DEM-LT3"))
+        self.assertFalse(imm.series_blocklisted("KXAAAGASPARTYCOMBO"))
+        # ...but nothing else on the list is: the pure-CPI combo stays out
+        self.assertTrue(blocked("KXCPICOMBO-26NOV-0101B"))
+        self.assertTrue(blocked("KXAAAGASD-26NOV17-3.100"))
 
     def test_natural_gas_is_frozen_too(self):
         # Jack 2026-11-16, the same evening: "Block natural gas too"
@@ -27540,7 +27557,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the crypto event gate (2026-11-14)
         # + the FX event gate (2026-11-14)
         # + the snow-day gate (2026-11-14)
-        self.assertEqual(len(conts), 60)   # +1 2026-11-04: pvd_removed (a market off the PVD list)
+        # + the listed combo gate (2026-11-17)
+        self.assertEqual(len(conts), 61)   # +1 2026-11-04: pvd_removed (a market off the PVD list)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -47835,4 +47853,210 @@ class TestEarningOnlyQuotes(unittest.TestCase):
         # flat (under one contract): nothing to unwind
         kept, _ = self.f(qs, yes, no, pos=-0.4)
         self.assertEqual(kept, [("ask", 35, 40)])
+
+
+class TestListedComboFair(unittest.TestCase):
+    """LISTED COMBO FAIR (Jack 2026-11-17: "build the fair, expect combos as a line of
+    business"): Kalshi's listed combo grids quote only off the combo fair -- every bid at most
+    p_lo - tol, every ask at least p_hi + tol, failing closed -- and a priced combo outside the
+    election family joins the listed combo family. Fixture: the 11/17 read of
+    KXIRANWTICOMBO-28JAN-NODEAL-60-74 (18.9c, band 15.3-22.8) on its 23c x 63c book."""
+
+    T = "KXIRANWTICOMBO-28JAN-NODEAL-60-74"
+    EV = "KXIRANWTICOMBO-28JAN"
+
+    def setUp(self):
+        _clean_persist()
+        saved = imm.ALLOWLIST_ONLY
+
+        def restore():
+            imm.ALLOWLIST_ONLY = saved
+            imm._listed_combo_state["snap"] = None
+        self.addCleanup(restore)
+        imm.ALLOWLIST_ONLY = True
+        p_ = mock.patch.dict(imm.SERIES_OVERRIDES)        # family clones come and go
+        p_.start()
+        self.addCleanup(p_.stop)
+
+    def _snap(self, p=0.189, lo=0.153, hi=0.228, age=5.0, hold=None, ev_hold=None, err=None,
+              cut=False, ev_err=None, priced=("KXIRANWTICOMBO",), t=None):
+        now = time.time()
+        mk = ({"event": self.EV, "err": err} if err else
+              {"event": self.EV, "outcome": "Not agreed", "bin": "$60 to $74.99", "p": p,
+               "p_lo": lo, "p_hi": hi, "ts": now - age, "hold_until": hold, "cut": cut})
+        imm._listed_combo_state["snap"] = {
+            "checked_ts": now, "legs": {}, "errors": [], "unmapped": [],
+            "events": {self.EV: {"legs": ["KXUSAIRANAGREEMENT-27-28", f"fut {self.EV}"],
+                                 "ts": now - age, "hold_until": ev_hold, "n": 8,
+                                 "n_priced": 0 if (err or ev_err) else 8, "err": ev_err}},
+            "markets": {t or self.T: mk},
+            "priced_series": [] if (err or ev_err) else list(priced)}
+
+    def test_which_series_and_events(self):
+        self.assertTrue(imm.listed_combo_series("KXIRANWTICOMBO"))
+        self.assertTrue(imm.listed_combo_series("KXHORMUZGASCOMBO"))
+        # Jack 2026-11-17: "leave the combos, that are already quoting e.g. french election"
+        for s_ in ("KXLEPENEURCOMBO", "KXINXPARTYCOMBO", "KXCPIPARTYCOMBO", "KXGDPPARTYCOMBO"):
+            self.assertFalse(imm.listed_combo_series(s_), s_)
+            self.assertIsNone(imm.fair_underlying_of(f"{s_}-30JAN-DEM-0-10"), s_)
+        self.assertFalse(imm.listed_combo_series("KXMVECROSSCATEGORY"))
+        self.assertFalse(imm.listed_combo_series("KXMVESPORTSCOMBO"))      # the RFQ combos
+        self.assertFalse(imm.listed_combo_series("KXCOMBOX"))
+        with mock.patch.object(imm, "LISTED_COMBO_FAIR", False):
+            self.assertFalse(imm.listed_combo_series("KXIRANWTICOMBO"))
+        self.assertEqual(imm.listed_combo_event(self.T), self.EV)
+        self.assertEqual(imm.listed_combo_event("KXLEPENEURCOMBO-27JUN-LP-N1-P1"),
+                         "KXLEPENEURCOMBO-27JUN")
+
+    def test_gate_reasons_fail_closed(self):
+        now = time.time()
+        r = lambda b=23, a=63: imm.listed_combo_gate(self.T, now, b, a)[1].get("reason")
+        imm._listed_combo_state["snap"] = None
+        self.assertEqual(r(), "no_read")
+        self._snap(t="KXIRANWTICOMBO-28JAN-DEAL-LT60")
+        self.assertEqual(r(), "unmapped")                                  # not in the read
+        self._snap(err="no read of KXUSAIRANAGREEMENT-27-28")
+        self.assertEqual(r(), "model")
+        self._snap(cut=True)
+        self.assertEqual(r(), "cutoff")
+        self._snap(age=imm.LISTED_COMBO_TTL_SECS + 5)
+        self.assertEqual(r(), "stale")
+        self._snap(hold=now + 600)
+        self.assertEqual(r(), "leg_hold")
+        self._snap(ev_hold=now + 600)
+        self.assertEqual(r(), "leg_hold")
+        self._snap(hold=now - 1)
+        self.assertIsNone(r())
+        self._snap()
+        self.assertEqual(r(b=28), "band")                  # a bid over 22.8 + 5
+        self.assertEqual(r(a=10), "band")                  # an ask under 15.3 - 5
+        self.assertIsNone(r(b=27, a=11))
+        why, inputs, caps = imm.listed_combo_gate(self.T, now, 23, 63)
+        self.assertEqual((why, caps), ("", (13, 25)))      # 15.3 - 2 / 22.8 + 2
+        self.assertEqual(inputs["fair"], 18.9)
+        self.assertAlmostEqual(imm.listed_combo_fair_c(self.T, now), 18.9)
+        self._snap(p=0.004, lo=0.0, hi=0.02)               # a long shot: asks only
+        self.assertEqual(imm.listed_combo_gate(self.T, now, 1, 50)[2], (None, 4))
+        with mock.patch.object(imm, "LISTED_COMBO_TOL_CENTS", 80):   # 15.3-80 / 22.8+80
+            self._snap()
+            self.assertEqual(r(b=None, a=None), "decided")
+
+    def test_a_priced_combo_joins_the_family_and_the_blocklist_still_wins(self):
+        self._snap()
+        self.assertTrue(imm.listed_combo_admitted("KXIRANWTICOMBO"))
+        self.assertTrue(IncentiveMarketMaker._allowed(self.T))
+        self._snap(ev_err="no read")                       # unpriced: out
+        self.assertFalse(imm.listed_combo_admitted("KXIRANWTICOMBO"))
+        self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+        # a gas-leg combo quotes once priced ("allow gas markets on combos"); unpriced, it
+        # stays out like any other
+        self.assertFalse(IncentiveMarketMaker._allowed("KXHORMUZGASCOMBO-27AUG-BACK-LT3.40"))
+        self._snap(priced=("KXIRANWTICOMBO", "KXHORMUZGASCOMBO"))
+        self.assertTrue(IncentiveMarketMaker._allowed("KXHORMUZGASCOMBO-27AUG-BACK-LT3.40"))
+        # the pure-CPI combo stays blocked even if priced
+        self._snap(priced=("KXIRANWTICOMBO", "KXCPICOMBO"))
+        self.assertFalse(IncentiveMarketMaker._allowed("KXCPICOMBO-26NOV-0101B"))
+        with mock.patch.object(imm, "LISTED_COMBO_FAIR", False):
+            self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+
+    def test_family_guard_set_and_the_election_combos_keep_theirs(self):
+        imm.SERIES_OVERRIDES[imm.LISTED_COMBO_ARCHETYPE] = dataclasses.replace(
+            imm.SERIES_OVERRIDES[imm.LISTED_COMBO_ARCHETYPE], size_mult=3.0)
+        self._snap(priced=("KXFOOCOMBO", "KXBARCOMBO"))
+        with mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXBARCOMBO"}):
+            imm.ensure_family_override("KXFOOCOMBO")
+            imm.ensure_family_override("KXBARCOMBO")
+        foo, bar = imm.SERIES_OVERRIDES["KXFOOCOMBO"], imm.SERIES_OVERRIDES["KXBARCOMBO"]
+        self.assertEqual((foo.size_mult, foo.price_min_cents, foo.price_max_cents), (3.0, 1, 99))
+        self.assertEqual(bar.size_mult, imm.ELECTION_SIZE_MULT)          # the election's own
+
+    def test_a_held_or_stale_event_is_one_underlying(self):
+        now = time.time()
+        self.assertEqual(imm.fair_underlying_of(self.T), f"lcombo {self.EV}")
+        with mock.patch.object(imm, "_crypto_event_state", {"snap": None}), \
+                mock.patch.object(imm, "_fx_event_state", {"snap": None}):
+            self._snap(ev_hold=now + 600)
+            h = imm.fair_underlying_holds(now)
+            self.assertEqual(list(h), [f"lcombo {self.EV}"])
+            self.assertIn("leg hold", h[f"lcombo {self.EV}"])
+            self._snap(age=imm.LISTED_COMBO_TTL_SECS + 30)
+            self.assertIn("s old", imm.fair_underlying_holds(now)[f"lcombo {self.EV}"])
+            self._snap()
+            self.assertEqual(imm.fair_underlying_holds(now), {})
+            self._snap(ev_err="no read", ev_hold=now + 600)    # no fair: left to the gate
+            self.assertEqual(imm.fair_underlying_holds(now), {})
+
+    def test_leads_wait_for_jack(self):
+        now = time.time()
+        self._snap()
+        self.assertFalse(imm.in_fair_lead_series("KXIRANWTICOMBO"))
+        with mock.patch.object(imm, "LISTED_COMBO_LEAD", True):
+            self.assertTrue(imm.in_fair_lead_series("KXIRANWTICOMBO"))
+            self.assertFalse(imm.fair_close_series("KXIRANWTICOMBO"))
+            self.assertAlmostEqual(imm.fair_model_c(self.T, "KXIRANWTICOMBO", now), 18.9)
+        self.assertEqual(imm.fair_model_label("KXIRANWTICOMBO"), "the listed combo fair")
+
+    def _cycle(self, yes=(("0.21", "210"), ("0.22", "62"), ("0.23", "30")),
+               no=(("0.37", "606"),)):
+        self._snap()
+        client = FakeClient()
+        close = "2027-12-31T19:30:00Z"
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 9000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": close, "expected_expiration_time": close,
+            "yes_bid_dollars": yes[-1][0], "yes_ask_dollars": f"{1 - float(no[-1][0]):.4f}",
+            "volume_fp": "0.00"}
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": [list(x) for x in yes],
+                                                 "no_dollars": [list(x) for x in no]}}
+        for p_ in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                   mock.patch.object(imm, "LADDER_MODE", "atref"),
+                   mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99),
+                   mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"),
+                   mock.patch.object(imm, "SERIES_HOUR_MULTS", [])):
+            p_.start()
+            self.addCleanup(p_.stop)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+            self._snap()                                   # keep the read fresh
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+        rest = sorted((o["book_side"], o["yes_price"], int(o["remaining_count"]))
+                      for o in bot.state.sim_orders.values() if o["ticker"] == self.T
+                      and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS)
+        return bot, rest, lines
+
+    def test_a_cycle_rests_only_outside_the_band(self):
+        bot, rest, lines = self._cycle()
+        self.assertIn(self.T, bot.state.selected, [s_ for s_ in lines if "universe:" in s_][-2:])
+        self.assertTrue(rest, [s_ for s_ in lines if self.T in s_][-20:])
+        self.assertTrue(all(px <= 13 for side, px, _n in rest if side == "bid"), rest)
+        self.assertTrue(all(px >= 25 for side, px, _n in rest if side == "ask"), rest)
+        self.assertIn("ask", {side for side, _px, _n in rest})
+
+    def test_a_leg_hold_stands_the_market_aside(self):
+        bot, rest, _lines = self._cycle()
+        self.assertTrue(rest)
+        self._snap(ev_hold=time.time() + 900)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+        left = [o for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
+        self.assertEqual(left, [])
+        self.assertIn(self.T, bot._lcv_stood)
+        self.assertTrue(any(f"listed-combo stand-aside {self.T}: leg hold" in s_ for s_ in lines),
+                        [s_ for s_ in lines if "listed-combo" in s_])
+        self._snap()
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+        self.assertTrue(any(f"listed-combo resume {self.T}" in s_ for s_ in lines))
 

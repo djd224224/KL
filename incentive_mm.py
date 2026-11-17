@@ -5796,8 +5796,7 @@ _CUT_AAA_MONTHLY_SERIES = ("KXAAAGASM",)
 # legacy non-KX names AAAGAS* / DIESEL*. As exact series (the dash), the
 # gasoline prices outside those prefixes: EIA's KXGAS weekly (its KXGAS-MONTH
 # twin shares the stem), KXGASD, KXGASMAX, KXGASMIN and the legacy GAS /
-# GASD / GASMAX / GASMIN, Truflation's KXTRUFGAS index, and KXHORMUZGASCOMBO
-# (Hormuz traffic x a 2027 gas price). Not a bare KXGAS prefix: that would
+# GASD / GASMAX / GASMIN, and Truflation's KXTRUFGAS index. Not a bare KXGAS prefix: that would
 # freeze the Georgia election series (KXGASEN1R, KXGASTATELEG, ...). A prefix
 # entry wins over the AS test's gas family and a gas-state daily pick, which
 # stand aside only the state PATTERN block (_blocked). Left as they are: jet
@@ -5812,7 +5811,18 @@ _CUT_AAA_MONTHLY_SERIES = ("KXAAAGASM",)
 # logging. Un-block by removing this entry.
 _CUT_FUEL_PREFIXES = ("KXAAAGAS", "AAAGAS", "KXDIESEL", "DIESEL")
 _CUT_FUEL_SERIES = ("KXGAS", "KXGASD", "KXGASMAX", "KXGASMIN", "GAS", "GASD",
-                    "GASMAX", "GASMIN", "KXTRUFGAS", "KXHORMUZGASCOMBO")
+                    "GASMAX", "GASMIN", "KXTRUFGAS")
+# GAS ON COMBOS (Jack 2026-11-17: "allow gas markets on combos"). A listed combo grid with a
+# gas leg -- KXHORMUZGASCOMBO, Hormuz traffic x the Jul 31, 2027 AAA price, frozen by name
+# here until then -- is not a gas market: the fuel cut stands aside for any listed combo
+# series (fuel_cut_waived), which quotes only off the listed combo fair (LISTED COMBO FAIR).
+# The gas, diesel and natural gas markets themselves stay frozen.
+_COMBO_NAME_RE = re.compile(r"^KX(?!MVE)[A-Z0-9]+COMBO$")
+
+
+def fuel_cut_waived(series: str) -> bool:
+    """Does the fuel cut stand aside for this series -- a listed combo (GAS ON COMBOS)?"""
+    return bool(_COMBO_NAME_RE.match(series or ""))
 # NATURAL GAS TOO (Jack 2026-11-16, the same evening: "Block natural gas too",
 # to "Also turn off the natural-gas markets?"). By prefix: KXNATGAS (the
 # daily, weekly, monthly and 15-minute contracts), KXNGAS and its legacy
@@ -6099,8 +6109,10 @@ def series_blocklisted(series: str) -> bool:
     ("KXMLBPLAYOFFS-26") still leaves its series name alone. A company-KPI
     series (COMPANY_KPI_BLOCK, 2026-11-08) counts too, and a Carbon Arc
     family turned off (CA_FAMILY_BLOCK, 2026-11-08)."""
+    waived = _CUT_FUEL_ENTRIES if fuel_cut_waived(series) else ()     # GAS ON COMBOS
     return company_kpi_series(series) or ca_family_blocked(series) or any(
-        series.startswith(p) or p == f"{series}-" for p in SERIES_BLOCKLIST_PREFIXES)
+        series.startswith(p) or p == f"{series}-" for p in SERIES_BLOCKLIST_PREFIXES
+        if p not in waived)
 
 # WIND-DOWN EXEMPTION for a blocklisted series (Jack 2026-09-11, KXTRUEV):
 # event tickers that keep quoting to their own completion even though their
@@ -10216,6 +10228,18 @@ SERIES_OVERRIDES[ELECTION_ARCHETYPE] = SeriesOverride(
 PRESRUN_SIZE_MULT = _env_float("IMM_PRESRUN_SIZE_MULT", 6.0)
 SERIES_OVERRIDES["KXPRESRUN"] = replace(SERIES_OVERRIDES[ELECTION_ARCHETYPE],
                                         size_mult=PRESRUN_SIZE_MULT)
+
+# LISTED COMBO archetype (Jack 2026-11-17: "build the fair, expect combos as a line of
+# business"; see LISTED COMBO FAIR). A priced listed combo outside the election family --
+# KXIRANWTICOMBO, filed under Politics -- takes the election guard set (1-99c, no safe-join)
+# at LISTED_COMBO_SIZE_MULT, the x2 the election-family combos quote at, so every combo grid
+# sizes alike. Its members clone it (FAMILY_OVERRIDE_PARENTS, after the election family, so
+# an election combo keeps its own). IMM_LISTED_COMBO_SIZE_MULT=1 halves it (env => task-level
+# restart).
+LISTED_COMBO_SIZE_MULT = _env_float("IMM_LISTED_COMBO_SIZE_MULT", 2.0)
+LISTED_COMBO_ARCHETYPE = "KXIRANWTICOMBO"
+SERIES_OVERRIDES[LISTED_COMBO_ARCHETYPE] = replace(SERIES_OVERRIDES[ELECTION_ARCHETYPE],
+                                                   size_mult=LISTED_COMBO_SIZE_MULT)
 NO_SIDE_ONLY_EVENTS = frozenset(
     s.strip() for s in os.environ.get(
         "IMM_NO_SIDE_ONLY_EVENTS", "KXPRESRUN-28").split(",") if s.strip())
@@ -13100,6 +13124,9 @@ FAMILY_OVERRIDE_PARENTS = (
     # elections (2026-09-28): a name pattern OR the exact general-election
     # list, so the family is a predicate rather than one regex
     ("predicate", election_series, ELECTION_ARCHETYPE),
+    # priced listed combos outside the election family (2026-11-17): the election guard set
+    # at LISTED_COMBO_SIZE_MULT, see LISTED COMBO FAIR (defined further down: called late)
+    ("predicate", lambda s: listed_combo_admitted(s), LISTED_COMBO_ARCHETYPE),
     # data center counts (2026-10-01): KX<state code>DATACENTERS
     ("predicate", datacenter_series, DATACENTER_ARCHETYPE),
     # open-scan graduates (2026-10-03): the scan's guard set, see above
@@ -20666,6 +20693,149 @@ def fx_event_wave_limits(ticker: str, now_ts: float) -> Optional[Tuple[int, int]
     return (caps[0] if caps[0] is not None else 0, caps[1] if caps[1] is not None else 100)
 
 
+# LISTED COMBO FAIR (Jack 2026-11-17: "build the fair, expect combos as a line of business").
+# Kalshi's LISTED combo grids (KX...COMBO events; not the RFQ multivariate KXMVE* combos) cross
+# one yes/no leg another Kalshi market prices -- the 2028 party, Le Pen, the US-Iran deal --
+# with one binned number: WTI on a date, the S&P 500's 2029 change, December 2029 CPI, 2029 GDP,
+# EUR/USD across the French vote. On 11/13 the party combos rested at the book with no fair, and
+# by 09:25Z a taker had lifted 13 of our asks 2-6c under where those grids trade now (-$67 at the
+# 11/17 mids, against ~$38 of rewards); KXIRANWTICOMBO-28JAN stayed out for want of one.
+#   FAIR: listed_combo_fair.py (refresher thread "listed-combo-fair", every LISTED_COMBO_
+#     REFRESH_SECS). Each cell = P(the leg's outcome) x P(the number in its bin | that outcome):
+#     the yes/no leg off its Kalshi market's mid (KXPRESPARTY-2028-D/R, KXFRENCHPRES-27-MLEP,
+#     KXUSAIRANAGREEMENT-27-28), the number off its model -- WTI lognormal on the named CME
+#     contract's delayed price (CLG28), the 2029-30 prints and the S&P window priors -- linked
+#     by the number's shift between the two worlds (a deal: WTI ~8% lower). BAND: each input
+#     alone at its low and high, the moves in quadrature. A new combo event prices only once
+#     its legs are mapped (listed_combo_fair.EVENTS); until then it is "unmapped" in the status
+#     file and stands aside.
+#   GATE (listed_combo_gate): every bid at most p_lo - LISTED_COMBO_TOL_CENTS, every ask at
+#     least p_hi + it (mort_cap_quotes, LAST). STAND ASIDE (cancel, fail closed): any listed
+#     combo series with no fair (no read, an unmapped event, a grid that does not parse), a
+#     leg read older than LISTED_COMBO_TTL_SECS, a LEG HOLD (a yes/no leg's mid moved 4c+
+#     inside 10 min: 15 min out -- the leg market is the headline feed; WTI's front month
+#     2.5%: 10 min), within 24 h of the earliest scheduled leg decision, or a touch past the
+#     band by more than LISTED_COMBO_BAND_TOL_CENTS (the book knows something the read does
+#     not).
+#   FAMILY: a priced listed combo series is allowed (listed_combo_admitted). The election
+#     family keeps its members (its x2 guard set, its date rows); any other takes LISTED_
+#     COMBO_ARCHETYPE. The blocklist still wins (the pure-CPI KXCPICOMBO), but not the fuel
+#     cut: a gas-leg combo is no gas market (GAS ON COMBOS: KXHORMUZGASCOMBO).
+#   The combos quoting before the gate are left as they were (LISTED_COMBO_UNGATED).
+#   FAIR HOLD PULL: a held or stale combo EVENT has every order on it pulled at once
+#     ("lcombo <event>").
+#   FAIR LEAD only with LISTED_COMBO_LEAD (off: Jack's call once the live reads are in).
+# IMM_LISTED_COMBO_FAIR=0: no gate, no family -- the election combos quote as before.
+LISTED_COMBO_FAIR = os.environ.get("IMM_LISTED_COMBO_FAIR", "1") == "1"
+LISTED_COMBO_LEAD = os.environ.get("IMM_LISTED_COMBO_LEAD", "0") == "1"
+LISTED_COMBO_TOL_CENTS = _env_int("IMM_LISTED_COMBO_TOL_CENTS", 2)
+LISTED_COMBO_BAND_TOL_CENTS = _env_int("IMM_LISTED_COMBO_BAND_TOL_CENTS", 5)
+LISTED_COMBO_TTL_SECS = _env_int("IMM_LISTED_COMBO_TTL_SECS", 300)
+LISTED_COMBO_REFRESH_SECS = _env_int("IMM_LISTED_COMBO_REFRESH_SECS", 30)
+LISTED_COMBO_FAIR_FILE = os.environ.get(
+    "IMM_LISTED_COMBO_FAIR_FILE", os.path.join(STATUS_DIR, "listed_combo_fair.json"))
+_LISTED_COMBO_RE = _COMBO_NAME_RE
+# THE COMBOS ALREADY QUOTING STAY AS THEY ARE (Jack 2026-11-17: "leave the combos, that are
+# already quoting e.g. french election"): the election-family grids quoting before this gate
+# -- Le Pen x EUR/USD, party x S&P / CPI, and party x GDP (quoting 11/12-11/15 until its
+# program ended) -- keep the election family's own quoting, no gate, no hold pull; the fair
+# still prices them in the status file. Every other listed combo goes through the gate.
+LISTED_COMBO_UNGATED = frozenset(s_.strip().upper() for s_ in os.environ.get(
+    "IMM_LISTED_COMBO_UNGATED",
+    "KXLEPENEURCOMBO,KXINXPARTYCOMBO,KXCPIPARTYCOMBO,KXGDPPARTYCOMBO").split(",") if s_.strip())
+_listed_combo_state: dict = {"snap": None}
+
+
+def listed_combo_series(series: str) -> bool:
+    """A Kalshi listed combo series by name (KX...COMBO, not the RFQ KXMVE* ones): it quotes
+    only off the listed combo fair -- all but the ones already quoting (LISTED_COMBO_UNGATED)."""
+    return LISTED_COMBO_FAIR and bool(_LISTED_COMBO_RE.match(series or "")) \
+        and series not in LISTED_COMBO_UNGATED
+
+
+def listed_combo_event(ticker: str) -> str:
+    """A listed combo market's EVENT: its first two segments (KXIRANWTICOMBO-28JAN-DEAL-60-74
+    -> KXIRANWTICOMBO-28JAN). event_ticker_of drops one segment, and these strikes carry two
+    or three (KXLEPENEURCOMBO-27JUN-LP-N1-P1)."""
+    return "-".join((ticker or "").split("-")[:2])
+
+
+def listed_combo_admitted(series: str) -> bool:
+    """The listed combo family: a combo series the fair prices now (any event of it)."""
+    if not listed_combo_series(series):
+        return False
+    snap = _listed_combo_state.get("snap") or {}
+    return series in (snap.get("priced_series") or ())
+
+
+def listed_combo_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                      ext_ask: Optional[float]
+                      ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """('', inputs, (bid_cap, ask_floor)) when a listed combo market may quote -- bids at most
+    bid_cap, asks at least ask_floor, None = that side not at all -- else (why, guard-skip
+    inputs, None). Fails CLOSED."""
+    snap = _listed_combo_state.get("snap")
+    if snap is None:
+        return "no listed combo read yet", {"reason": "no_read"}, None
+    e = (snap.get("markets") or {}).get(ticker)
+    if e is None:
+        ev = listed_combo_event(ticker)
+        why = ((snap.get("events") or {}).get(ev) or {}).get("err") or "no leg map for this event"
+        return f"not priced: {why}"[:200], {"reason": "unmapped", "event": ev, "why": why}, None
+    if e.get("err") or e.get("p") is None:
+        why = str(e.get("err") or "no fair")[:160]
+        return f"not priced: {why}", {"reason": "model", "why": why}, None
+    if e.get("cut"):
+        return "within 24 h of a leg's decision", {"reason": "cutoff"}, None
+    ts = e.get("ts")
+    age = None if ts is None else now_ts - float(ts)
+    if age is None or age > LISTED_COMBO_TTL_SECS:
+        return (f"leg read {'missing' if age is None else f'{age:.0f}s old'}",
+                {"reason": "stale", "age_s": None if age is None else round(age)}, None)
+    hold = float(e.get("hold_until") or 0.0)
+    ev_hold = ((snap.get("events") or {}).get(e.get("event")) or {}).get("hold_until")
+    hold = max(hold, float(ev_hold or 0.0))
+    if hold > now_ts:
+        return (f"leg hold ({(hold - now_ts) / 60:.0f}m left)",
+                {"reason": "leg_hold", "left_s": round(hold - now_ts)}, None)
+    fair = float(e["p"]) * 100.0
+    lo_c, hi_c = float(e["p_lo"]) * 100.0, float(e["p_hi"]) * 100.0
+    inputs = {"fair": round(fair, 2), "band": [round(lo_c, 2), round(hi_c, 2)],
+              "outcome": e.get("outcome"), "bin": e.get("bin"), "tol": LISTED_COMBO_TOL_CENTS}
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, lo_c, LISTED_COMBO_BAND_TOL_CENTS, hi_c)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {fair:.1f}c (band {lo_c:.1f}-{hi_c:.1f}, "
+                f"tol {LISTED_COMBO_BAND_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side)",
+                dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad), None)
+    if pvd_entry(ticker) is not None:
+        # WAVE BOOK (as the crypto strikes'): the wave's reference both sides, bounded by the
+        # band itself -- never a bid over p_hi, never an ask under p_lo
+        bid_cap = int(math.floor(hi_c + 1e-9))
+        ask_floor = int(math.ceil(lo_c - 1e-9))
+        caps = (min(bid_cap, 99) if bid_cap >= 1 else None,
+                max(ask_floor, 1) if ask_floor <= 99 else None)
+        if caps == (None, None):
+            return (f"no side inside 1-99c of the band {lo_c:.1f}-{hi_c:.1f}c",
+                    dict(inputs, reason="decided", wave=True), None)
+        return "", dict(inputs, wave=True, bid_cap=caps[0], ask_floor=caps[1]), caps
+    bid_cap = int(math.floor(lo_c - LISTED_COMBO_TOL_CENTS + 1e-9))
+    ask_floor = int(math.ceil(hi_c + LISTED_COMBO_TOL_CENTS - 1e-9))
+    caps = (bid_cap if bid_cap >= 1 else None, ask_floor if ask_floor <= 99 else None)
+    if caps == (None, None):
+        return (f"no side {LISTED_COMBO_TOL_CENTS}c clear of the band {lo_c:.1f}-{hi_c:.1f}c",
+                dict(inputs, reason="decided"), None)
+    return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
+
+
+def listed_combo_fair_c(ticker: str, now_ts: float) -> Optional[float]:
+    """`ticker`'s listed combo fair (YES cents) while the gate reads it (the book test apart),
+    else None: FAIR LEAD's view of the family. None on a wave-listed market (WAVE BOOKS)."""
+    if pvd_entry(ticker) is not None:
+        return None
+    why, inputs, _caps = listed_combo_gate(ticker, now_ts, None, None)
+    return None if why else float(inputs["fair"])
+
+
 # FAIR HOLD PULL (Jack 2026-11-15: "build these to generalize into the market-wave skill").
 # The live-fair gates above stand a strike aside as the quote loop reaches it, one cancel at a
 # time: BTC's 02:05:48Z 11/15 jump hold cancelled its 128 orders over 95 s, strike by strike,
@@ -20691,6 +20861,8 @@ def fair_underlying_of(ticker: str) -> Optional[str]:
     if crypto_event_series(s):
         m = _CRYPTO_EVENT_RE.match(s)
         return f"crypto {m.group(1)}" if m else None
+    if listed_combo_series(s):
+        return f"lcombo {listed_combo_event(ticker)}"
     return None
 
 
@@ -20719,6 +20891,17 @@ def fair_underlying_holds(now_ts: float) -> Dict[str, str]:
             out[f"fx {s}"] = f"{s} jump hold ({(h - now_ts) / 60:.0f}m left)"
         elif ts and now_ts - float(ts) > FX_EVENT_TTL_SECS:
             out[f"fx {s}"] = f"{s} source price is {now_ts - float(ts):.0f}s old"
+    # a listed combo EVENT: in a leg hold, or priced off a leg read older than its TTL
+    snap = _listed_combo_state.get("snap") if LISTED_COMBO_FAIR else None
+    for ev, v in ((snap or {}).get("events") or {}).items():
+        if not isinstance(v, dict) or v.get("err"):
+            continue
+        h = float(v.get("hold_until") or 0.0)
+        ts = v.get("ts")
+        if h > now_ts:
+            out[f"lcombo {ev}"] = f"{ev} leg hold ({(h - now_ts) / 60:.0f}m left)"
+        elif ts and now_ts - float(ts) > LISTED_COMBO_TTL_SECS:
+            out[f"lcombo {ev}"] = f"{ev} leg read is {now_ts - float(ts):.0f}s old"
     return out
 
 
@@ -27179,6 +27362,8 @@ def fair_lead_margin(series: str) -> int:
         return max(FAIR_LEAD_MARGIN_C, CRYPTO_EVENT_TOL_CENTS)
     if snow_days_series(series):
         return max(FAIR_LEAD_MARGIN_C, SNOW_DAYS_RUNG_TOL_CENTS)
+    if listed_combo_series(series):
+        return max(FAIR_LEAD_MARGIN_C, LISTED_COMBO_TOL_CENTS)
     return FAIR_LEAD_MARGIN_C
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
 FAIR_LEAD_EVENT_CAP = _env_float("IMM_FAIR_LEAD_EVENT_CAP", 2000.0)
@@ -27284,7 +27469,8 @@ def in_fair_lead_series(series: str) -> bool:
         or (HOME_AUTO_LEAD and home_auto_allowed(series)) \
         or (vercel_series(series) and any(s in FAIR_LEAD_SERIES for s in VERCEL_BASE_SERIES)) \
         or (CRYPTO_EVENT_LEAD and crypto_event_series(series)) \
-        or (SNOW_DAYS_LEAD and snow_days_series(series))
+        or (SNOW_DAYS_LEAD and snow_days_series(series)) \
+        or (LISTED_COMBO_LEAD and listed_combo_series(series))
 
 
 def fair_close_series(series: str) -> bool:
@@ -27293,7 +27479,7 @@ def fair_close_series(series: str) -> bool:
     month has scored yet. Not the crypto event strikes: a close at the
     model's own price leaves no room for the spot to move under it."""
     return in_fair_lead_series(series) and not ca_array_lead_series(series) \
-        and not crypto_event_series(series)
+        and not crypto_event_series(series) and not listed_combo_series(series)
 
 
 def fair_lead_series(series: str) -> bool:
@@ -27327,6 +27513,8 @@ def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
         return crypto_event_fair_c(ticker, now_ts)
     if snow_days_series(series):
         return snow_days_fair_c(ticker, now_ts)
+    if listed_combo_series(series):
+        return listed_combo_fair_c(ticker, now_ts)
     return None
 
 
@@ -27355,6 +27543,8 @@ def fair_model_label(series: str) -> str:
         return "the crypto spot fair"
     if snow_days_series(series):
         return "the snow-day fair"
+    if listed_combo_series(series):
+        return "the listed combo fair"
     return "its model fair"
 
 
@@ -29018,6 +29208,8 @@ class IncentiveMarketMaker:
         self._home_edges: Set[str] = set()        # ...and its edges-only markets
         self._cev_stood: Set[str] = set()         # crypto event gate stand-asides
         self._fev_stood: Set[str] = set()         # FX event gate stand-asides
+        self._lcv_stood: Set[str] = set()         # listed combo gate stand-asides
+        self._lcombo_seen: Set[str] = set()       # listed combo markets with a live program
         self._sd_stood: Set[str] = set()          # snow-day gate stand-asides
         # EARN ONLY (EARN_ONLY_MODE): each market's last-logged dropped set,
         # this cycle's totals, and the once-only failure note
@@ -35311,6 +35503,9 @@ class IncentiveMarketMaker:
             # the IMM's own high-temperature family (2026-10-23): the "KXHIGH"
             # ownership block stands aside for its markets
             prefixes = tuple(p for p in prefixes if p != HIGHT_PREFIX)
+        if fuel_cut_waived(series_of(ticker)):
+            # GAS ON COMBOS (2026-11-17): a listed combo with a gas leg is no gas market
+            prefixes = tuple(p for p in prefixes if p not in _CUT_FUEL_ENTRIES)
         # the opportunistic AS test's states (2026-10-26): the state pattern
         # block stands aside for its members -- and for a gas-state daily
         # pick's event (2026-10-27, astest_pick_gas_ticker)
@@ -35403,6 +35598,7 @@ class IncentiveMarketMaker:
             graduate_auto_series(series) or \
             mention_auto_series(series) or \
             politics_auto_series(series) or \
+            listed_combo_admitted(series) or \
             (astest_new_series(series) and astest_pick_event_ok(ticker)) or \
             marathon_series(series) or \
             home_auto_allowed(series) or \
@@ -35904,6 +36100,9 @@ class IncentiveMarketMaker:
             td = parse_event_date(t)
             return td is not None and now_utc >= td + timedelta(hours=24)
 
+        # listed combo markets with a live program: the listed combo refresher reads their
+        # events, and names any it has no leg map for (LISTED COMBO FAIR)
+        self._lcombo_seen = {t for t in by_market if listed_combo_series(series_of(t))}
         candidates = sorted(
             ((t, info) for t, info in by_market.items()
              if self._allowed(t) and info["dollars_per_day"] > 0
@@ -40179,6 +40378,10 @@ class IncentiveMarketMaker:
                 # FX event gate: the same, inside the live limits
                 _fw, _fi, _fc = fx_event_gate(meta.ticker, _now.timestamp())
                 out = [] if (_fw or _fc is None) else mort_cap_quotes(out, *_fc)
+            if listed_combo_series(meta.series):
+                # listed combo gate: the same, the band plus LISTED_COMBO_TOL_CENTS
+                _lw, _li, _lc = listed_combo_gate(meta.ticker, _now.timestamp(), eb, ea)
+                out = [] if (_lw or _lc is None) else mort_cap_quotes(out, *_lc)
             if snow_days_series(meta.series):
                 # snow-day gate: the same, SNOW_DAYS_RUNG_TOL_CENTS clear (0: up to the fair)
                 _sw, _si, _sc = snow_days_gate(meta.ticker, _now.timestamp(), eb, ea)
@@ -43106,6 +43309,24 @@ class IncentiveMarketMaker:
             if t in self._fev_stood:
                 self._fev_stood.discard(t)
                 log(f"{self.tag} fx-event resume {t}")
+
+            # LISTED COMBO GATE (Jack 2026-11-17, see LISTED_COMBO_FAIR): stand aside (cancel)
+            # with no fair, a stale leg read, in a leg hold, near a leg's decision, or when the
+            # touch fights the band; otherwise every rung below stays LISTED_COMBO_TOL_CENTS
+            # outside the band (bids <= p_lo - tol, asks >= p_hi + tol).
+            lcv_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            if listed_combo_series(meta.series):
+                lc_why, lc_in, lcv_caps = listed_combo_gate(t, now_ts, ext_bid, ext_ask)
+                if lc_why or lcv_caps is None:
+                    if t not in self._lcv_stood:
+                        self._lcv_stood.add(t)
+                        log(f"{self.tag} listed-combo stand-aside {t}: {lc_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "listed_combo_fair", lambda: lc_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._lcv_stood:
+                self._lcv_stood.discard(t)
+                log(f"{self.tag} listed-combo resume {t}")
             # SNOW-DAY GATE (Jack 2026-11-14, see SNOW_DAYS_ENABLE): stand
             # aside (cancel) without a fresh snow-day fair (the season has
             # started, no history) or when the touch fights it; otherwise
@@ -43922,6 +44143,9 @@ class IncentiveMarketMaker:
             # FX event gate: likewise last, inside the live limits
             if fev_caps is not None:
                 mq = mort_cap_quotes(mq, *fev_caps)
+            # listed combo gate: likewise last, outside the band by the tolerance
+            if lcv_caps is not None:
+                mq = mort_cap_quotes(mq, *lcv_caps)
             # snow-day gate: likewise last, SNOW_DAYS_RUNG_TOL_CENTS clear
             if sd_caps is not None:
                 mq = mort_cap_quotes(mq, *sd_caps)
@@ -47465,6 +47689,61 @@ class IncentiveMarketMaker:
                     time.sleep(max(5, FX_EVENT_REFRESH_SECS))
             threading.Thread(target=_fx_event_fair_refresh, daemon=True,
                              name="fx-event-fair").start()
+        if LISTED_COMBO_FAIR and not once:
+            # listed combo fair refresher (2026-11-17): combo market lists every 10 min, the
+            # yes/no leg markets every LISTED_COMBO_REFRESH_SECS, the futures legs every 2 min;
+            # the gate reads _listed_combo_state. A failed leg read leaves its ts behind, so
+            # the gate fails closed after LISTED_COMBO_TTL_SECS.
+            def _listed_combo_fair_refresh():
+                try:
+                    import listed_combo_fair
+                except Exception as e:
+                    log(f"{self.tag} ! listed combo refresher disabled: {e}")
+                    return
+
+                def _events() -> List[str]:
+                    seen = {listed_combo_event(t) for t in list(self._lcombo_seen)}
+                    return sorted(set(listed_combo_fair.EVENTS) | seen)
+                watch = listed_combo_fair.ListedComboWatch(
+                    fair_reader() or listed_combo_fair.public_get, _events)
+                last = None
+                status_at = 0.0
+                while True:
+                    try:
+                        snap = watch.refresh()
+                        _listed_combo_state["snap"] = snap
+                        evs = snap.get("events") or {}
+                        n_ok = sum(1 for e in (snap.get("markets") or {}).values() if "p" in e)
+                        holds = sorted(ev for ev, v in evs.items()
+                                       if (v.get("hold_until") or 0) > time.time())
+                        bad = sorted(ev for ev, v in evs.items()
+                                     if v.get("err") and ev not in (snap.get("unmapped") or []))
+                        key = (n_ok, tuple(sorted(evs)), tuple(holds), tuple(bad),
+                               tuple(snap.get("unmapped") or []))
+                        if last != key:
+                            legs = snap.get("legs") or {}
+                            log(f"{self.tag} listed-combo fair: {n_ok} cells priced in "
+                                f"{sum(1 for v in evs.values() if v.get('n_priced'))} events; "
+                                + ", ".join(f"{k} {100 * v['mid']:.1f}c" for k, v in sorted(legs.items())
+                                            if v.get("mid") is not None)
+                                + "".join(f", {k} ${v['fwd']:.2f}" for k, v in sorted(legs.items())
+                                          if v.get("fwd"))
+                                + (f"; LEG HOLD {', '.join(holds)}" if holds else "")
+                                + (f"; NO FAIR {', '.join(bad)}: {evs[bad[0]].get('err')}" if bad else "")
+                                + (f"; UNMAPPED {', '.join(snap['unmapped'])}" if snap.get("unmapped") else "")
+                                + (f"; {'; '.join(snap['errors'])[:200]}" if snap.get("errors") else ""))
+                        last = key
+                        if time.time() - status_at >= 60:
+                            status_at = time.time()
+                            try:
+                                listed_combo_fair.write_status(LISTED_COMBO_FAIR_FILE, snap)
+                            except Exception:
+                                pass      # observability only
+                    except Exception as e:
+                        log(f"{self.tag} ! listed-combo fair refresh: {type(e).__name__}: {str(e)[:120]}")
+                    time.sleep(max(5, LISTED_COMBO_REFRESH_SECS))
+            threading.Thread(target=_listed_combo_fair_refresh, daemon=True,
+                             name="listed-combo-fair").start()
         if HOME_ENABLE and (HOME_SERIES or HOME_AUTO) and not once:
             # Zillow home value refresher (2026-11-12): the mortgage
             # refresher's shape. Kalshi markets every 15 min, the Zillow CSVs
