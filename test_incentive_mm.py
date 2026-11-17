@@ -393,6 +393,17 @@ def _without_cut(*series):
         tuple(p for p in imm.SERIES_BLOCKLIST_PREFIXES if p not in drop))
 
 
+def _without_fuel_cut():
+    """SERIES_BLOCKLIST_PREFIXES without the 2026-11-16 gas and diesel cut
+    (_CUT_FUEL_ENTRIES), for the tests of the gas machinery it left dormant --
+    the GasBuddy gate, the AS test's gas family, a gas-state daily pick, the
+    state pattern block -- as an un-block would leave them. The cut itself
+    is TestFuelCut's subject."""
+    return mock.patch.object(
+        imm, "SERIES_BLOCKLIST_PREFIXES",
+        tuple(p for p in imm.SERIES_BLOCKLIST_PREFIXES if p not in imm._CUT_FUEL_ENTRIES))
+
+
 # ----------------------------------------------------------------------------
 # Event-start cutoff
 # ----------------------------------------------------------------------------
@@ -2379,8 +2390,16 @@ class TestBlocklist(unittest.TestCase):
         # neighbours of an exact cut, and an event-ticker entry's series
         # (KXMLBPLAYOFFS-26 leaves KXMLBPLAYOFFS live for a 2027 listing)
         for s in ("KXLOLTEEMOX", "KXLOLREGION", "KXNETFLIXTOPVIEWSMOVIE",
-                  "KXAAAGASMTX", "KXMLBPLAYOFFS"):
+                  "KXMLBPLAYOFFS"):
             self.assertFalse(sb(s), s)
+        # KXAAAGASMTX, KXAAAGASM's neighbour, is taken by the 2026-11-16 gas
+        # and diesel PREFIX cut, and stands clear of the exact one without it;
+        # the EIA gas weekly's exact entry leaves the Georgia series alone
+        self.assertTrue(sb("KXAAAGASMTX"))
+        self.assertTrue(sb("KXGAS"))
+        self.assertFalse(sb("KXGASEN1R"))
+        with _without_fuel_cut():
+            self.assertFalse(sb("KXAAAGASMTX"))
 
     def test_market_suffix_block_freezes_the_nqe_leg_only(self):
         # Jack 2026-09-11 pm ("implement the suffix block"): the mention
@@ -3361,10 +3380,15 @@ class TestAllowlist(unittest.TestCase):
 
     def test_econ_series(self):
         a = IncentiveMarketMaker._allowed
-        for t in ("KXAAAGASW-26JUL27-4.040", "KXNHSALES-26JUL24-T620000",
-                  # diesel enrolled 2026-08-02 evening under re-entry guards
-                  "KXDIESELW-26AUG09-T5.30"):
-            self.assertTrue(a(t), t)
+        self.assertTrue(a("KXNHSALES-26JUL24-T620000"))
+        # the gas and diesel weeklies keep their allowlist entries (diesel
+        # enrolled 2026-08-02 evening under re-entry guards), but every gas
+        # and diesel market is cut since 2026-11-16 (Jack: "turn off gas and
+        # diesel markets from IMM", TestFuelCut); the entries stay for a
+        # one-line un-block
+        for t in ("KXAAAGASW-26JUL27-4.040", "KXDIESELW-26AUG09-T5.30"):
+            self.assertIn(t.split("-")[0], imm.ALLOW_SERIES, t)
+            self.assertFalse(a(t), t)
         # the national AAA monthly, cut 2026-10-25 (Jack: "Cut KXAAAGASM")
         self.assertFalse(a("KXAAAGASM-26JUL31-3.10"))
         # the gas trial ended 2026-10-08 (Jack: "block both"): the national
@@ -5297,6 +5321,7 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                                         "KXNFLDRAFT-26APR30-JSMITH")[0],
                          "review")
 
+    @_without_fuel_cut()
     def test_state_gas_family_is_pattern_blocked(self):
         # Jack 2026-09-14: "block the state daily family (including any future
         # ones). keep monthlies." The states share the KXAAAGASD prefix with the
@@ -6018,8 +6043,10 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # tests leave EXTRA_ALLOW_SERIES scratch behind — both restored.
         # The 2026-10-03 cut (the KPI set, the two food trackers, the AAA
         # max/min pair) blocks members by name; lifted here, the subject is
-        # finecon membership and its guards.
+        # finecon membership and its guards. So is the 2026-11-16 gas and
+        # diesel cut (the AAA pair again, by prefix).
         self.enterContext(_without_cut())
+        self.enterContext(_without_fuel_cut())
         saved_extra = set(imm.EXTRA_ALLOW_SERIES)
         imm.EXTRA_ALLOW_SERIES.clear()
         imm.ALLOWLIST_ONLY = True
@@ -9289,6 +9316,48 @@ class TestNextSpeakerCut(unittest.TestCase):
         self.assertTrue(imm.IncentiveMarketMaker._blocked("KXNEXTSPEAKER-31-KCLA"))
         self.assertTrue(imm.series_blocklisted("KXNEXTSPEAKER"))
         self.assertFalse(imm.series_blocklisted("KXNEXTSPEAKERX"))   # an exact series, not a prefix
+
+
+class TestFuelCut(unittest.TestCase):
+    """Jack 2026-11-16: "turn off gas and diesel markets from IMM" -- every
+    gasoline and diesel price market is frozen, whatever path admits it."""
+
+    def test_every_gas_and_diesel_price_series_is_frozen(self):
+        blocked = imm.IncentiveMarketMaker._blocked
+        for t in ("KXAAAGASD-26NOV17-3.100", "KXAAAGASDCT-26NOV17-3.050",
+                  "KXAAAGASCDTX-26NOV17-2.700", "KXAAAGASW-26NOV23-3.10",
+                  "KXAAAGASM-26NOV30-3.10", "KXAAAGASMTX-26NOV30-2.70",
+                  "KXAAAGASMAX-26-4.00", "KXAAAGASED-26NOV03-3.10",
+                  "KXDIESELD-26NOV17-3.700", "KXDIESELW-26NOV23-3.70",
+                  "KXDIESELMAXY-26-4.50", "KXDIESELMINY-26-3.20",
+                  "KXDIESELYE-26-3.80", "KXDIESELMONAK-26NOV-4.50",
+                  "KXDIESEL-26NOV23-3.70", "KXDIESELEXPORTBAN-27",
+                  "KXGAS-26NOV23-3.10", "KXGASD-26NOV17-3.10",
+                  "KXGASMAX-26-4.00", "KXGASMIN-26-2.80",
+                  "KXTRUFGAS-26NOV-T1", "KXHORMUZGASCOMBO-27JUL31-A",
+                  "AAAGASD-26NOV17-3.10", "DIESELM-26NOV-3.70", "GASD-26NOV17-3.10"):
+            self.assertTrue(blocked(t), t)
+        for s in ("KXAAAGASDCT", "KXDIESELYE", "KXGAS", "KXTRUFGAS", "GAS"):
+            self.assertTrue(imm.series_blocklisted(s), s)
+
+    def test_the_georgia_elections_and_natural_gas_stay(self):
+        # the EIA KXGAS weekly is an exact series: a bare KXGAS prefix would
+        # also freeze the Georgia election series
+        for s in ("KXGASEN1R", "KXGASTATELEG", "KXGASCHOOLSUPER", "KXGASENGOVCOMBO",
+                  "KXNATGASD", "KXNGASW", "KXMARCELLUSGAS", "KXPAGAS", "KXTTFD",
+                  "KXJETFUEL", "KXEIAGASINVM", "KXGASTAX", "KXRUSDIESELGL"):
+            self.assertFalse(any(f"{s}-26NOV17-T1".startswith(e)
+                                 for e in imm._CUT_FUEL_ENTRIES), s)
+
+    def test_the_as_test_gas_family_cannot_lift_it(self):
+        # the AS test's states stand aside only the state PATTERN block
+        with mock.patch.object(imm, "ASTEST_ENABLE", True), \
+                mock.patch.object(imm, "ASTEST_GAS_SERIES", frozenset({"KXAAAGASDCT"})), \
+                mock.patch.object(imm, "astest_stopped", lambda: False):
+            self.assertTrue(imm.astest_gas_series("KXAAAGASDCT"))
+            self.assertTrue(imm.IncentiveMarketMaker._blocked("KXAAAGASDCT-26NOV17-3.050"))
+            with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+                self.assertFalse(imm.IncentiveMarketMaker._allowed("KXAAAGASDCT-26NOV17-3.050"))
 
 
 class TestCaFamiliesOff(unittest.TestCase):
@@ -16285,8 +16354,11 @@ class TestGasBuddyFairGate(unittest.TestCase):
         # cycle adds.
         # The opportunistic AS test (2026-10-25) quotes the gas dailies plain;
         # this class is the gate's, so it runs with the test off.
+        # Every gas market is cut since 2026-11-16 (TestFuelCut); the gate is
+        # tested as an un-block of that cut would leave it.
         import dataclasses
-        for p in (mock.patch.object(imm, "ASTEST_ENABLE", False),
+        for p in (_without_fuel_cut(),
+                  mock.patch.object(imm, "ASTEST_ENABLE", False),
                   mock.patch.object(imm, "GB_STATE_QUOTE", True),
                   mock.patch.object(imm, "SERIES_BLOCK_PATTERNS", tuple(
                       imm.re.compile(x) for x in
@@ -41440,7 +41512,10 @@ class TestOpportunisticAsTestGas(unittest.TestCase):
 
     def setUp(self):
         _clean_persist()
-        for p in (mock.patch.dict(imm._astest_stop, {"checked": 0.0, "stopped": False}),
+        # every gas market is cut since 2026-11-16 (TestFuelCut), which the
+        # family cannot lift; it is tested as an un-block would leave it
+        for p in (_without_fuel_cut(),
+                  mock.patch.dict(imm._astest_stop, {"checked": 0.0, "stopped": False}),
                   mock.patch.dict(imm.SERIES_OVERRIDES)):
             p.start()
             self.addCleanup(p.stop)
@@ -41904,7 +41979,10 @@ class TestOpportunisticAsTestDailyPicks(unittest.TestCase):
 
     def setUp(self):
         _clean_persist()
-        for p in (mock.patch.dict(imm._astest_family_stop["PICK"],
+        # the gas-state pick fixture: every gas market is cut since
+        # 2026-11-16 (TestFuelCut), tested here as an un-block would leave it
+        for p in (_without_fuel_cut(),
+                  mock.patch.dict(imm._astest_family_stop["PICK"],
                                   {"checked": 0.0, "stopped": False}),
                   mock.patch.dict(imm.SERIES_OVERRIDES),
                   mock.patch.object(imm, "ALLOWLIST_ONLY", True),

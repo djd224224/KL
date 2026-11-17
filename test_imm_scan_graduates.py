@@ -30,6 +30,12 @@ class ScanGraduateTests(unittest.TestCase):
         # incentive_mm.SELL_BACK_ONLY_SERIES.)
         cut = set(imm._CUT_LOSERS_1101_SERIES)
         self.assertEqual(sorted(imm.SCAN_GRADUATE_SERIES & cut), ["KXNETFLIXTOPVIEWSTV"])
+        # ...and the gas and diesel graduates, cut by prefix on 2026-11-16
+        # (Jack: "turn off gas and diesel markets from IMM"), the same way
+        fuel = {s for s in imm.SCAN_GRADUATE_SERIES
+                if any(f"{s}-X".startswith(e) for e in imm._CUT_FUEL_ENTRIES)}
+        self.assertEqual(sorted(fuel), ["KXAAAGASEOYNJ", "KXAAAGASMTX", "KXDIESELYE"])
+        cut |= fuel
         for s in sorted(imm.SCAN_GRADUATE_SERIES - cut):
             self.assertTrue(M._allowed(f"{s}-X"), s)
             self.assertFalse(M._blocked(f"{s}-X"), s)
@@ -128,15 +134,21 @@ class CutSeriesTests(unittest.TestCase):
             self.assertTrue(M._allowed(f"{s}-X"), s)
 
     def test_one_series_per_entry_never_a_neighbour(self):
-        # the trailing dash: a KPI name that prefixes another series
-        for t in ("KXBABELMANDEBWEEKLY-26OCT11-T30",   # KXBA
-                  "KXCMGFT-26NOV08-T100", "KXCMGCC-26NOV07-T100",  # KXCMG
-                  "KXAMZNCC-26NOV07-T100",              # KXAMZN
-                  "KXDGCC-26NOV07-T100",                # KXDG
-                  "KXLOWCC-26NOV07-T100",               # KXLOW
-                  "KXBKFT-26NOV08-T100", "KXYUMTBFT-26NOV08-T95",
-                  "KXAAAGASMTX-26OCT31-T3"):
-            self.assertFalse(M._blocked(t), t)
+        # the trailing dash: a KPI name that prefixes another series. The
+        # 2026-11-16 gas and diesel cut is a PREFIX on purpose and takes
+        # KXAAAGASMTX too; the exact entries are checked with it lifted.
+        unfuel = tuple(p for p in imm.SERIES_BLOCKLIST_PREFIXES
+                       if p not in imm._CUT_FUEL_ENTRIES)
+        self.assertTrue(M._blocked("KXAAAGASMTX-26OCT31-T3"))
+        with mock.patch.object(imm, "SERIES_BLOCKLIST_PREFIXES", unfuel):
+            for t in ("KXBABELMANDEBWEEKLY-26OCT11-T30",   # KXBA
+                      "KXCMGFT-26NOV08-T100", "KXCMGCC-26NOV07-T100",  # KXCMG
+                      "KXAMZNCC-26NOV07-T100",              # KXAMZN
+                      "KXDGCC-26NOV07-T100",                # KXDG
+                      "KXLOWCC-26NOV07-T100",               # KXLOW
+                      "KXBKFT-26NOV08-T100", "KXYUMTBFT-26NOV08-T95",
+                      "KXAAAGASMTX-26OCT31-T3"):
+                self.assertFalse(M._blocked(t), t)
         # KXAAAGASM itself (MINM / MAXM's neighbour) is cut on its own since
         # 2026-10-25 (Jack: "Cut KXAAAGASM")
         self.assertTrue(M._blocked("KXAAAGASM-26OCT31-T3.1"))

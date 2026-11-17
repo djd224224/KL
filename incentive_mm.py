@@ -5786,6 +5786,34 @@ _CUT_GAS_TRIAL_SERIES = ("KXAAAGASD", "KXDIESELD")
 # stays, and MINM / MAXM have been cut since 10/03. Standard semantics: the
 # open KXAAAGASM-26OCT31 position rides to settlement.
 _CUT_AAA_MONTHLY_SERIES = ("KXAAAGASM",)
+# GAS AND DIESEL OFF (Jack 2026-11-16: "turn off gas and diesel markets from
+# IMM"). Every gasoline and diesel price market is frozen, whichever path
+# would admit it. By PREFIX, the AAA families: KXAAAGAS (the national and
+# state dailies, KXAAAGASD<ST> and KXAAAGASCD<ST>, the weeklies, monthlies,
+# MAX/MIN annuals, Election Day, the NJ year-end) and KXDIESEL (daily,
+# weekly, monthly, Alaska, the MAXY/MINY/YE annuals the bot was quoting that
+# night, Election Day, the EIA weekly, the export-ban one-off), plus their
+# legacy non-KX names AAAGAS* / DIESEL*. As exact series (the dash), the
+# gasoline prices outside those prefixes: EIA's KXGAS weekly (its KXGAS-MONTH
+# twin shares the stem), KXGASD, KXGASMAX, KXGASMIN and the legacy GAS /
+# GASD / GASMAX / GASMIN, Truflation's KXTRUFGAS index, and KXHORMUZGASCOMBO
+# (Hormuz traffic x a 2027 gas price). Not a bare KXGAS prefix: that would
+# freeze the Georgia election series (KXGASEN1R, KXGASTATELEG, ...). A prefix
+# entry wins over the AS test's gas family and a gas-state daily pick, which
+# stand aside only the state PATTERN block (_blocked). Left as they are:
+# natural gas (KXNATGAS*, KXNGAS*, the TTF, Marcellus and PA production),
+# jet fuel, gasoline inventories, gas-tax bills and the Russian-diesel policy
+# questions; the CPI-gas series sit under the CPI pattern already. The
+# piecemeal cuts above (_CUT_AAA_SERIES, _CUT_GAS_TRIAL_SERIES,
+# _CUT_AAA_MONTHLY_SERIES, the launcher's KXAAAGASW,KXDIESELW) stay, so
+# lifting this entry restores exactly what they had cut. Standard semantics:
+# no new orders, resting quotes cancelled next cycle, NOT reduce-only, the
+# diesel annual positions ride to settlement; the GasBuddy refresher keeps
+# logging. Un-block by removing this entry.
+_CUT_FUEL_PREFIXES = ("KXAAAGAS", "AAAGAS", "KXDIESEL", "DIESEL")
+_CUT_FUEL_SERIES = ("KXGAS", "KXGASD", "KXGASMAX", "KXGASMIN", "GAS", "GASD",
+                    "GASMAX", "GASMIN", "KXTRUFGAS", "KXHORMUZGASCOMBO")
+_CUT_FUEL_ENTRIES = _CUT_FUEL_PREFIXES + tuple(f"{_s}-" for _s in _CUT_FUEL_SERIES)
 # OPENROUTER SHARE FAMILY OFF (Jack 2026-10-09: "yes do both", after "is it
 # still underperforming after the latest changes around breaks and control
 # measures?"). The ten KX<AUTHOR>SHARE series (_DEFAULT_OR_SHARE_SERIES)
@@ -5912,6 +5940,8 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + [f"{_s}-" for _s in _CUT_GAS_TRIAL_SERIES]
     # the national AAA monthly (2026-10-25, above)
     + [f"{_s}-" for _s in _CUT_AAA_MONTHLY_SERIES]
+    # every gasoline and diesel price market (2026-11-16, above)
+    + list(_CUT_FUEL_ENTRIES)
     # the OpenRouter share family (2026-10-09, above)
     + [f"{_s}-" for _s in _CUT_OR_SHARE_SERIES]
     # Netflix top-10 TV + LoL Worlds Teemo (2026-11-01, above)
