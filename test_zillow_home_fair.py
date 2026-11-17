@@ -139,6 +139,19 @@ class TestMarketEntry(unittest.TestCase):
         mar = SEA.replace("November 2026", "March 2027")          # h = 6
         self.assertIn("p", z.market_entry({"rules_primary": mar, "floor_strike": 882500},
                                           self.region(), "City"))
+        # THE FAR MONTHS (2026-11-17): MAX_H 14, so HOU's June / August 2027
+        # (h 8 / 10 off October) and a 14-month target are modelled
+        self.assertEqual(z.MAX_H, 14)
+        nov27 = SEA.replace("November 2026", "November 2027")     # h = 14
+        e14 = z.market_entry({"rules_primary": nov27, "floor_strike": 882500},
+                             self.region(), "City")
+        self.assertEqual(e14["h"], 14)
+        self.assertTrue(0.0 < e14["p"] < 1.0)
+        for mon, h in (("June 2027", 9), ("August 2027", 11)):
+            e = z.market_entry({"rules_primary": SEA.replace("November 2026", mon),
+                                "floor_strike": 882500}, self.region(), "City")
+            self.assertEqual(e["h"], h)
+            self.assertIn("p", e)
         with mock.patch.object(z, "MAX_H", 20):
             self.assertIn("p", z.market_entry({"rules_primary": far, "floor_strike": 882500},
                                               self.region(), "City"))

@@ -56,8 +56,19 @@ Zillow Home Value Index joins `auto` (KXMEMHOME, KXHOUHOME); one whose rules
 do not (KXEXUSHOME: FRED; KX<ST>HOMEPRICE: FHFA) is probed again only every
 META_REFRESH_SECS. "below" / "at most" strikes price as 1 - P(above) and
 "at least" as "above"; a target month more than MAX_H months past the latest
-print is not modelled (the re-anchor drift is measured over a season, not
-years: KXHOUHOME's December 2027 strikes stand aside).
+print is not modelled.
+
+THE FAR MONTHS (Jack 2026-11-17: "why doesnt KXHOUHOME-30JUN27 quote or
+KXHOUHOME-31AUG27? it should"). MAX_H was 6, so Houston's June and August
+2027 ladders (8 and 10 months past the October print, ~$26.50/day a market)
+stood aside as "not modelled". It is 14 now, which covers every Zillow month
+listed (KXHOUHOME-31DEC27 is 14). Past 6 months the fair leans on the
+re-anchor drift, a fall-2026 reading carried 8-14 releases (-4% to -7%), so
+it is the least certain part of the model. The gate still bounds every quote
+at fair -/+ HOME_FAIR_TOL_CENTS, and a touch fighting the fair still rests the
+1c / 99c edges alone. The FAIR LEAD is live on these months too (the 11/16
+no-lead change never landed), so it can step ahead of the book toward this
+fair, up to that bound.
 """
 import csv
 import json
@@ -96,10 +107,11 @@ REANCHOR_IDIO_SD_OTHER_PCT = _env_float("IMM_HOME_REANCHOR_IDIO_SD_OTHER_PCT", 0
 SHAPE_SD_MULT = _env_float("IMM_HOME_SHAPE_SD_MULT", 1.0)
 SD_FLOOR_PCT = _env_float("IMM_HOME_SD_FLOOR_PCT", 0.5)
 AR_MONTHS = int(_env_float("IMM_HOME_AR_MONTHS", 36))
-# the furthest target month modelled, in months past the latest print: the
+# the furthest target month modelled, in months past the latest print. The
 # AR fit is scored to h=3 and the re-anchor drift (h x REANCHOR_MEAN_PCT) is
-# a fall-2026 reading, so a year out it would be a -6% guess
-MAX_H = int(_env_float("IMM_HOME_MAX_H", 6))
+# a fall-2026 reading, so a year out it is a -6% guess. Was 6; 14 since
+# 2026-11-17 (THE FAR MONTHS above): every listed Zillow month quotes.
+MAX_H = int(_env_float("IMM_HOME_MAX_H", 14))
 # every minute since the HOME LEADS (2026-11-13): 200-lot leads ~15c+ off the
 # fair rest on every strike, and a new Zillow release is what moves it, so the
 # gate's release hold must start within a minute of Zillow's file changing
