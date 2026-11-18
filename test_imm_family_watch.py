@@ -2063,6 +2063,17 @@ class TestUpcomingAlerts(unittest.TestCase):
         it = self._items(rows, targets=targets, state=state)["upcoming:KXSPAINABROAD"]
         self.assertEqual((it["hold"], it["researched"]), (False, True))
         self.assertEqual(fw.quote_call("upcoming:KXSPAINABROAD", it, {})[0], "QUOTE ONCE DATED")
+        # a start-time target counts too (the Power Slap cards); an event with
+        # no research at all keeps the series alerted
+        rows = [self._row("KXPOWERSLAPMATCH-26NOV19AAABBB-AAA", "no",
+                          "cutoff at or before the start"),
+                self._row("KXPOWERSLAPMATCH-26NOV19CCCDDD-CCC", "no",
+                          "cutoff at or before the start")]
+        starts = {f"start:KXPOWERSLAPMATCH-26NOV19{m}": {"kind": "powerslap"}
+                  for m in ("AAABBB", "CCCDDD")}
+        self.assertTrue(self._items(rows, targets=starts)["upcoming:KXPOWERSLAPMATCH"]["hold"])
+        one = {"start:KXPOWERSLAPMATCH-26NOV19AAABBB": {"kind": "powerslap"}}
+        self.assertFalse(self._items(rows, targets=one)["upcoming:KXPOWERSLAPMATCH"]["hold"])
 
     def test_the_email_says_when_it_starts_and_why_it_would_be_dark(self):
         rows = [self._row("KXGRAMMY-BAMA69-LOS", "no", "cutoff at or before the start"),

@@ -1438,9 +1438,12 @@ def upcoming_alert_items(client, upcoming: list, progs: Dict[str, dict],
     for s, d in sorted(dark.items()):
         why = d["whys"].most_common(1)[0][0]
         evs = sorted(d["events"])
-        tkeys = [f"gap:{ev}" for ev in evs]
-        researched = [k for k in tkeys if k in targets]
-        live = [k for k in researched if not _research_gave_up(rstate.get(k) or {})]
+        # each event's research targets: a date row (gap:) or a start time
+        # (start:, the Power Slap cards and broadcast mentions)
+        per_ev = [[k for k in (f"gap:{ev}", f"start:{ev}") if k in targets] for ev in evs]
+        researched = [k for ks in per_ev for k in ks]
+        working = [ks for ks in per_ev
+                   if any(not _research_gave_up(rstate.get(k) or {}) for k in ks)]
         items[f"upcoming:{s}"] = {
             "est": round(d["dpd"] * GAP_CAPTURE, 2),
             "what": (f"{s}: {d['n']} market{'s' if d['n'] != 1 else ''} in {len(evs)} "
@@ -1450,7 +1453,7 @@ def upcoming_alert_items(client, upcoming: list, progs: Dict[str, dict],
             "why": why, "events": evs, "upcoming_start": d["start"].timestamp(),
             "researched": bool(researched),
             # research is still working on every event: wait for it
-            "hold": bool(tkeys) and len(live) == len(tkeys)}
+            "hold": bool(evs) and len(working) == len(evs)}
     for s, n in sorted(new.items()):
         it = {"est": round(n["dpd"] * GAP_CAPTURE, 2),
               "what": (f"{s}: paying from {_fmt_et(n['start'].timestamp())} "
