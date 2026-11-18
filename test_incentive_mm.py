@@ -250,6 +250,8 @@ def setUpModule():
     # THE FAR MONTHS x5 (2026-11-18): the Zillow fixtures are dated 2067, so
     # every one would read as a far month -- x1 here; TestHomeFarSize turns it on
     imm.HOME_FAR_SIZE_MULT = 1.0
+    # ...and the far months' follow-the-book rule likewise (2026-11-18)
+    imm.HOME_FAR_FOLLOW_BOOK = False
     # the Pokemon gate's status file and in-memory snapshot (2026-10-03):
     # the same -- only its refresher thread writes them
     imm.POKE_STATUS_FILE = os.path.join(tmp, "pokemon_fair.json")
@@ -26531,6 +26533,87 @@ class TestHomeFarSize(unittest.TestCase):
         for side in ("bid", "ask"):
             self.assertAlmostEqual(s5[side], 5 * s1[side], delta=0.02 * 5 * s1[side] + 2,
                                    msg=(side, s1, s5))
+
+    # THE FAR MONTHS FOLLOW THE BOOK (Jack 2026-11-18: "on Zillow far out
+    # markets, still not placing asks" -> "Yes, follow the book"), CONSISTENT
+    # ACROSS MONTHS ("and make sure the book is consistent across months for a
+    # city" -> "Cross-month bound")
+
+    def _quotes(self, bot):
+        return {(o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
+                if o["ticker"] == self.T}
+
+    def test_a_far_month_follows_the_book(self):
+        now = time.time()
+        self._snap(p=0.99)                 # the model: 99c against a 50x90 book
+        with mock.patch.object(imm, "HOME_FAR_FOLLOW_BOOK", False):
+            self.assertEqual(imm.home_gate(self.T, now, 50, 90)[2], (84, 99))
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertEqual({px for s, px in self._quotes(bot) if s == "ask"}, {99})
+        _clean_persist()
+        with mock.patch.object(imm, "HOME_FAR_FOLLOW_BOOK", True):
+            why, inputs, caps = imm.home_gate(self.T, now, 50, 90)
+            self.assertEqual((why, caps, inputs["follow_book"]), ("", (99, 1), True))
+            self.assertIsNone(imm.home_fair_c(self.T, now))       # no model-priced close
+            # the fail-closed stand-asides still hold a far month
+            self._snap(p=0.99, release_age=60)
+            self.assertIsNone(imm.home_gate(self.T, now, 50, 90)[2])
+            self._snap(p=0.99, check_age=3600.0)
+            self.assertIsNone(imm.home_gate(self.T, now, 50, 90)[2])
+            self._snap(err="not modelled: x")
+            self.assertIsNone(imm.home_gate(self.T, now, 50, 90)[2])
+            # ...a near month keeps the model's bound
+            near = "KXSEAHOME-" + (datetime.now(timezone.utc).astimezone(imm.ET)
+                                   + timedelta(days=30)).strftime("%d%b%y").upper() + "-GT882500"
+            self._snap(p=0.99, ticker=near)
+            self.assertEqual(imm.home_gate(near, now, 50, 90)[2], (84, 99))
+            # the quote loop: both sides at the book
+            self._snap(p=0.99)
+            bot = self._bot()
+            bot.run_cycle()
+            q = self._quotes(bot)
+            self.assertEqual({px for s, px in q if s == "bid"}, {48, 49, 50})
+            self.assertEqual({px for s, px in q if s == "ask"}, {90, 91, 92})
+
+    def test_the_cross_month_caps(self):
+        sufs = {"KXHOUHOME-30JUN27": frozenset({"LT122000", "LT124000"}),
+                "KXHOUHOME-31AUG27": frozenset({"LT122000"}),
+                "KXSEAHOME-31AUG27": frozenset({"LT122000"})}
+        with mock.patch.dict(imm.EVENT_PROGRAMMED_SUFFIXES, sufs, clear=True):
+            self.assertEqual(imm.home_xmonth_tickers("KXHOUHOME-30JUN27-LT122000"),
+                             ["KXHOUHOME-31AUG27-LT122000"])
+            self.assertEqual(imm.home_xmonth_tickers("KXHOUHOME-30JUN27-LT124000"), [])
+        aug = ("KXHOUHOME-31AUG27-LT122000", [[51.0, 100.0]], [[48.0, 100.0]])   # 51x52
+        caps, why = imm.home_xmonth_caps((99, 1), [aug])
+        self.assertEqual((caps, why), ((67, 36), ""))              # no touch given
+        caps, why = imm.home_xmonth_caps((99, 1), [aug], ext_bid=70, ext_ask=30)
+        self.assertIn("bids <= 67 (KXHOUHOME-31AUG27-LT122000 ask 52 + 15)", why)
+        self.assertIn("asks >= 36", why)
+        self.assertEqual(imm.home_xmonth_caps((99, 1), [aug], ext_bid=38, ext_ask=39)[1], "")
+        # a thin top level does not set it (HOME_XMONTH_MIN_QTY deep)
+        thin = ("X", [[80.0, 1.0], [51.0, 100.0]], [[48.0, 100.0]])
+        self.assertEqual(imm.home_xmonth_caps((99, 1), [thin])[0], (67, 36))
+        # several months: the tightest of each; a one-sided month binds one side
+        oct_ = ("Y", [[60.0, 100.0]], [])
+        self.assertEqual(imm.home_xmonth_caps((99, 1), [aug, oct_])[0], (67, 45))
+
+    def test_the_quote_loop_holds_a_far_month_inside_its_city(self):
+        self._snap(p=0.99)
+        other = "KXSEAHOME-31DEC67-GT882500"
+        with mock.patch.object(imm, "HOME_FAR_FOLLOW_BOOK", True), \
+                mock.patch.object(imm, "home_xmonth_tickers", lambda t: [other]):
+            bot = self._bot()
+            # the other month's external book: 20 x 30
+            bot._comp_books = lambda tickers: [(other, [[20.0, 100.0]], [[70.0, 100.0]])]
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertEqual({px for s, px in q if s == "bid"}, {45}, lines[-30:])   # 30 + 15
+        self.assertEqual({px for s, px in q if s == "ask"}, {90, 91, 92})
+        self.assertTrue(any(f"home-value cross-month {self.T}: bids <= 45 ({other} ask 30 + 15)"
+                            in s for s in lines), [s for s in lines if "cross-month" in s])
 
 
 class TestHomeAutoFamily(TestZillowHomeGate):

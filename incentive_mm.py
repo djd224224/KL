@@ -15101,6 +15101,7 @@ _CONFIG_CODE_KNOBS = (
     "HOME_ENABLE", "HOME_SERIES", "HOME_FAIR_TOL_CENTS", "HOME_FAIR_TTL_MIN",
     "HOME_FAIR_REFRESH_SECS", "HOME_RELEASE_HOLD_MIN", "HOME_SIZE_MULT", "HOME_EDGES",
     "HOME_FAR_SIZE_MULT", "HOME_FAR_DAYS", "HOME_ONE_SIDE_BREACH",     # (2026-11-18)
+    "HOME_FAR_FOLLOW_BOOK", "HOME_XMONTH_TOL_CENTS", "HOME_XMONTH_MIN_QTY",
     "HOME_AUTO", "HOME_AUTO_PATTERN",
     # placement queue priority (2026-11-14)
     "PLACE_PRIORITY", "RENEW_URGENT_SECS",
@@ -22241,6 +22242,33 @@ HOME_SIZE_MULT = _env_float("IMM_HOME_SIZE_MULT", 1.0)
 # ever. IMM_HOME_FAR_SIZE_MULT=1 turns it off.
 HOME_FAR_SIZE_MULT = _env_float("IMM_HOME_FAR_SIZE_MULT", 5.0)
 HOME_FAR_DAYS = _env_float("IMM_HOME_FAR_DAYS", 90.0)
+# THE FAR MONTHS FOLLOW THE BOOK (Jack 2026-11-18: "on Zillow far out
+# markets, still not placing asks" -> "Yes, follow the book"). Past
+# HOME_FAR_DAYS the fair is mostly the re-anchor drift (-0.5% a release
+# carried 8-10 releases): on 11/18 it put Houston's June / August 2027 at
+# $117k / $115k against books implying ~$123k / ~$122k, 20-60c over the book
+# on the high LT strikes, so the gate's ask floor (fair + 15c) kept every ask
+# off the touch; without the drift the model sat close to the books (June
+# LT124000 74c vs 68x69), where the +/-15c band keeps BOTH sides 15c off the
+# touch. So a far month is not bounded by the model at all: both sides join
+# the book (no lead, home_lead_off), at x HOME_FAR_SIZE_MULT. The fail-closed
+# stand-asides stay -- no Zillow read, a stale check, the hold after a
+# release, an unmodelled or decided strike -- and home_fair_c reads no fair
+# there (no model-priced close). IMM_HOME_FAR_FOLLOW_BOOK=0: the model's
+# bound again.
+HOME_FAR_FOLLOW_BOOK = os.environ.get("IMM_HOME_FAR_FOLLOW_BOOK", "1") == "1"
+# ...CONSISTENT ACROSS MONTHS (Jack the same night: "and make sure the book
+# is consistent across months for a city" -> "Cross-month bound"). A far
+# month's quote on a strike may not go past the same strike's book in the
+# city's other programmed months by more than HOME_XMONTH_TOL_CENTS: every
+# bid <= another month's ask + tol, every ask >= another month's bid - tol,
+# each month's EXTERNAL book (our own orders out) read at the first level
+# HOME_XMONTH_MIN_QTY deep, so a 1-lot cannot set it. A month whose book is
+# out of line with its neighbours cannot fill us on the far side of them. On
+# 11/18 Houston's June / August ladders sat inside it (LT122000 38x39 vs
+# 51x52). A month off the feed sets no bound. HOME_XMONTH_TOL_CENTS=100: off.
+HOME_XMONTH_TOL_CENTS = _env_int("IMM_HOME_XMONTH_TOL_CENTS", 15)
+HOME_XMONTH_MIN_QTY = _env_float("IMM_HOME_XMONTH_MIN_QTY", 20.0)
 # ONE SIDE OFF A BREACH (Jack 2026-11-18: "i dont see the Zillow bids"). A
 # touch fighting the fair took BOTH sides to the 1c / 99c edges, which sit
 # behind 1,000+ contract walls and earn nothing, so neither rested. 00:48Z
@@ -22367,17 +22395,77 @@ def home_cutoff_utc(event_ticker: str) -> Optional[datetime]:
     return ET.localize(d).astimezone(timezone.utc)
 
 
-def home_far_mult(ticker: str, now_ts: Optional[float] = None) -> float:
-    """HOME_FAR_SIZE_MULT for a Zillow market (or event) whose cutoff is
-    HOME_FAR_DAYS or more away, else 1.0 (THE FAR MONTHS, x5)."""
-    if HOME_FAR_SIZE_MULT == 1.0 or HOME_FAR_SIZE_MULT <= 0 \
-            or not home_series(series_of(ticker)):
-        return 1.0
+def home_far_month(ticker: str, now_ts: Optional[float] = None) -> bool:
+    """Is this Zillow market (or event) a FAR month -- its cutoff
+    HOME_FAR_DAYS or more away?"""
+    if not home_series(series_of(ticker)):
+        return False
     cut = home_cutoff_utc("-".join(str(ticker).split("-")[:2]))
     if cut is None:
-        return 1.0
+        return False
     ts = time.time() if now_ts is None else now_ts
-    return HOME_FAR_SIZE_MULT if cut.timestamp() - ts >= HOME_FAR_DAYS * 86400 else 1.0
+    return cut.timestamp() - ts >= HOME_FAR_DAYS * 86400
+
+
+def home_far_mult(ticker: str, now_ts: Optional[float] = None) -> float:
+    """HOME_FAR_SIZE_MULT for a Zillow far month (home_far_month), else 1.0
+    (THE FAR MONTHS, x5)."""
+    if HOME_FAR_SIZE_MULT == 1.0 or HOME_FAR_SIZE_MULT <= 0:
+        return 1.0
+    return HOME_FAR_SIZE_MULT if home_far_month(ticker, now_ts) else 1.0
+
+
+def home_xmonth_tickers(ticker: str) -> List[str]:
+    """The same strike in the city's other programmed months
+    (EVENT_PROGRAMMED_SUFFIXES): KXHOUHOME-30JUN27-LT122000 ->
+    [KXHOUHOME-31AUG27-LT122000, ...]."""
+    ev, _, suf = str(ticker).rpartition("-")
+    if not ev or not suf:
+        return []
+    pre = series_of(ticker) + "-"
+    return sorted(f"{e}-{suf}" for e, sufs in EVENT_PROGRAMMED_SUFFIXES.items()
+                  if e != ev and e.startswith(pre) and suf in sufs)
+
+
+def _xmonth_ref(levels: List[List[float]], min_qty: float) -> Optional[int]:
+    """A side's price at the first level HOME_XMONTH_MIN_QTY deep (best
+    first, its own price space), else None."""
+    cum = 0.0
+    for px, q in levels_desc(levels):
+        cum += q
+        if cum >= min_qty:
+            return int(px)
+    return None
+
+
+def home_xmonth_caps(caps: Tuple[Optional[int], Optional[int]],
+                     books: List[Tuple[str, List[List[float]], List[List[float]]]],
+                     ext_bid: Optional[float] = None, ext_ask: Optional[float] = None
+                     ) -> Tuple[Tuple[Optional[int], Optional[int]], str]:
+    """(caps tightened by the city's other months, why): every bid at most
+    another month's ask + HOME_XMONTH_TOL_CENTS, every ask at least another
+    month's bid - it (CONSISTENT ACROSS MONTHS); `books` are those months'
+    EXTERNAL books (ticker, YES, NO levels). `why` names a bound that keeps
+    a side off this market's own touch (ext_bid / ext_ask), else ''."""
+    bid_cap, ask_floor = caps
+    tol = HOME_XMONTH_TOL_CENTS
+    by_b = by_a = ""
+    for tk, yes, no in books:
+        ob = _xmonth_ref(yes, HOME_XMONTH_MIN_QTY)
+        nb = _xmonth_ref(no, HOME_XMONTH_MIN_QTY)
+        oa = None if nb is None else 100 - nb
+        if bid_cap is not None and oa is not None and oa + tol < bid_cap:
+            bid_cap = max(1, oa + tol)
+            by_b = f"bids <= {bid_cap} ({tk} ask {oa} + {tol})"
+        if ask_floor is not None and ob is not None and ob - tol > ask_floor:
+            ask_floor = min(99, ob - tol)
+            by_a = f"asks >= {ask_floor} ({tk} bid {ob} - {tol})"
+    why = []
+    if by_b and ext_bid is not None and bid_cap is not None and ext_bid > bid_cap:
+        why.append(by_b)
+    if by_a and ext_ask is not None and ask_floor is not None and ext_ask < ask_floor:
+        why.append(by_a)
+    return (bid_cap, ask_floor), "; ".join(why)
 
 
 def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
@@ -22415,6 +22503,10 @@ def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     if e.get("decided"):
         return (f"decided at {fair:.0f}c (the target month is out)",
                 dict(inputs, reason="decided"), None)
+    # a far month follows the book: no bound from the model (THE FAR MONTHS
+    # FOLLOW THE BOOK; the quote loop adds the cross-month bound)
+    if HOME_FAR_FOLLOW_BOOK and home_far_month(ticker, now_ts):
+        return "", dict(inputs, follow_book=True, bid_cap=99, ask_floor=1), (99, 1)
     # the band edges a fair of `fair` never argues with (HOME_EDGES)
     edges = ((1 if fair >= 1.0 else None, 99 if fair <= 99.0 else None)
              if HOME_EDGES else (None, None))
@@ -22450,9 +22542,10 @@ def home_fair_c(ticker: str, now_ts: float) -> Optional[float]:
     """`ticker`'s Zillow fair (YES cents) while the home gate reads it -- a
     fresh check, no new-release hold, a modelled and undecided strike, a side
     HOME_FAIR_TOL_CENTS clear of it -- else None: FAIR LEAD's view of the
-    family (the gate's book test apart; see HOME LEADS)."""
+    family (the gate's book test apart; see HOME LEADS). None on a far month
+    following the book (no model-priced close there either)."""
     why, inputs, _caps = home_gate(ticker, now_ts, None, None)
-    return None if why else float(inputs["fair"])
+    return None if (why or inputs.get("follow_book")) else float(inputs["fair"])
 
 
 # ----------------------------------------------------------------------------
@@ -29479,6 +29572,7 @@ class IncentiveMarketMaker:
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
         self._home_stood: Set[str] = set()        # zillow home gate stand-asides
         self._home_edges: Set[str] = set()        # ...and its edges-only markets
+        self._home_xmonth_note: Dict[str, str] = {}   # ...and its cross-month bounds
         self._cev_stood: Set[str] = set()         # crypto event gate stand-asides
         self._fev_stood: Set[str] = set()         # FX event gate stand-asides
         self._lcv_stood: Set[str] = set()         # listed combo gate stand-asides
@@ -38406,6 +38500,17 @@ class IncentiveMarketMaker:
             out.append((s, sy, sn))
         return out
 
+    def _home_xmonth(self, t: str, caps: Tuple[Optional[int], Optional[int]],
+                     ext_bid: Optional[float] = None, ext_ask: Optional[float] = None
+                     ) -> Tuple[Tuple[Optional[int], Optional[int]], str]:
+        """A far Zillow month's caps under the CROSS-MONTH BOUND: the same
+        strike's external books in the city's other programmed months
+        (home_xmonth_tickers, _comp_books) -> home_xmonth_caps."""
+        others = home_xmonth_tickers(t)
+        if not others:
+            return caps, ""
+        return home_xmonth_caps(caps, self._comp_books(others), ext_bid, ext_ask)
+
     def _comp_sib_books(self, t: str
                         ) -> Optional[List[Tuple[str, List[List[float]], List[List[float]]]]]:
         """Each of `t`'s siblings' EXTERNAL book from the WS feed, as
@@ -40689,6 +40794,8 @@ class IncentiveMarketMaker:
                 # Zillow home gate: the same, HOME_FAIR_TOL_CENTS clear
                 # (a touch fighting the fair: the 1c / 99c edges alone, HOME_EDGES)
                 _hw, _hi, _hc = home_gate(meta.ticker, _now.timestamp(), eb, ea)
+                if _hc is not None and not _hw and _hi.get("follow_book"):
+                    _hc = self._home_xmonth(meta.ticker, _hc)[0]     # (CROSS-MONTH BOUND)
                 out = [] if _hc is None else mort_cap_quotes(out, *_hc)
             if crypto_event_series(meta.series):
                 # crypto event gate: the same, the band plus CRYPTO_EVENT_TOL_CENTS
@@ -43573,6 +43680,16 @@ class IncentiveMarketMaker:
             home_edges_only = False
             if home_series(meta.series):
                 hg_why, hg_in, home_caps = home_gate(t, now_ts, ext_bid, ext_ask)
+                # a far month following the book: the CROSS-MONTH BOUND
+                if not hg_why and home_caps is not None and hg_in.get("follow_book"):
+                    home_caps, xm_why = self._home_xmonth(t, home_caps, ext_bid, ext_ask)
+                    if xm_why != self._home_xmonth_note.get(t, ""):
+                        log(f"{self.tag} home-value cross-month {t}: "
+                            + (xm_why or "clear (inside the city's other months)"))
+                        if xm_why:
+                            self._home_xmonth_note[t] = xm_why
+                        else:
+                            self._home_xmonth_note.pop(t, None)
                 home_edges_only = bool(hg_why) and home_caps is not None
                 if home_edges_only != (t in self._home_edges):
                     if home_edges_only:
@@ -48710,7 +48827,10 @@ class IncentiveMarketMaker:
                    if HOME_ONE_SIDE_BREACH else "rests the 1c / 99c edges alone")
                 + f", {HOME_RELEASE_HOLD_MIN}m out after a Zillow "
                 f"release, size x{HOME_SIZE_MULT:g} (x{HOME_FAR_SIZE_MULT:g} with "
-                f"{HOME_FAR_DAYS:g}+ days to the cutoff), 1-99c, out 00:00 ET on the "
+                f"{HOME_FAR_DAYS:g}+ days to the cutoff"
+                + (f", where both sides follow the book inside the city's other months "
+                   f"+/-{HOME_XMONTH_TOL_CENTS}c" if HOME_FAR_FOLLOW_BOOK else "")
+                + "), 1-99c, out 00:00 ET on the "
                 f"ticker day, ttl {HOME_FAIR_TTL_MIN}m, leads "
                 + ("on" if HOME_LEADS else "OFF (fair closes only; IMM_HOME_LEADS=1 "
                    "restores them)")
