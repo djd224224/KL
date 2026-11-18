@@ -151,10 +151,14 @@ def _floor_verdict(meta, est_day: float, est_total: float, at: datetime):
 
 
 def assess(client, bot, raw_rows: list, active_markets: set,
-           now_utc: datetime) -> dict:
+           now_utc: datetime, max_books: int = None) -> dict:
     """{"rows": [series rows, best first], "renewals": (n markets, $ pool),
-    "n_new_markets", "n_events", "books", "horizon_days"}. See the module
-    docstring."""
+    "n_new_markets", "n_events", "books", "horizon_days", "markets": {ticker:
+    its verdict row (series, event, info, pool, kind, why)}}. See the module
+    docstring. `max_books` (default MAX_BOOKS) caps the estimator's book
+    reads; 0 is the family watch's cheap read (2026-11-18): the config and
+    screen verdicts only, the estimates left to the pool proxy."""
+    max_books = MAX_BOOKS if max_books is None else max_books
     hot_reload()
     programs = bot.upcoming_by_market(raw_rows, now_utc)
     horizon = now_utc + timedelta(days=HORIZON_DAYS)
@@ -227,7 +231,7 @@ def assess(client, bot, raw_rows: list, active_markets: set,
              for t in sorted(by_series[s], key=lambda t: -rows[t]["pool"])
              if (rows[t]["kind"] == "no") == no_pass]
     for t in queue:
-        if books >= MAX_BOOKS:
+        if books >= max_books:
             break
         r = rows[t]
         meta = r["meta"]
@@ -294,7 +298,7 @@ def assess(client, bot, raw_rows: list, active_markets: set,
     out.sort(key=lambda e: (-e["est_total"], -e["pool"], e["series"]))
     return {"rows": out, "renewals": (renew_n, renew_pool),
             "n_new_markets": len(new), "n_events": len({r["event"] for r in rows.values()}),
-            "books": books, "horizon_days": HORIZON_DAYS}
+            "books": books, "horizon_days": HORIZON_DAYS, "markets": rows}
 
 
 def quote_cell(e: dict) -> str:

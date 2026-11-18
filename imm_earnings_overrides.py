@@ -1610,27 +1610,34 @@ def discover_broadcast_mention_events(client, now):
     cannot place — the population that silently dies at the midnight rule.
     The single-event Mentions auto family (incentive_mm.mention_auto_series,
     2026-10-13: KXDJTRALLY ... -- no MENTION in the name) is discovered the
-    same way, so its starts get written too."""
+    same way, so its starts get written too.
+
+    UPCOMING PROGRAMS too (Jack 2026-11-18: "Yes, build them"), as
+    enroll_new_series reads them: a mention event whose program has not
+    started is placed now, so it quotes from the start with its start time
+    on file instead of after the next run. IMM_UPCOMING=0: active only."""
     imm.load_mention_auto_series()
     events = {}
-    cursor = None
-    for _page in range(20):
-        params = {"limit": 1000, "status": "active"}
-        if cursor:
-            params["cursor"] = cursor
-        resp = client.get("/incentive_programs", params=params)
-        batch = resp.get("incentive_programs") or []
-        for p in batch:
-            t = p.get("market_ticker") or ""
-            series = t.split("-")[0]
-            if not (BROADCAST_MENTION_RE.search(series)
-                    or imm.mention_auto_series(series)) \
-                    or series.startswith(_EARNINGS_PREFIX):
-                continue
-            events.setdefault("-".join(t.split("-")[:2]), series)
-        cursor = resp.get("next_cursor")
-        if not cursor or not batch:
-            break
+    statuses = ("active",) + (("upcoming",) if getattr(imm, "UPCOMING_ENABLE", False) else ())
+    for status in statuses:
+        cursor = None
+        for _page in range(20):
+            params = {"limit": 1000, "status": status}
+            if cursor:
+                params["cursor"] = cursor
+            resp = client.get("/incentive_programs", params=params)
+            batch = resp.get("incentive_programs") or []
+            for p in batch:
+                t = p.get("market_ticker") or ""
+                series = t.split("-")[0]
+                if not (BROADCAST_MENTION_RE.search(series)
+                        or imm.mention_auto_series(series)) \
+                        or series.startswith(_EARNINGS_PREFIX):
+                    continue
+                events.setdefault("-".join(t.split("-")[:2]), series)
+            cursor = resp.get("next_cursor")
+            if not cursor or not batch:
+                break
     out = []
     resolver = imm.EventStartResolver()
     today_et = now.astimezone(ET).date()

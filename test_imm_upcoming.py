@@ -81,7 +81,7 @@ def _meta(bot, t, info, m, at):
                            yield_per_contract=0.0)
 
 
-def run(rows, bot, active=(), markets=None):
+def run(rows, bot, active=(), markets=None, max_books=None):
     tickers = {p["market_ticker"] for p in rows}
     markets = markets if markets is not None else {
         t: {"ticker": t, "status": "active"} for t in tickers}
@@ -96,7 +96,7 @@ def run(rows, bot, active=(), markets=None):
             mock.patch.object(imm, "NO_NEW_SERIES", set()), \
             mock.patch.object(imm, "scan_universe_reason", lambda t: "not_scan"), \
             mock.patch.object(imm, "series_family_suffix", lambda s: False):
-        return up.assess(None, bot, rows, set(active), NOW)
+        return up.assess(None, bot, rows, set(active), NOW, max_books=max_books)
 
 
 class Verdicts(unittest.TestCase):
@@ -169,6 +169,27 @@ class Verdicts(unittest.TestCase):
         rows = [prog("KXFX-26NOV17-T1"), prog("KXFX-26NOV18-T1"), prog("KXFX-26NOV19-T1")]
         e = run(rows, FakeBot())["rows"][0]
         self.assertEqual((e["n"], e["label"]), (3, "KXFX x3 events"))
+
+    def test_the_cheap_read_reads_no_book_and_returns_every_market(self):
+        # 2026-11-18 (the family watch's UPCOMING ALERTS): max_books=0 runs the
+        # config and screen verdicts only; each market comes back with its own
+        rows = [prog("KXGOODS-26DEC01-T1"), prog("KXDARK-26DEC01-T1"),
+                prog("KXNOPE-26DEC01-T1")]
+        bot = FakeBot(allowed={"KXGOODS", "KXDARK"},
+                      screens={"KXDARK-26DEC01-T1": "cutoff"},
+                      est={"KXGOODS-26DEC01-T1": 5.0})
+        res = run(rows, bot, max_books=0)
+        self.assertEqual((bot.estimated, res["books"]), ([], 0))
+        m = res["markets"]
+        self.assertEqual((m["KXDARK-26DEC01-T1"]["kind"], m["KXDARK-26DEC01-T1"]["why"]),
+                         ("no", "cutoff at or before the start"))
+        self.assertEqual(m["KXNOPE-26DEC01-T1"]["why"], "not allowlisted")
+        self.assertEqual((m["KXGOODS-26DEC01-T1"]["kind"], m["KXGOODS-26DEC01-T1"]["why"]),
+                         ("maybe", "not estimated (book budget)"))
+        self.assertEqual(m["KXGOODS-26DEC01-T1"]["info"]["start"], START)
+        # the default still reads the books
+        self.assertGreater(run(rows, FakeBot(allowed={"KXGOODS"},
+                                             est={"KXGOODS-26DEC01-T1": 5.0}))["books"], 0)
 
 
 class EmailSection(unittest.TestCase):

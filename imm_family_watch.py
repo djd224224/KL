@@ -62,6 +62,15 @@ threshold". Three passes, each fail-safe on its own:
    it; nothing is placed. `python ca_settled_dry.py --report` scores it. A
    failing pass is emailed too (daily).
 
+UPCOMING PROGRAMS (2026-11-18, Jack: "also fix the root errors" and then
+"Yes, build them"): Kalshi's not-yet-started programs (status=upcoming) are
+read once a run. Pass 3 researches their undated election / award events
+and their marathons' starts before they begin (UPCOMING PROGRAMS); pass 4
+alerts on upcoming series a config verdict would hold dark and on new
+not-allowed families before their programs start (UPCOMING ALERTS); pass 5
+checks their markets' model coverage. imm_earnings_overrides' broadcast
+mention discovery reads them too. IMM_UPCOMING=0: active programs only.
+
 Imports imm_quote_gaps first: it mirrors the launcher's env (blocklist, allow
 lists, pilots) before incentive_mm is imported, so "allowed" means what the live
 bot means.
@@ -389,9 +398,7 @@ def hold_researched(items: Dict[str, dict], targets: Dict[str, dict], state: dic
             continue
         r = rstate.get(rkey) or {}
         n = int(r.get("attempts") or 0)
-        gave_up = (r.get("status") in ("judgment", "unsafe")
-                   or (r.get("status") == "unresolved" and n >= 2)
-                   or n >= RESEARCH_MAX_ATTEMPTS)
+        gave_up = _research_gave_up(r)
         first = float((seen.get(key) or {}).get("first") or now_ts)
         it["hold"] = not gave_up and (now_ts - first) < ALERT_STALE_HOURS * 3600
         if r.get("status"):
@@ -418,7 +425,7 @@ def describe(client, due: List[Tuple[str, dict, float]]) -> None:
             continue
         kind, _, tick = key.partition(":")
         try:
-            if kind == "new":
+            if kind in ("new", "upcoming"):          # upcoming:<series> too
                 s = ieo.series_meta(client, tick)
                 it["category"] = str(s.get("category") or "")
                 it["frequency"] = str(s.get("frequency") or "")
@@ -495,14 +502,19 @@ def missing_of(key: str, it: dict) -> str:
         return "its start time"
     if kind == "new":
         return "a place on the allowlist (a new family: your call)"
+    if kind == "upcoming":
+        return f"a fix before its programs start ({it.get('why') or 'a config verdict'})"
     g = gap_kind(it.get("what") or "")
     return {"election": "its election day", "award": "its date row"}.get(g, "a config fix")
 
 
 def quote_label(key: str, qs: Optional[Dict[str, dict]]) -> Tuple[str, Optional[dict]]:
     """("QUOTED on N of M markets" / "NOT QUOTED (...)" / "QUOTE STATE
-    UNKNOWN", the state) for an item, from load_quote_state."""
+    UNKNOWN", the state) for an item, from load_quote_state. An upcoming:
+    item has no quotes to read yet: "UPCOMING"."""
     kind, _, tick = key.partition(":")
+    if kind == "upcoming":
+        return "UPCOMING", None
     if not qs:
         return "QUOTE STATE UNKNOWN", None
     st = qs.get(("ser:" if kind == "new" else "ev:") + tick)
@@ -735,6 +747,13 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
                 "until its card start is on file, then to 10 min before it" + rec_txt)
     if kind == "start":
         return ("KEEP QUOTING", "a mention event, quoted behind the live gates" + rec_txt)
+    if kind == "upcoming":
+        if it.get("researched"):
+            return ("QUOTE ONCE DATED", "research could not date it before its programs "
+                                        "start; quote it once a verified row is on file"
+                    + rec_txt)
+        return ("FIX, THEN QUOTE", "a rule would hold it dark from its programs' start"
+                + rec_txt)
     if kind == "gap":
         if it.get("research") == "unsafe":
             return ("DON'T QUOTE", f"not a vote, and research judged it unsafe to quote for "
@@ -868,6 +887,10 @@ def _now_line(key: str, label: str, st: Optional[dict], dark_s: float,
     clear and succinct" -- one line, not a separate Needs line)."""
     hours = f"{dark_s / 60:.0f}h" if dark_s >= 90 else f"{dark_s:.0f} min"
     need = "; needs " + _needs_line(key, it) if it is not None else ""
+    if it is not None and it.get("upcoming_start"):
+        # an upcoming program: nothing is quoted yet (UPCOMING ALERTS)
+        verb = "would start dark" if key.startswith("upcoming:") else "not allowed"
+        return f"programs start {_fmt_et(it['upcoming_start'])}, {verb}" + need
     if label.startswith("QUOTED") and st is not None:
         txt = f"quoted on {st['q']} of {st['n']} markets"
         if st.get("cutoff"):
@@ -922,7 +945,11 @@ def alert_body(due: List[Tuple[str, dict, float]],
     quoted = [it for key, it, _ in due if labels[key][0].startswith("QUOTED")]
     unknown = [it for key, it, _ in due if labels[key][0].startswith("QUOTE STATE")]
     dark = [it for key, it, _ in due if labels[key][0].startswith("NOT QUOTED")]
+    upcoming = [it for key, it, _ in due if labels[key][0] == "UPCOMING"]
     parts = []
+    if upcoming:
+        parts.append(f"{len(upcoming)} would start dark "
+                     f"~${sum(i['est'] for i in upcoming):,.0f}/day")
     if dark:
         parts.append(f"{len(dark)} not quoted ~${sum(i['est'] for i in dark):,.0f}/day")
     if quoted:
@@ -1249,10 +1276,13 @@ def live_gaps(gaps: dict) -> dict:
 # ("gap:<event>"), priced by the upcoming pool so research_due ranks them.
 def upcoming_dating_gaps(rows: list) -> Dict[str, dict]:
     """{event: {kind, series, msg}} for the events of upcoming program rows
-    that would start dark for want of a date row."""
+    that would start dark for want of a date row -- or, since 2026-11-18
+    ("Yes, build them"), a marathon event for want of its race start (the
+    bot's "no race start on file" stand-down, researched as kind marathon)."""
     imm.load_election_extra_series()
     imm.load_election_dates_extra()
     imm.load_awards_dates_extra()
+    imm.load_file_event_overrides()
     first: Dict[str, Tuple[str, datetime]] = {}
     for p in rows or []:
         ev = str(p.get("event_ticker") or "")
@@ -1270,6 +1300,12 @@ def upcoming_dating_gaps(rows: list) -> Dict[str, dict]:
                 out[ev] = {"kind": "election", "series": series,
                            "msg": f"{ev} has no verified election day in ELECTION_DATES "
                                   f"-- its program starts {when}, so it would start dark"}
+            continue
+        if imm.marathon_series(series):
+            if ev not in imm.EVENT_START_OVERRIDES:
+                out[ev] = {"kind": "marathon", "series": series,
+                           "msg": f"{ev} has no race start on file -- its program starts "
+                                  f"{when}, so it would start dark"}
             continue
         imm.ensure_family_override(series)
         ov = imm.series_override(series)
@@ -1297,6 +1333,136 @@ def upcoming_pools(rows: list) -> Dict[str, float]:
         if ev:
             pools[ev] += ifa._dollars_per_day(p)
     return pools
+
+
+def fetch_upcoming(client) -> list:
+    """Kalshi's upcoming program rows (imm_upcoming.fetch_upcoming_raw), read
+    once a run for every pass that uses them; [] without a client, with
+    IMM_UPCOMING=0, or on a failed read (logged; the next run retries)."""
+    if client is None or not getattr(imm, "UPCOMING_ENABLE", False):
+        return []
+    try:
+        return imm_upcoming.fetch_upcoming_raw(client)
+    except Exception as e:                           # noqa: BLE001 - next run retries
+        log(f"[WATCH] ! upcoming programs read failed: {e!r}")
+        return []
+
+
+# UPCOMING ALERTS (Jack 2026-11-18: "any other checks/watches that i currently
+# do, that should be applied to upcoming programs?" -> "Yes, build them"). The
+# dark alert (pass 4) saw only ACTIVE programs, so a batch that a rule kept
+# dark was found once it had started: on 11/18 the 18 Grammy winner events
+# ($10,755 a period) and KXNBA30PTSTREAK were set to start on cutoffs at or
+# before their programs' start, and only a hand check caught them. Each run
+# now reads the upcoming programs through imm_upcoming.assess -- the bot's
+# own admission and screens as of each program's start, no book reads
+# (max_books=0) -- and adds two kinds of item to the same alert:
+#   upcoming:<series>  markets that would start dark on a config verdict
+#                      (UPCOMING_DARK_WHYS) within UPCOMING_ALERT_HORIZON_H,
+#                      worth the alert's GAP_ALERT_MIN_DPD at the pool proxy;
+#                      held while research is still working on every one of
+#                      its events (the election / award / marathon targets)
+#   new:<series>       a not-allowlisted family (pass 4's "your call" item,
+#                      the same key, so it is sent once and joins the
+#                      baseline either way) BEFORE its programs start; a
+#                      series a registry wave lists at its start (the FX /
+#                      metals and crypto ladders) is not one
+# Both go through due_alerts / describe / alert_body with the live items.
+UPCOMING_ALERT_HORIZON_H = float(os.environ.get("IMM_UPCOMING_ALERT_HORIZON_H", "72"))
+UPCOMING_DARK_WHYS = {
+    "cutoff at or before the start":
+        "the bot's cutoff for these is at or before the program start: a missing date "
+        "row (research works on those) or a rule that reads the wrong date (a code fix)",
+    "no event date (config gap)":
+        "no event date the bot can read: a date row or a code fix",
+}
+WAVES_FILE = os.path.join(KL_DIR, "run-logs", "pvd-scan", "waves.json")
+
+
+def wave_listed_series(path: Optional[str] = None) -> set:
+    """The series an enabled registry wave lists (pvd_waves.py's waves.json):
+    the wave lists their markets itself when their programs start."""
+    try:
+        with open(path or WAVES_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError):
+        return set()
+    waves = data.get("waves", data) if isinstance(data, dict) else data
+    rows = waves.values() if isinstance(waves, dict) else (waves or [])
+    return {str(s) for w in rows if isinstance(w, dict) and w.get("enabled", True)
+            for s in (w.get("series") or [])}
+
+
+def _research_gave_up(r: dict) -> bool:
+    """Research's verdict on a target is final (hold_researched's test)."""
+    n = int(r.get("attempts") or 0)
+    return (r.get("status") in ("judgment", "unsafe")
+            or (r.get("status") == "unresolved" and n >= 2)
+            or n >= RESEARCH_MAX_ATTEMPTS)
+
+
+def upcoming_alert_items(client, upcoming: list, progs: Dict[str, dict],
+                         targets: Dict[str, dict], state: dict, baseline: set,
+                         now: datetime, make_bot=None,
+                         waves: Optional[set] = None) -> Dict[str, dict]:
+    """{key: alert item} for UPCOMING ALERTS (see above): upcoming:<series>
+    and new:<series>."""
+    if not upcoming:
+        return {}
+    bot = (make_bot or _estimator)(client)
+    up = imm_upcoming.assess(client, bot, upcoming, set(progs), now, max_books=0)
+    horizon = now + timedelta(hours=UPCOMING_ALERT_HORIZON_H)
+    waves = wave_listed_series() if waves is None else waves
+    rstate = state.get("research") or {}
+    dark: Dict[str, dict] = {}
+    new: Dict[str, dict] = {}
+    for r in (up.get("markets") or {}).values():
+        start = r["info"]["start"]
+        if start > horizon or r.get("kind") != "no":
+            continue
+        s = r["series"]
+        if r.get("why") in UPCOMING_DARK_WHYS:
+            d = dark.setdefault(s, {"events": set(), "n": 0, "dpd": 0.0, "start": start,
+                                    "whys": Counter()})
+            d["events"].add(r["event"])
+            d["n"] += 1
+            d["dpd"] += float(r["info"]["dollars_per_day"])
+            d["start"] = min(d["start"], start)
+            d["whys"][r["why"]] += 1
+        elif r.get("why") == "not allowlisted" and s not in baseline and s not in waves:
+            n = new.setdefault(s, {"dpd": 0.0, "start": start, "events": set()})
+            n["dpd"] += float(r["info"]["dollars_per_day"])
+            n["start"] = min(n["start"], start)
+            n["events"].add(r["event"])
+    items: Dict[str, dict] = {}
+    for s, d in sorted(dark.items()):
+        why = d["whys"].most_common(1)[0][0]
+        evs = sorted(d["events"])
+        tkeys = [f"gap:{ev}" for ev in evs]
+        researched = [k for k in tkeys if k in targets]
+        live = [k for k in researched if not _research_gave_up(rstate.get(k) or {})]
+        items[f"upcoming:{s}"] = {
+            "est": round(d["dpd"] * GAP_CAPTURE, 2),
+            "what": (f"{s}: {d['n']} market{'s' if d['n'] != 1 else ''} in {len(evs)} "
+                     f"event{'s' if len(evs) != 1 else ''} would start dark ({why})"),
+            "fix": UPCOMING_DARK_WHYS[why] + (f"; e.g. {', '.join(evs[:3])}"
+                                              + (f" +{len(evs) - 3} more" if len(evs) > 3 else "")),
+            "why": why, "events": evs, "upcoming_start": d["start"].timestamp(),
+            "researched": bool(researched),
+            # research is still working on every event: wait for it
+            "hold": bool(tkeys) and len(live) == len(tkeys)}
+    for s, n in sorted(new.items()):
+        it = {"est": round(n["dpd"] * GAP_CAPTURE, 2),
+              "what": (f"{s}: paying from {_fmt_et(n['start'].timestamp())} "
+                       f"(${n['dpd']:,.0f}/day pool) and not on the allowlist"),
+              "fix": "your call: enroll the family before its programs start, or leave it out",
+              "upcoming_start": n["start"].timestamp()}
+        if WEATHER_NAME_RE.search(s):
+            it.update(always=True,
+                      fix="a weather series no family takes: your call (enroll it into "
+                          "a weather family, or leave it out)")
+        items[f"new:{s}"] = it
+    return items
 
 
 def research_targets(client, gaps: dict, now: datetime, dry: bool,
@@ -1906,16 +2072,14 @@ def apply_results(rstate: Dict[str, dict], due: List[str], targets: Dict[str, di
     return notes
 
 
-def research_pass(client, gaps: dict, state: dict, dry: bool) -> Tuple[Dict[str, dict], List[str]]:
+def research_pass(client, gaps: dict, state: dict, dry: bool,
+                  upcoming: Optional[list] = None) -> Tuple[Dict[str, dict], List[str]]:
     """Collect targets, research the due ones, update state["research"].
-    Returns (targets, summary lines)."""
+    Returns (targets, summary lines). `upcoming`: the run's upcoming program
+    rows (read here when not given)."""
     now_ts = time.time()
-    upcoming: list = []
-    if client is not None:
-        try:
-            upcoming = imm_upcoming.fetch_upcoming_raw(client)
-        except Exception as e:                       # noqa: BLE001 - next run retries
-            log(f"[WATCH] ! upcoming programs read failed: {e!r}")
+    if upcoming is None:
+        upcoming = fetch_upcoming(client)
     targets = research_targets(client, gaps, datetime.now(timezone.utc), dry,
                                upcoming=upcoming)
     rstate = prune_research(state.get("research") or {}, targets, now_ts)
@@ -1955,15 +2119,23 @@ MODEL_PASS_ERR_HOURS = 24.0
 
 
 def model_coverage_pass(progs: Dict[str, dict], state: dict, dry: bool,
-                        summary: List[str]) -> None:
+                        summary: List[str], upcoming: Optional[list] = None) -> None:
     """Pass 5 (Jack 2026-10-09): every paying market in a per-entity-modeled
     family must be modeled (imm_model_coverage). A gap is emailed on first
     sight and re-sent daily while open; the pass's own failure is emailed
-    too (at most daily), so a broken check can never go quiet."""
+    too (at most daily), so a broken check can never go quiet. Since
+    2026-11-18 ("Yes, build them") the markets of UPCOMING programs are
+    checked too, so a new city / entity / strike is modeled before its
+    program starts instead of sitting dark (fail-closed) after it."""
     import imm_model_coverage as mcov
     now_ts = time.time()
     try:
-        gaps = mcov.find_gaps(progs, now_ts)
+        markets = dict(progs)
+        for p in upcoming or []:
+            t = str(p.get("market_ticker") or "")
+            if t and t not in markets:
+                markets[t] = p
+        gaps = mcov.find_gaps(markets, now_ts)
         first = "model_gaps" not in state
         due_m, state["model_gaps"] = mcov.due(state.get("model_gaps") or {}, gaps,
                                               now_ts, baseline_once=first)
@@ -2115,6 +2287,9 @@ def main(argv=None) -> int:
         except Exception as e:
             log(f"[WATCH] ! enroll pass failed: {e!r}")
     progs = ifa.fetch_active_programs(client)
+    # the upcoming programs, read once for research, the alert and model
+    # coverage (UPCOMING ALERTS, 2026-11-18)
+    upcoming = fetch_upcoming(client)
     state = _load_state()
     try:
         n = load_event_map(client, progs, state)
@@ -2139,7 +2314,7 @@ def main(argv=None) -> int:
     targets: Dict[str, dict] = {}
     if not args.no_research:
         try:
-            targets, notes = research_pass(client, gaps, state, args.dry)
+            targets, notes = research_pass(client, gaps, state, args.dry, upcoming=upcoming)
             for n in notes:
                 log(f"[WATCH] {n}")
             summary.append(f"research targets {len(targets)}")
@@ -2159,8 +2334,27 @@ def main(argv=None) -> int:
             baseline = set(state["baseline_not_allowed"])
             items = gap_items(progs, gaps, audit["not_allowed"], baseline, targets)
             hold_researched(items, targets, state, time.time())
+            # one offline bot for the upcoming verdicts and the estimates
+            bots: Dict[str, object] = {}
+
+            def make_bot(c):
+                if "bot" not in bots:
+                    bots["bot"] = _estimator(c)
+                return bots["bot"]
+            n_up = 0
             try:
-                for n in real_estimates(client, items, progs, state, time.time()):
+                up_items = upcoming_alert_items(client, upcoming, progs, targets, state,
+                                                baseline, datetime.now(timezone.utc),
+                                                make_bot=make_bot)
+                for k, it in up_items.items():
+                    if k not in items:                   # a live item wins
+                        items[k] = it
+                        n_up += 1
+            except Exception as e:
+                log(f"[WATCH] ! upcoming alert items failed ({e!r}); live items only")
+            try:
+                for n in real_estimates(client, items, progs, state, time.time(),
+                                        make_bot=make_bot):
                     log(f"[WATCH] {n}")
             except Exception as e:
                 log(f"[WATCH] ! real estimates failed ({e!r}); pool proxy kept")
@@ -2175,11 +2369,11 @@ def main(argv=None) -> int:
                     # a new family is sent once, then joins the baseline
                     state["baseline_not_allowed"] = sorted(
                         baseline | {k[4:] for k, _, _ in due if k.startswith("new:")})
-            summary.append(f"tracking {len(items)}, alerted {len(due)}")
+            summary.append(f"tracking {len(items)} ({n_up} upcoming), alerted {len(due)}")
         except Exception as e:
             log(f"[WATCH] ! alert pass failed: {e!r}")
     if not args.no_model:
-        model_coverage_pass(progs, state, args.dry, summary)
+        model_coverage_pass(progs, state, args.dry, summary, upcoming=upcoming)
     if not args.no_calendar:
         release_calendar_pass(client, new_state_series, state, args.dry, summary)
     if not args.no_size_test:

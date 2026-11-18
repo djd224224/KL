@@ -2004,3 +2004,137 @@ class TestNotAVote(unittest.TestCase):
         # once: a verdict under these rules stands
         rstate["gap:KXPRESRUNFIRSTR-28"].update(attempts=1, status="judgment", last=t)
         self.assertEqual(fw.requeue_old_rules(rstate, T), [])
+
+
+class TestUpcomingAlerts(unittest.TestCase):
+    """Jack 2026-11-18 ("any other checks/watches that i currently do, that
+    should be applied to upcoming programs?" -> "Yes, build them"): the dark
+    alert, the new-family call, model coverage and the start-time research
+    read Kalshi's upcoming programs, not only the paying ones."""
+
+    NOW = datetime(2026, 11, 18, 13, 0, tzinfo=timezone.utc)
+
+    def _row(self, t, kind, why, start_h=6, dpd=500.0):
+        start = self.NOW + timedelta(hours=start_h)
+        return {"ticker": t, "event": t.rsplit("-", 1)[0], "series": imm.series_of(t),
+                "info": {"start": start, "end": start + timedelta(days=3),
+                         "dollars_per_day": dpd},
+                "pool": dpd * 3, "kind": kind, "why": why}
+
+    def _items(self, rows, targets=None, state=None, baseline=(), waves=()):
+        markets = {r["ticker"]: r for r in rows}
+        with mock.patch.object(fw.imm_upcoming, "assess",
+                               lambda c, b, u, a, n, max_books=None: {"markets": markets}):
+            return fw.upcoming_alert_items(None, [{"market_ticker": "X"}], {}, targets or {},
+                                           state or {}, set(baseline), self.NOW,
+                                           make_bot=lambda c: None, waves=set(waves))
+
+    def test_a_series_a_rule_holds_dark_and_a_new_family_are_items(self):
+        rows = [self._row("KXGRAMMY-BAMA69-LOS", "no", "cutoff at or before the start"),
+                self._row("KXGRAMMY-ROTY69-X", "no", "cutoff at or before the start"),
+                self._row("KXOK-26DEC01-T1", "yes", ""),
+                self._row("KXNEWFAM-26DEC01-T1", "no", "not allowlisted"),
+                # a registry wave lists it at its start
+                self._row("KXUSDJPYEVENT-25NOV261500-T157", "no", "not allowlisted"),
+                # in the baseline: already seen, sent once
+                self._row("KXOLDFAM-26DEC01-T1", "no", "not allowlisted"),
+                # past the horizon
+                self._row("KXFAR-26DEC30-T1", "no", "cutoff at or before the start", start_h=200),
+                # no config fixes an extreme mid
+                self._row("KXEXT-26DEC01-T1", "no", "extreme mid")]
+        items = self._items(rows, baseline={"KXOLDFAM"}, waves={"KXUSDJPYEVENT"})
+        self.assertEqual(sorted(items), ["new:KXNEWFAM", "upcoming:KXGRAMMY"])
+        g = items["upcoming:KXGRAMMY"]
+        self.assertEqual(g["events"], ["KXGRAMMY-BAMA69", "KXGRAMMY-ROTY69"])
+        self.assertAlmostEqual(g["est"], round(1000 * fw.GAP_CAPTURE, 2))
+        self.assertEqual((g["hold"], g["researched"]), (False, False))
+        self.assertIn("2 markets in 2 events would start dark (cutoff at or before the start)",
+                      g["what"])
+        self.assertEqual(g["upcoming_start"], (self.NOW + timedelta(hours=6)).timestamp())
+        self.assertIn("not on the allowlist", items["new:KXNEWFAM"]["what"])
+        self.assertEqual(fw.upcoming_alert_items(None, [], {}, {}, {}, set(), self.NOW), {})
+
+    def test_research_at_work_holds_the_item_and_a_give_up_alerts_it(self):
+        rows = [self._row("KXSPAINABROAD-26NOV29-1-PP", "no", "cutoff at or before the start")]
+        key = "gap:KXSPAINABROAD-26NOV29-1"
+        targets = {key: {"kind": "election", "event": "KXSPAINABROAD-26NOV29-1"}}
+        self.assertTrue(self._items(rows, targets=targets)["upcoming:KXSPAINABROAD"]["hold"])
+        state = {"research": {key: {"status": "judgment", "attempts": 1}}}
+        it = self._items(rows, targets=targets, state=state)["upcoming:KXSPAINABROAD"]
+        self.assertEqual((it["hold"], it["researched"]), (False, True))
+        self.assertEqual(fw.quote_call("upcoming:KXSPAINABROAD", it, {})[0], "QUOTE ONCE DATED")
+
+    def test_the_email_says_when_it_starts_and_why_it_would_be_dark(self):
+        rows = [self._row("KXGRAMMY-BAMA69-LOS", "no", "cutoff at or before the start"),
+                self._row("KXNEWFAM-26DEC01-T1", "no", "not allowlisted")]
+        items = self._items(rows)
+        state = {k: {"first": 1.0} for k in items}         # seen 2.8 h ago
+        due, _ = fw.due_alerts(state, items, 10_000.0, min_dpd=0.0)
+        self.assertEqual(sorted(k for k, _, _ in due), ["new:KXNEWFAM", "upcoming:KXGRAMMY"])
+        self.assertEqual(fw.quote_label("upcoming:KXGRAMMY", None), ("UPCOMING", None))
+        subject, body = fw.alert_body(due, {}, {})
+        self.assertIn("1 would start dark", subject)
+        self.assertIn("would start dark; needs a fix before its programs start "
+                      "(cutoff at or before the start)", body)
+        self.assertIn("FIX, THEN QUOTE", body)
+        self.assertIn("not allowed; needs a place on the allowlist", body)
+
+    def test_model_coverage_reads_the_upcoming_markets(self):
+        import imm_model_coverage as mcov
+        seen = {}
+
+        def find(progs, now_ts):
+            seen.update(progs)
+            return {}
+        with mock.patch.object(mcov, "find_gaps", find), \
+                mock.patch.object(mcov, "due", lambda st, g, now, baseline_once=False: ([], {})):
+            fw.model_coverage_pass({"KXRAINNYC-26NOV20-T1": {"a": 1}}, {}, True, [],
+                                   upcoming=[{"market_ticker": "KXRAINBOS-26NOV21-T1"},
+                                             {"market_ticker": "KXRAINNYC-26NOV20-T1", "b": 2}])
+        self.assertEqual(sorted(seen), ["KXRAINBOS-26NOV21-T1", "KXRAINNYC-26NOV20-T1"])
+        self.assertEqual(seen["KXRAINNYC-26NOV20-T1"], {"a": 1})    # the paying program wins
+
+    def test_an_upcoming_marathon_is_researched_for_its_start(self):
+        ev = "KXMARATHONNYC-26NOV29"
+        rows = [{"event_ticker": ev, "series_ticker": "KXMARATHONNYC",
+                 "market_ticker": ev + "-W", "start_date": "2026-11-20T17:00:00Z",
+                 "end_date": "2026-11-29T05:00:00Z", "period_reward": 500000}]
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {}, clear=True), \
+                mock.patch.object(imm, "load_file_event_overrides", lambda: 0):
+            gaps = fw.upcoming_dating_gaps(rows)
+            self.assertEqual(gaps[ev]["kind"], "marathon")
+            self.assertEqual(fw.gap_kind(gaps[ev]["msg"]), "marathon")
+            imm.EVENT_START_OVERRIDES[ev] = datetime(2026, 11, 29, 13, 40, tzinfo=timezone.utc)
+            self.assertEqual(fw.upcoming_dating_gaps(rows), {})
+
+    def test_the_mention_start_lookup_reads_the_upcoming_programs(self):
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+        asked = []
+
+        class _Client:
+            def get(self, path, params=None):
+                asked.append(params.get("status"))
+                rows = {"active": ["KXTRUMPMENTION-26OCT14-OIL"],
+                        "upcoming": ["KXTRUMPMENTIONB-26OCT14-COAL"]}.get(params.get("status"), [])
+                return {"incentive_programs": [{"market_ticker": t} for t in rows]}
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {}, clear=True), \
+                mock.patch.object(imm, "UPCOMING_ENABLE", True), \
+                mock.patch.object(imm, "load_mention_auto_series", lambda: 0):
+            found = fw.ieo.discover_broadcast_mention_events(_Client(), now)
+            self.assertEqual(asked, ["active", "upcoming"])
+            self.assertIn(("KXTRUMPMENTIONB-26OCT14", "KXTRUMPMENTIONB"), found)
+            asked.clear()
+            with mock.patch.object(imm, "UPCOMING_ENABLE", False):
+                fw.ieo.discover_broadcast_mention_events(_Client(), now)
+            self.assertEqual(asked, ["active"])
+
+    def test_the_wave_list_is_read_from_the_registry(self):
+        tmp = tempfile.mkdtemp(prefix="waves_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "waves.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"waves": {"w1": {"series": ["KXGOLDEVENT", "KXUSDJPYEVENT"],
+                                        "enabled": True},
+                                 "w2": {"series": ["KXOFFEVENT"], "enabled": False}}}, f)
+        self.assertEqual(fw.wave_listed_series(path), {"KXGOLDEVENT", "KXUSDJPYEVENT"})
+        self.assertEqual(fw.wave_listed_series(os.path.join(tmp, "absent.json")), set())
