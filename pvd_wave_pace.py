@@ -156,13 +156,32 @@ def cycle_rows(tickers, since_ts: float, now: datetime) -> dict:
             pool = f("pool_per_day")
             out[q[ix["ticker"]]].append({"ts": q[ix["ts"]][:19], "b": f("own_bid_ct"), "a": f("own_ask_ct"),
                                          "wb": f("want_bid_ct"), "wa": f("want_ask_ct"),
-                                         "rate": f("est_frac") * pool, "pool": pool})
+                                         "rate": f("est_frac") * pool, "pool": pool,
+                                         "hm": (f("hour_mult") or 1.0) if "hour_mult" in ix else 1.0})
     return out
 
 
-def judge_rows(rows: list) -> dict:
+def held_at_base(r: dict, lst) -> bool:
+    """The bot wants less than the list asks for on a side it quotes at all: its first
+    hour on a market (the off-usual rule's cold start, under 4 touch samples 15 min
+    apart, rests the entry's base size -- not the cheap tiers or the multiple) or its
+    off-usual cut. The share it measures is then a fraction of the listed size, so the
+    multiple that size would need can't be judged from it (2026-11-18, w1113-fxmetals:
+    the 19:33Z and 19:48Z reads judged 99 new FX strikes at the 300 a side the bot
+    rested in its first hour, against 1,500 listed -- 5x of the listed size is 7,500 --
+    and turned them all off; one it sized up instead went 0.48% -> 2.35% at 1,500).
+    `lst` = (bid, ask) contracts the list asks for; the row's hour multiple scales it."""
+    if not lst:
+        return False
+    hm = r.get("hm") or 1.0
+    return any(0 < w < LANDED_FRAC * n * hm for w, n in ((r["wb"], lst[0]), (r["wa"], lst[1])))
+
+
+def judge_rows(rows: list, lst=None) -> dict:
     """The market's measured state from its rows (oldest first): status, the average rate
-    (resting-weighted), uptime, share while resting, the latest own / wanted contracts."""
+    (resting-weighted), uptime, share while resting, the latest own / wanted contracts.
+    `lst` = (bid, ask) contracts the list asks for: a row where the bot holds a side under
+    it is "held" (held_at_base), and only rows after the latest such row count."""
     if not rows:
         return {"status": "no rows"}
     last = rows[-1]
@@ -171,11 +190,13 @@ def judge_rows(rows: list) -> dict:
     # rested yet). Resting nothing is not landing: that cycle simply earns 0 (a stand-down,
     # a queued side, a breaker) and lowers the uptime.
     landing = lambda o, wn: wn > 0 and 0 < o < LANDED_FRAC * wn
+    if held_at_base(last, lst):
+        return {"status": "held", "own": own_l, "want": want_l, "list": sum(lst)}
     if landing(own_l, want_l):
         return {"status": "landing", "own": own_l, "want": want_l}
     i0 = 0
     for i in range(len(rows) - 1, -1, -1):
-        if landing(rows[i]["b"] + rows[i]["a"], rows[i]["wb"] + rows[i]["wa"]):
+        if landing(rows[i]["b"] + rows[i]["a"], rows[i]["wb"] + rows[i]["wa"]) or held_at_base(rows[i], lst):
             break
         i0 = i
     use = rows[i0:]
@@ -296,7 +317,9 @@ def measure(name: str, a, now: "datetime | None" = None, dash=None, rows=None, b
     for t in sorted(listed):
         dr = drows.get(t) or {}
         m0 = mult.get(t, 1.0)
-        j = judge_rows(rows.get(t) or [])
+        e = listed[t]
+        lst = tuple(float(e.get(k, e.get("size")) or 0) for k in ("bid_size", "ask_size"))
+        j = judge_rows(rows.get(t) or [], lst)
         banked = float(dr.get("period_est") or 0.0)
         hrs = float(dr.get("hrs_left") if dr.get("hrs_left") is not None else
                     max(0.0, ((_ts(listed[t].get("stop")) or nts) - nts) / 3600))
@@ -330,8 +353,9 @@ def print_pace(res: dict) -> None:
         print(f"  ! the dashboard read is {res['dash_age_min']} min old")
     st = collections.Counter(m["status"] for m in ms)
     print(f"  {res['listed']} listed: {st.get('judged', 0)} judged, {st.get('landing', 0)} landing (size not rested "
-          f"yet), {st.get('not resting', 0)} not resting, {st.get('no rows', 0)} with no bot rows, "
-          f"{st.get('off', 0)} off (multiple 0)")
+          f"yet), {st.get('held', 0)} held under the listed size by the bot (its first hour on a market, or its "
+          f"off-usual cut: not judged), {st.get('not resting', 0)} not resting, {st.get('no rows', 0)} with no bot "
+          f"rows, {st.get('off', 0)} off (multiple 0)")
     if j:
         tot_rate = sum(m["rate"] for m in j)
         banked = sum(m["banked"] for m in ms)

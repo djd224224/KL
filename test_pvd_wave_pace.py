@@ -246,6 +246,58 @@ class Judge(unittest.TestCase):
         self.assertEqual(j["rows"], 4)
         self.assertAlmostEqual(j["rate"], 1.0)
 
+    def test_held_while_the_bot_rests_its_base_under_the_listed_size(self):
+        # 11/18 w1113-fxmetals: the bot's first hour rested 300 a side against 1,500 listed;
+        # a share read at 300 is no read of the listed size, so the market is not judged
+        j = pp.judge_rows(_rows(6, own=(300, 300), want=(300, 300), rate=0.07), (1500.0, 1500.0))
+        self.assertEqual(j["status"], "held")
+        self.assertEqual((j["own"], j["want"], j["list"]), (600, 600, 3000.0))
+
+    def test_only_rows_after_the_bot_wants_the_listed_size_count(self):
+        early = _rows(4, own=(300, 300), want=(300, 300), rate=0.07)
+        late = _rows(3, own=(1500, 1500), want=(1500, 1500), rate=0.41, t0=NOW - timedelta(minutes=15))
+        j = pp.judge_rows(early + late, (1500.0, 1500.0))
+        self.assertEqual((j["status"], j["rows"]), ("judged", 3))
+        self.assertAlmostEqual(j["rate"], 0.41)
+
+    def test_a_side_the_bot_does_not_quote_is_not_held(self):
+        # a fair clamp or a capped side: the bot wants 0 there, which is not a base hold
+        j = pp.judge_rows(_rows(4, own=(0, 300), want=(0, 300)), (1500.0, 300.0))
+        self.assertEqual(j["status"], "judged")
+
+    def test_the_hour_multiple_scales_the_listed_size(self):
+        rows = [dict(r, hm=0.5) for r in _rows(4, own=(150, 150), want=(150, 150))]
+        self.assertEqual(pp.judge_rows(rows, (300.0, 300.0))["status"], "judged")
+        self.assertEqual(pp.judge_rows(_rows(4, own=(150, 150), want=(150, 150)), (300.0, 300.0))["status"],
+                         "held")
+
+    def test_without_the_listed_sizes_nothing_is_held(self):
+        self.assertEqual(pp.judge_rows(_rows(4, own=(300, 300), want=(300, 300)))["status"], "judged")
+
+
+class MeasureHeld(unittest.TestCase):
+    def test_a_market_the_bot_holds_at_base_is_neither_judged_nor_turned_off(self):
+        # the 11/18 FX offs: 300 a side resting, 1,500 listed (cheap tier x5), two reads
+        _save_reg({"wt": _wave()})
+        L = {"KXFOO-26NOV-T1": {"stop": LATER, "size": 300, "bid_size": 1500, "ask_size": 1500},
+             "KXFOO-26NOV-T2": {"stop": LATER, "size": 300}}
+        rows = {t: _rows(6, own=(300, 300), want=(300, 300), rate=0.07, pool=17.57) for t in L}
+        a = argparse.Namespace(aim=1.20, max_mult=5.0, real=0.65, window_min=60, keep_within=0.05, no_off=False)
+        res = pp.measure("wt", a, now=NOW, dash={"now": NOW.isoformat(), "rows": []}, rows=rows,
+                         bot={"started": NOW.timestamp() - 7200}, mult={}, L=L)
+        self.assertEqual({m["ticker"]: m["status"] for m in res["markets"]},
+                         {"KXFOO-26NOV-T1": "held", "KXFOO-26NOV-T2": "judged"})
+        prev = {"at": (NOW - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "off_candidates": ["KXFOO-26NOV-T1", "KXFOO-26NOV-T2"]}
+        plan = pp.plan_resize(res, prev, a, NOW)
+        self.assertEqual(plan["off"], ["KXFOO-26NOV-T2"])         # the one judged at its listed size
+        self.assertEqual(plan["skipped"]["held"], 1)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            pp.print_pace(dict(res, dash_at=None, bot_started=None, since_restart_min=120.0, rows_since=None,
+                               dash_age_min=1.0, listed=2))
+        self.assertIn("1 held under the listed size by the bot", out.getvalue())
+
 
 class Multiple(unittest.TestCase):
     J = {"share": 0.06, "pool": 13.7, "uptime": 1.0}
