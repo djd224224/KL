@@ -306,6 +306,14 @@ def bot_est_fracs(tickers: set, now: datetime) -> dict:
     return out
 
 
+def our_sides(r: dict) -> str:
+    """Which sides WE rest on a page row: both sides / bid only / ask only / not quoting."""
+    if not r.get("rest_ct"):
+        return "not quoting"
+    b, a = r.get("our_bid") is not None, r.get("our_ask") is not None
+    return "both sides" if b and a else "bid only" if b else "ask only" if a else "not quoting"
+
+
 def poll(client, hist: dict) -> dict:
     now = datetime.now(timezone.utc)
     lst = load_list()
@@ -513,6 +521,8 @@ def poll(client, hist: dict) -> dict:
         la = [rows[t] for t in lts if rows[t]["active"]]
         latest = {"period": lp, "n": len(lts), "listed": len(la), "quoted": sum(1 for r in la if r["rest_ct"]),
                   "two_sided": sum(1 for r in la if r["sides"] == 2),
+                  "both": sum(1 for r in la if our_sides(r) == "both sides"),
+                  "one": sum(1 for r in la if our_sides(r) in ("bid only", "ask only")),
                   "rest_ct": sum(rows[t]["rest_ct"] for t in lts),
                   "rest_coll": sum((px if sd == "bid" else 100 - px) * q for t in lts for sd, px, q in own[t]) / 100.0,
                   "est": sum(rows[t]["period_est"] for t in lts),
@@ -638,11 +648,30 @@ def poll(client, hist: dict) -> dict:
     pace = {"quoted": len(quoted_rows), "active": sum(1 for r in rows.values() if r["active"]),
             "src_bot": sum(1 for r in quoted_rows if r.get("est_src") == "bot"),
             "bar": PACE_BAR, "spare_h": PACE_SPARE_H, "buckets": pace_b}
+    # ONE SIDE OR BOTH (Jack 2026-11-18: "build into the dash how many markets are one sided
+    # vs two sided. and whether they're above threshold or not based on that split"): every
+    # active market by the sides WE rest (our bid / our ask -- not the book's qualifying
+    # sides), each group by where it paces this period (banked + the rate now x the hours to
+    # its stop) against LATEST_TARGET and Kalshi's $1 floor
+    sides_g = {k: {"label": k, "n": 0, "ok_target": 0, "ok_1": 0, "short": 0, "rate": 0.0, "proj": 0.0}
+               for k in ("both sides", "bid only", "ask only", "not quoting")}
+    for r in rows.values():
+        if not r["active"]:
+            continue
+        g = sides_g[our_sides(r)]
+        pj = r["proj_period"]
+        g["n"] += 1
+        g["ok_target" if pj >= LATEST_TARGET else "ok_1" if pj >= 1.0 else "short"] += 1
+        g["rate"] += r["rate"]
+        g["proj"] += pj
+    sides_tab = {"target": LATEST_TARGET,
+                 "rows": [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in g.items()}
+                          for g in sides_g.values()]}
     return {"now": now.isoformat(), "go_live": GO_LIVE.isoformat(), "stale": dict(_stale), "pace": pace,
             "by_price": [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in b.items()} for b in bands],
             "end": end.isoformat() if end else None, "hrs_left": round(hrs_left, 2),
             "totals": {k: (round(v, 2) if isinstance(v, float) else v) for k, v in tot.items()},
-            "latest": latest,
+            "latest": latest, "sides": sides_tab,
             "rows": sorted(rows.values(), key=lambda r: r["trade"]),
             "by_series": sorted(by.values(), key=lambda b: b["net"]),
             "by_kind": sorted(kinds.values(), key=lambda k: k["kind"]),
@@ -699,6 +728,8 @@ tr.pos td{background:var(--hi)}tr.off td{opacity:.5}
 <div class="tiles" id="tiles"></div>
 <h2>Pacing this period <span class="mut" id="pacesub" style="font-weight:400;font-size:12px"></span></h2>
 <div class="wrap" style="margin-bottom:8px"><table><thead><tr><th>Pacing to</th><th>Markets</th><th>Share</th><th>Est $/day now</th><th>Proj. this period</th><th>Earning $0 now</th></tr></thead><tbody id="pace"></tbody></table></div>
+<h2>One side or both <span class="mut" style="font-weight:400;font-size:12px">(active markets by the sides we rest -- our bid, our ask -- and where each paces this period: banked + the rate now x the hours to its stop)</span></h2>
+<div class="wrap" style="margin-bottom:8px"><table><thead><tr><th>We quote</th><th>Markets</th><th id="sdt">target+</th><th id="sd1">$1.00 to target</th><th>Under $1</th><th>Est $/day now</th><th>Proj. this period</th></tr></thead><tbody id="sides"></tbody></table></div>
 <h2>Quotes, rewards, fills and cash by price <span class="mut" style="font-weight:400;font-size:12px">(by what a fill ties up a contract: a bid its price, an ask 100 - its price; quotes now, the rest since go-live; a market's rewards split between its sides by each side's share of its book, an estimate)</span></h2>
 <div class="wrap" style="margin-bottom:8px"><table><thead><tr><th>Cost per contract</th><th>Quoted contracts</th><th>Avg quote size</th><th>Quoted $</th><th>Rewards so far</th><th>Rewards / contract</th><th>Est $/day now</th><th>Fills</th><th>Contracts filled</th><th>Cash used</th><th>Open contracts</th><th>Cash held now</th><th>Open P&amp;L (at last)</th></tr></thead><tbody id="byprice"></tbody></table></div>
 <div class="wrap" style="padding:8px 12px"><div class="mut key">Cumulative since go-live, a point every 5 min:
@@ -767,6 +798,15 @@ function render(){
       `<tr><td class="mut">total</td><td>${pc.quoted.toLocaleString()}</td><td></td><td>${money(pc.buckets.reduce((a,b)=>a+b.rate,0))}</td>`+
       `<td>${money(pc.buckets.reduce((a,b)=>a+b.proj,0))}</td><td>${pc.buckets.reduce((a,b)=>a+b.zero,0).toLocaleString()||''}</td></tr>`;
   }
+  const sd=d.sides;
+  if(sd){
+    const tg='$'+sd.target.toFixed(2),SS=k=>sd.rows.reduce((a,g)=>a+(g[k]||0),0);
+    $('sdt').textContent=tg+'+';$('sd1').textContent='$1.00 - '+tg;
+    $('sides').innerHTML=sd.rows.map(g=>`<tr><td>${g.label}</td><td>${g.n.toLocaleString()}</td><td class="up">${g.ok_target||''}</td>`+
+      `<td>${g.ok_1||''}</td><td class="dn">${g.short||''}</td><td>${g.n?money(g.rate):''}</td><td>${g.n?money(g.proj):''}</td></tr>`).join('')+
+      `<tr><td class="mut">total</td><td>${SS('n').toLocaleString()}</td><td class="up">${SS('ok_target')}</td><td>${SS('ok_1')}</td>`+
+      `<td class="dn">${SS('short')}</td><td>${money(SS('rate'))}</td><td>${money(SS('proj'))}</td></tr>`;
+  }
   const sc=d.scan;
   $('scan').innerHTML=sc?`Overnight scanner (pvd_scan.py, every 15 min): last run ${etS(sc.at)} ET${sc.write?'':' (dry run)'} &middot; ${sc.candidates??0} candidate(s) `+
     `(extended ${sc.extend_candidates??0}, relit ${sc.relit_candidates??0}, new ${sc.new_candidates??0}) &middot; ${sc.past_vote??0} past their vote &middot; `+
@@ -778,7 +818,7 @@ function render(){
     ['big','Est rewards so far',`<span style="color:var(--est)">${money(t.est)}</span>`,`projected ${money(t.proj_est)} by the end at today's rate`],
     ['big','Trading P&L',`<span class="${cls(t.trade)}">${money(t.trade)}</span>`,`realized ${money(t.real)} &middot; open ${money(t.open)} (at last trade)`],
     ['','Est reward rate now',money(t.rate)+'/day',`raw model; Kalshi has paid ~1.15x`],
-    ['','Markets quoting',`${t.quoted} / ${t.listed}`,`${t.two_sided} scoring both sides &middot; ${t.rest_ct.toLocaleString()} contracts resting${t.ended?` &middot; ${t.ended} past their stop`:''}`],
+    ['','Markets quoting',`${t.quoted} / ${t.listed}`,`${t.two_sided} with both book sides qualifying &middot; ${t.rest_ct.toLocaleString()} contracts resting${t.ended?` &middot; ${t.ended} past their stop`:''}`],
     ['','This period vs $1',`<span class="up">${t.period_ok}</span> / <span class="dn">${t.period_short}</span>`,`active markets projected over / under $1 by their stop`],
     ['','Fills since go-live',`${t.fills}`,`${Math.round(t.fill_ct).toLocaleString()} contracts &middot; open cost ${money(t.cost)}`],
     ['big','Cash held in positions',money(t.cost),`this page's fills since go-live, at cost &middot; free cash ${t.cash0!=null?money(t.cash0):'-'} (shard 0)${t.cash_all!=null?` / ${money(t.cash_all)} all shards`:''}`],
@@ -793,7 +833,7 @@ function render(){
       ['big','Est rewards this period',`<span style="color:var(--est)">${money(L.est)}</span>`,`projected ${money(L.proj_est)} by the stop at today's rate`],
       ['big','Trading P&L',`<span class="${cls(L.trade)}">${money(L.trade)}</span>`,`realized ${money(L.real)} &middot; open ${money(L.open)} (at last trade)`],
       ['','Est reward rate now',money(L.rate)+'/day',`raw model; Kalshi has paid ~1.15x`],
-      ['','Markets quoting',`${L.quoted} / ${L.listed}`,`${L.two_sided} scoring both sides &middot; ${L.rest_ct.toLocaleString()} contracts resting`],
+      ['','Markets quoting',`${L.quoted} / ${L.listed}`,`we quote both sides on ${L.both??'-'}, one side on ${L.one??'-'} &middot; ${L.rest_ct.toLocaleString()} contracts resting`],
       ['',`Pacing vs $${L.target.toFixed(2)}`,`<span class="up">${L.ok_target}</span> / ${L.listed}`,`active markets projected $${L.target.toFixed(2)}+ by their stop &middot; $1+: ${L.ok_1} &middot; under $1: <span class="dn">${L.short_1}</span>`],
       ['','Fills this period',`${L.fills}`,`${Math.round(L.fill_ct).toLocaleString()} contracts &middot; open cost ${money(L.cost)}`],
       ['big','Cash held in positions',money(L.cost),`this period's fills, at cost`],
