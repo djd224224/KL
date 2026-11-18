@@ -172,6 +172,51 @@ class DarkAndRelightWordingTests(unittest.TestCase):
         self.assertTrue(text.splitlines()[0].startswith("RELIGHT: 247 markets listed, 548 mkts denied"), text)
         self.assertIn("a DARK alert follows if they rest nothing", text)
 
+    def test_a_big_relight_names_its_wave_and_texts(self):
+        # Jack 2026-11-18: "i didnt get an email and text confirming the relight" -- the
+        # 05:00Z w1111-elec2028 relight (976 mkts) read as "4 markets listed", no text
+        r = {"since": "", "until": "", "listed": 977, "usd_day": 602.0, "programs_before": 5905,
+             "programs_now": 5869, "programs_jump": 0, "passes": [
+                 {"ts": "2026-11-18 05:07:10Z", "where": "waves task / wave w1111-elec2028 main", "taken": 975,
+                  "new": 0, "relit": 975, "extended": 0, "usd_day": 600.0, "skipped": {"under bar": 1}},
+                 {"ts": "2026-11-18 05:07:43Z", "where": "waves task / wave w1111-pol main", "taken": 1,
+                  "new": 0, "relit": 1, "extended": 0, "usd_day": 2.0},
+                 {"ts": "2026-11-18 05:15:35Z", "where": "waves task / wave w1111-elec2028 main", "taken": 1,
+                  "new": 0, "relit": 1, "extended": 0, "usd_day": 0.0}]}
+        text, push, subject, body, big = wa.relight_msg(r)
+        lines = text.splitlines()
+        self.assertTrue(lines[0].startswith("RELIGHT: 977 markets listed"), text)
+        self.assertEqual(lines[1], "Listed because: pool ROI over the $1.10/day bar (new 0, relit 977, extended 0)")
+        self.assertEqual(lines[2], "By wave: w1111-elec2028 976, w1111-pol 1")
+        self.assertTrue(big)
+        # a pass whose summary line was lost (relight_watch's WROTE fallback) says so
+        r2 = dict(r, passes=[dict(r["passes"][0], relit=0, unsplit=975)])
+        self.assertIn("relit 0, extended 0, split unknown 975)", wa.relight_msg(r2)[0])
+        self.assertIn("split unknown 975", wa.relight_msg(r2)[3])
+
+    def test_relight_names_count_the_windows_first_minute(self):
+        # entries are stamped with the pass's START minute ("scan 2026-11-18T05:00Z"), and a
+        # check whose window opens in that minute must still name them
+        import json
+        import os
+        import sys
+        import tempfile
+        from unittest import mock
+        tmp = tempfile.mkdtemp(prefix="wa-relight-")
+        lst = os.path.join(tmp, "pvd.json")
+        with open(lst, "w", encoding="utf-8") as fh:
+            json.dump({"markets": {
+                "KXDPRESPRIMARY-28NH-PBUT": {"added": "scan 2026-11-18T05:00Z (relit; ROI 0.4%/day)"},
+                "KXDPRESPRIMARY-28NH-JOSS": {"added": "scan 2026-11-18T05:00Z (relit; ROI 0.3%/day)"},
+                "KXOLD-26NOV16-X": {"added": "scan 2026-11-18T04:45Z (relit; ROI 0.3%/day)"},
+                "KXLATER-26NOV-X": {"added": "scan 2026-11-18T05:30Z (new; ROI 0.3%/day)"}}}, fh)
+        fake = mock.MagicMock()
+        fake.kalshi_get.return_value = {"markets": []}
+        with mock.patch.object(wa, "LIST", lst), mock.patch.object(wa, "event_titles", lambda evs: {}), \
+                mock.patch.dict(sys.modules, {"kalshi_reads": fake}):
+            got = wa.relight_names({"since": "2026-11-18 05:00:24Z", "until": "2026-11-18 05:15:36Z"})
+        self.assertEqual([(g["event"], g["markets"]) for g in got], [("KXDPRESPRIMARY-28NH", 2)])
+
     def test_a_program_jump_that_is_a_new_wave_says_so(self):
         # 2026-11-11 16:22Z: "RELIGHT: programs 5513 -> 6316 (+803), 0 listed" -- the
         # jump was w1111-statenom, listed (654 mkts) by the 24/7 wave check at 16:08Z

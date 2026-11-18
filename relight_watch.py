@@ -46,21 +46,23 @@ def scan(since: str):
             fh = open(path, encoding="utf-8", errors="replace")
         except OSError:
             continue
+        took = False      # a "taking N by ROI" line seen under the current label
         with fh:
             for line in fh:
                 m = RX_PASS.match(line)
                 if m:
-                    label = f"pass {m.group(1)}: {m.group(2)}"
+                    label, took = f"pass {m.group(1)}: {m.group(2)}", False
                     continue
                 m = RX_WAVE.match(line)
                 if m:
-                    label = f"wave {m.group(1)}" + (f" {m.group(2)}" if m.group(2) else "")
+                    label, took = f"wave {m.group(1)}" + (f" {m.group(2)}" if m.group(2) else ""), False
                     continue
                 m = RX_PROG.search(line)
                 if m and m.group(1) > since:
                     progs.append((m.group(1), int(m.group(2))))
                 m = RX_TAKE.search(line)
                 if m and m.group(1) > since and int(m.group(2)) > 0:
+                    took = True
                     takes.append({"ts": m.group(1), "where": f"{src} / {label}",
                                   "taken": int(m.group(2)), "extended": int(m.group(3)),
                                   "relit": int(m.group(4)), "new": int(m.group(5)),
@@ -72,8 +74,15 @@ def scan(since: str):
                         except (ValueError, SyntaxError):
                             pass
                 m = RX_WROTE.search(line)
-                if m and m.group(1) > since and takes and takes[-1]["ts"][:16] == m.group(1)[:16]:
+                if m and m.group(1) > since and took and takes and takes[-1]["ts"][:16] == m.group(1)[:16]:
                     takes[-1]["now_listed"] = int(m.group(3))
+                elif m and m.group(1) > since and not took and int(m.group(2)) > 0:
+                    # WROTE with no "taking" line under this label: its summary line fell out
+                    # of the task log's tail (11/18 05:07Z: 975 relit counted as 0). The
+                    # entries written are the markets listed; the relit / new split is unknown
+                    takes.append({"ts": m.group(1), "where": f"{src} / {label}", "taken": int(m.group(2)),
+                                  "extended": 0, "relit": 0, "new": 0, "unsplit": int(m.group(2)),
+                                  "usd_day": 0.0, "now_listed": int(m.group(3))})
     progs.sort()
     takes.sort(key=lambda r: r["ts"])
     return takes, progs
@@ -131,7 +140,8 @@ def main() -> int:
           + (f" (peak {p_max}, +{jump})" if jump > 0 else ""))
     for t in takes:
         print(f"  {t['ts']}  {t['where']}: {t['taken']} listed (relit {t['relit']}, new {t['new']}, "
-              f"extended {t['extended']}), ~${t['usd_day']:,.0f}/day"
+              f"extended {t['extended']}" + (f", split unknown {t['unsplit']}" if t.get("unsplit") else "")
+              + f"), ~${t['usd_day']:,.0f}/day"
               + (f", now {t['now_listed']} on the list" if "now_listed" in t else ""))
     last_ts = max([t["ts"] for t in takes] + [p[0] for p in progs] + [since])
     waves = new_waves(since)

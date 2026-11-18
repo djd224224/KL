@@ -337,7 +337,9 @@ def relight_names(r: dict):
     tick = []
     for t, e in mk.items():
         a = str(e.get("added") or "")
-        if a.startswith("scan ") and since < a[5:21] <= until:   # "scan 2026-11-07T03:36Z (new; ...)"
+        # "scan 2026-11-07T03:36Z (new; ...)" is the pass's START minute, and its log lines come
+        # minutes later (11/18: stamped 05:00, logged 05:07), so the window's first minute counts
+        if a.startswith("scan ") and since <= a[5:21] <= until:
             tick.append(t)
     recs = {}
     try:
@@ -396,10 +398,15 @@ def relight_msg(r: dict):
         head = (f"RELIGHT: programs {p0} -> {p1} (+{jump:,}), none listed by the relight tasks: "
                 f"the wave check judges new series next (a WAVE alert follows if they fit)")
     tot = collections.Counter()
+    where = collections.Counter()      # the wave (or pass) that listed them, its markets
     for p in r.get("passes") or []:
-        tot.update({"new": p["new"], "relit": p["relit"], "extended": p["extended"]})
+        tot.update({"new": p["new"], "relit": p["relit"], "extended": p["extended"],
+                    "unsplit": p.get("unsplit") or 0})
+        w = str(p.get("where") or "").split(" / ", 1)[-1]
+        where[w[5:].replace(" main", "") if w.startswith("wave ") else w] += p["taken"]
     whys = [f"Listed because: pool ROI over the $1.10/day bar (new {tot['new']}, relit {tot['relit']}, "
-            f"extended {tot['extended']})",
+            f"extended {tot['extended']}" + (f", split unknown {tot['unsplit']}" if tot["unsplit"] else "") + ")",
+            "By wave: " + ", ".join(f"{w} {n:,}" for w, n in where.most_common()),
             "Quoting checked on Kalshi 20 min after listing: a DARK alert follows if they rest nothing"
             ] if n_mk else []
     if d_mk:
@@ -427,7 +434,9 @@ def relight_msg(r: dict):
     if len(evs) > N_NAMES:
         body.append(f"  +{len(evs) - N_NAMES} more events")
     body += ["", "Passes:"] + [f"  {p['ts']} {p['where']}: {p['taken']} listed (relit {p['relit']}, new {p['new']}, "
-                               f"extended {p['extended']}), ~${p['usd_day']:,.0f}/day"
+                               f"extended {p['extended']}"
+                               + (f", split unknown {p['unsplit']}" if p.get("unsplit") else "")
+                               + f"), ~${p['usd_day']:,.0f}/day"
                                + (f"; skipped {p['skipped']}" if p.get("skipped") else "")
                                for p in r.get("passes") or []]
     # a jump that is a new wave the check added was texted by its own WAVE alert

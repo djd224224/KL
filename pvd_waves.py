@@ -414,12 +414,27 @@ class wave_pass_lock:
         return False
 
 
+# A scan's SUMMARY lines always reach the task log, whatever the tail (Jack 2026-11-18: "i
+# didnt get an email and text confirming the relight"): the 11/18 05:00Z relight of
+# w1111-elec2028 printed 975 RELIT lines after its "taking 975 by ROI" line, so a tail of 3
+# kept only RELIT lines and the WROTE line. relight_watch.py, which reads this log, then
+# counted 4 markets (the small relights around it), and the alert said "4 markets listed"
+# and sent no text (texts start at 100).
+RUN_KEEP = re.compile(r" (programs \d+ \||past their voting day: \d+|scored \d+ clearing|WROTE \d+ entries )")
+
+
 def run_one(cmd: list, env=None, tail: int = 4) -> int:
     r = subprocess.run(cmd, cwd=HERE, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
     lines = [ln for ln in (r.stdout + r.stderr).splitlines() if ln.strip()]
-    for ln in lines[-tail:]:
+    for ln in run_lines(lines, tail):
         print("   ", ln[:400])
     return r.returncode
+
+
+def run_lines(lines: list, tail: int) -> list:
+    """The last `tail` lines, plus every summary line (RUN_KEEP) before them, in order."""
+    cut = max(0, len(lines) - tail)
+    return [ln for ln in lines[:cut] if RUN_KEEP.search(ln)] + lines[cut:]
 
 
 def cmd_add(a) -> int:

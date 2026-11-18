@@ -37,5 +37,58 @@ class NewWaves(unittest.TestCase):
             self.assertEqual(rw.new_waves("0000"), [])
 
 
+# the waves task's log of the 11/18 05:00Z pass, as it was (no "taking" line for
+# w1111-elec2028: it fell out of the tail) and around it a pass that had one
+ELEC_OLD = """===== Wed 11/18/2026  0:00:19.33 pass 7: registry waves
+== wave w1111-elec2028 main 2026-11-18T05:00:21Z: scan (write)
+    2026-11-18 05:07:10Z   RELIT  KXRPRESPRIMARY-28CO-MRUB live last None book 17x21 size 200/200
+    2026-11-18 05:07:10Z   RELIT  KXDPRESPRIMARY-28VA-JOSS live last None book 24x27 size 200/200
+    2026-11-18 05:07:11Z WROTE 975 entries -> C:\\KL\\post_vote_dead_books.json (now 6159 listed)
+== wave w1111-elec2028 main: tune
+    WROTE 2026-11-18T05:07:12Z 4 series since 2026-11-09T16:40:00Z: 976 live entries
+== wave w1111-pol main 2026-11-18T05:07:32Z: scan (write)
+    2026-11-18 05:07:37Z programs 5869 | election family: 2 listed for this period
+    2026-11-18 05:07:43Z scored 1 clearing $1.10 | skipped {'no book': 0, 'no quotable side': 0, 'under bar': 0} | taking 1 by ROI (extended 0, relit 1, new 0), new at risk if filled $192 (budget $400,000), ~$2/day; 0 over budget
+    2026-11-18 05:07:43Z   RELIT  KXDCSTATEHOODHOUSE-26NOV-27JUL01 live last 44.0
+    2026-11-18 05:07:44Z WROTE 1 entries -> C:\\KL\\post_vote_dead_books.json (now 6159 listed)
+"""
+# the same pass once the task log keeps the summary lines (pvd_waves.run_lines)
+ELEC_NEW = ELEC_OLD.replace(
+    "    2026-11-18 05:07:10Z   RELIT  KXRPRESPRIMARY-28CO-MRUB",
+    "    2026-11-18 05:00:24Z programs 5869 | election family: 1 listed for this period\n"
+    "    2026-11-18 05:07:10Z scored 975 clearing $1.10 | skipped {'no book': 0, 'no quotable side': 0, "
+    "'under bar': 1} | taking 975 by ROI (extended 0, relit 975, new 0), new at risk if filled $231,130 "
+    "(budget $400,000), ~$600/day; 0 over budget\n"
+    "    2026-11-18 05:07:10Z   RELIT  KXRPRESPRIMARY-28CO-MRUB")
+
+
+class ScanCounts(unittest.TestCase):
+    """Jack 2026-11-18: "i didnt get an email and text confirming the relight" -- the
+    05:28Z alert said "4 markets listed" for the 976-market w1111-elec2028 relight."""
+
+    def counts(self, text):
+        tmp = tempfile.mkdtemp(prefix="relight-scan-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "waves-task.log")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        with mock.patch.object(rw, "LOGS", [path]):
+            return rw.scan("2026-11-18 04:50:00Z")[0]
+
+    def test_a_pass_whose_summary_line_fell_out_still_counts(self):
+        takes = self.counts(ELEC_OLD)
+        self.assertEqual([(t["where"], t["taken"], t["relit"], t.get("unsplit"), t.get("now_listed"))
+                          for t in takes],
+                         [("waves task / wave w1111-elec2028 main", 975, 0, 975, 6159),
+                          ("waves task / wave w1111-pol main", 1, 1, None, 6159)])
+
+    def test_a_pass_with_its_summary_line_is_counted_once(self):
+        takes = self.counts(ELEC_NEW)
+        self.assertEqual([(t["where"], t["taken"], t["relit"], t.get("unsplit"), t.get("now_listed"), t["usd_day"])
+                          for t in takes],
+                         [("waves task / wave w1111-elec2028 main", 975, 975, None, 6159, 600.0),
+                          ("waves task / wave w1111-pol main", 1, 1, None, 6159, 2.0)])
+
+
 if __name__ == "__main__":
     unittest.main()

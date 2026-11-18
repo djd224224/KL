@@ -724,5 +724,28 @@ class WindowTests(unittest.TestCase):
             pw._set(argparse.Namespace(name="w", key="stop_cap", value="tomorrow"))
 
 
+class RunLinesTests(unittest.TestCase):
+    """Jack 2026-11-18: "i didnt get an email and text confirming the relight" -- the
+    05:00Z w1111-elec2028 relight's "taking 975 by ROI" line fell out of the task log's
+    tail of 3 behind 975 RELIT lines, so the relight alert counted 4 markets."""
+
+    def test_summary_lines_survive_a_long_tail(self):
+        out = ["2026-11-18 05:00:24Z programs 5869 | election family: 1 listed for this period | "
+               "candidates 976 (same program runs past the listed stop 0, relit 976, new 0)",
+               "2026-11-18 05:00:31Z past their voting day: 976",
+               "2026-11-18 05:07:10Z PVD collateral resting now $65,347; scan adds still live $3,938",
+               "2026-11-18 05:07:10Z scored 975 clearing $1.10 | skipped {'no book': 0, 'under bar': 1} | taking "
+               "975 by ROI (extended 0, relit 975, new 0), new at risk if filled $231,130 (budget $400,000), ~$600/day"]
+        out += [f"2026-11-18 05:07:10Z   RELIT  KXDPRESPRIMARY-28S{i}-X live" for i in range(975)]
+        out += ["2026-11-18 05:07:11Z WROTE 975 entries -> post_vote_dead_books.json (now 6159 listed)"]
+        got = pw.run_lines(out, 3)
+        self.assertEqual(got, [out[0], out[1], out[3]] + out[-3:])
+        # a short run prints as before, nothing twice
+        self.assertEqual(pw.run_lines(out[:2], 3), out[:2])
+        self.assertEqual(pw.run_lines(["a", "b", "c", "d"], 3), ["b", "c", "d"])
+        # the tune's own WROTE line is not a scan summary
+        self.assertEqual(pw.run_lines(["    WROTE 2026-11-18T05:07:12Z 4 series since ...", "x"], 1), ["x"])
+
+
 if __name__ == "__main__":
     unittest.main()
