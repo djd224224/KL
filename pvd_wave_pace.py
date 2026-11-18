@@ -319,7 +319,15 @@ def measure(name: str, a, now: "datetime | None" = None, dash=None, rows=None, b
         m0 = mult.get(t, 1.0)
         e = listed[t]
         lst = tuple(float(e.get(k, e.get("size")) or 0) for k in ("bid_size", "ask_size"))
-        j = judge_rows(rows.get(t) or [], lst)
+        # only the cycles since the entry's last size change on the list (the tune's
+        # "scaled_at" / "unpinned" stamps): earlier ones measured another size -- or none
+        # (2026-11-18 20:16:39Z: the 99 FX strikes back from a 0 were judged on the half
+        # hour they rested nothing while pinned off, 3 s before the tune brought them back)
+        chg = max(str(e.get("scaled_at") or "")[:19], str(e.get("unpinned") or "")[:19])
+        j = judge_rows([r for r in rows.get(t) or [] if not chg or r["ts"][:19] >= chg], lst)
+        if m0 != 0 and isinstance(e.get("pre_off"), dict):
+            # the multiples file lifted its 0, the tune hasn't yet: nothing to judge
+            j = {"status": "restoring"}
         banked = float(dr.get("period_est") or 0.0)
         hrs = float(dr.get("hrs_left") if dr.get("hrs_left") is not None else
                     max(0.0, ((_ts(listed[t].get("stop")) or nts) - nts) / 3600))
@@ -355,7 +363,8 @@ def print_pace(res: dict) -> None:
     print(f"  {res['listed']} listed: {st.get('judged', 0)} judged, {st.get('landing', 0)} landing (size not rested "
           f"yet), {st.get('held', 0)} held under the listed size by the bot (its first hour on a market, or its "
           f"off-usual cut: not judged), {st.get('not resting', 0)} not resting, {st.get('no rows', 0)} with no bot "
-          f"rows, {st.get('off', 0)} off (multiple 0)")
+          f"rows, {st.get('off', 0)} off (multiple 0)"
+          + (f", {st['restoring']} back from a 0 the tune hasn't applied yet" if st.get("restoring") else ""))
     if j:
         tot_rate = sum(m["rate"] for m in j)
         banked = sum(m["banked"] for m in ms)

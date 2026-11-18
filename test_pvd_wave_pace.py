@@ -324,6 +324,29 @@ class MeasureHeld(unittest.TestCase):
                                dash_age_min=1.0, listed=2))
         self.assertIn("1 held under the listed size by the bot", out.getvalue())
 
+    def test_only_rows_since_the_last_size_change_and_a_pending_restore_is_not_judged(self):
+        # 11/18 20:16:39Z: 99 FX strikes back from a 0 were judged on the half hour they rested
+        # nothing while pinned off, 3 s before the tune brought them back
+        _save_reg({"wt": _wave()})
+        off = _rows(6, own=(0, 0), want=(0, 0), rate=0.0, pool=17.57)                   # pinned at 0
+        back = _rows(3, own=(1500, 1500), want=(1500, 1500), rate=0.41, pool=17.57,
+                     t0=NOW - timedelta(minutes=15))
+        L = {"KXFOO-26NOV-T1": {"stop": LATER, "size": 300, "bid_size": 1500, "ask_size": 1500,
+                                "unpinned": (NOW - timedelta(minutes=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                + ": back on from the multiples file's 0"},
+             "KXFOO-26NOV-T2": {"stop": LATER, "size": 0, "pinned": "0 a side",
+                                "pre_off": {"size": 300, "bid_size": 1500, "ask_size": 1500}}}
+        rows = {"KXFOO-26NOV-T1": off + back, "KXFOO-26NOV-T2": off}
+        a = argparse.Namespace(aim=1.20, max_mult=5.0, real=0.65, window_min=60, keep_within=0.05, no_off=False)
+        res = pp.measure("wt", a, now=NOW, dash={"now": NOW.isoformat(), "rows": []}, rows=rows,
+                         bot={"started": NOW.timestamp() - 7200}, mult={"KXFOO-26NOV-T2": 1.25}, L=L)
+        m = {x["ticker"]: x for x in res["markets"]}
+        self.assertEqual((m["KXFOO-26NOV-T1"]["status"], m["KXFOO-26NOV-T2"]["status"]), ("judged", "restoring"))
+        self.assertAlmostEqual(m["KXFOO-26NOV-T1"]["rate"], 0.41)                   # uptime from the change on
+        plan = pp.plan_resize(res, {}, a, NOW)
+        self.assertNotIn("KXFOO-26NOV-T2", plan["candidates"])
+        self.assertEqual(plan["skipped"]["restoring"], 1)
+
 
 class Multiple(unittest.TestCase):
     J = {"share": 0.06, "pool": 13.7, "uptime": 1.0}
