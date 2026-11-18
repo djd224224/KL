@@ -340,6 +340,20 @@ def scan_cmd(w: dict, write: bool, group: str = "main") -> tuple:
         skip = [v.split(":")[0] for v in _vals(tune, "--pin") + _vals(tune, "--pin-series")]
         if skip:
             env["PVD_SCAN_TIER_SKIP"] = ",".join(skip)
+    # SIZE-UP TO THE BAR (the wave's "scan_max_mult", Jack 2026-11-18 "1.5-3x the size"): a
+    # market under the bar is judged again at the size the tune's bank step rests it (its
+    # --bank-max x --size-mult), then up to scan_max_mult x that; the multiple goes into the
+    # tune's --size-mult-file. The main group only; none without a multiples file.
+    for k in ("PVD_SCAN_MAX_MULT", "PVD_SCAN_MULT_BASE", "PVD_SCAN_MULT_FILE"):
+        env.pop(k, None)
+    mx = float(w.get("scan_max_mult") or 1.0)
+    mfile = _vals(tune, "--size-mult-file")
+    if group != "near" and mx > 1.0 and mfile:
+        env["PVD_SCAN_MAX_MULT"] = f"{mx:g}"
+        env["PVD_SCAN_MULT_FILE"] = mfile[-1]
+        bm, sm = _vals(tune, "--bank-max"), _vals(tune, "--size-mult")
+        if bm:
+            env["PVD_SCAN_MULT_BASE"] = str(int(round(float(bm[-1]) * (float(sm[-1]) if sm else 1.0))))
     return cmd, env
 
 
@@ -1184,6 +1198,17 @@ def _set(a) -> int:
         save(reg)
         print(f"{a.name}: floor max_mult = {x:g}")
         return 0
+    elif a.key == "scan_max_mult":
+        # SIZE-UP TO THE BAR (Jack 2026-11-18, "1.5-3x the size"): the scan judges a market
+        # under the bar again at the wave's bank max, then up to this multiple of it, and
+        # lists it with the multiple that clears (pvd_scan.py MAX_MULT); 1 = off. Never
+        # above the floor check's 5x cap. Sizing a wave up is Jack's word.
+        v = float(v)
+        if not 1.0 <= v <= 5.0:
+            raise SystemExit("scan_max_mult: 1 (off) to 5")
+        if v > 1.0 and not _vals(w.get("tune") or [], "--size-mult-file"):
+            raise SystemExit("scan_max_mult needs a --size-mult-file in the wave's tune (set NAME floor_auto on "
+                             "adds it): the multiple lives there")
     w[a.key] = v
     if a.key == "floor_auto" and v and not _vals(w.get("tune") or [], "--size-mult-file"):
         # the check writes per-market multiples the tune must read (pass_resize skips without)

@@ -79,6 +79,32 @@ class ScanBudget(unittest.TestCase):
         self.assertEqual(env["PVD_SCAN_OWN_SERIES"], "KXFOO,KXBAR")
         self.assertEqual(env["PVD_SCAN_BUDGET"], str(int(pw.GLOBAL_BUDGET + 50000)))
 
+    def test_scan_max_mult_passes_the_bank_max_and_the_multiples_file(self):
+        # Jack 2026-11-18 "1.5-3x the size": the FX wave lists an under-bar strike at up to
+        # 2x its 300 bank max (1,500-3,000 a side at 3-5c with its 5x cheap tier)
+        mf = os.path.join(TMP, "size_mult_wt.json")
+        tune = ["--bank-size", "200", "--bank-max", "300", "--cheap-tiers", "2:10,5:5", "--size-mult-file", mf]
+        _c, env = pw.scan_cmd(_wave(tune=tune, scan_max_mult=2.0), write=False)
+        self.assertEqual((env["PVD_SCAN_MAX_MULT"], env["PVD_SCAN_MULT_BASE"], env["PVD_SCAN_MULT_FILE"]),
+                         ("2", "300", mf))
+        _c, env = pw.scan_cmd(_wave(tune=tune + ["--size-mult", "1.5"], scan_max_mult=2.0), write=False)
+        self.assertEqual(env["PVD_SCAN_MULT_BASE"], "450")
+        for w in (_wave(tune=tune), _wave(tune=tune[:6], scan_max_mult=2.0)):    # off; no multiples file
+            _c, env = pw.scan_cmd(w, write=False)
+            self.assertNotIn("PVD_SCAN_MAX_MULT", env)
+        _c, env = pw.scan_cmd(_wave(tune=tune, near=["KXBAR"], scan_max_mult=2.0), write=False, group="near")
+        self.assertNotIn("PVD_SCAN_MAX_MULT", env)
+
+    def test_set_scan_max_mult_needs_a_multiples_file_and_stays_within_5x(self):
+        _save_reg({"wt": _wave(), "wm": _wave(tune=list(pw.PRESETS["default"]) + ["--size-mult-file", "m.json"])})
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                pw._set(argparse.Namespace(name="wt", key="scan_max_mult", value="2"))
+            with self.assertRaises(SystemExit):
+                pw._set(argparse.Namespace(name="wm", key="scan_max_mult", value="6"))
+            pw._set(argparse.Namespace(name="wm", key="scan_max_mult", value="2"))
+        self.assertEqual(pw.load()["waves"]["wm"]["scan_max_mult"], 2.0)
+
     def test_room_is_the_larger_of_the_shared_and_own_rules(self):
         L = {"KXFOO-1": {"added": "scan 2026-11-14T10:00Z", "stop": LATER, "coll_usd": 10_000},
              "KXOTHER-1": {"added": "scan 2026-11-14T10:00Z", "stop": LATER, "coll_usd": 681_453}}

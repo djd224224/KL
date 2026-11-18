@@ -91,5 +91,54 @@ class CheapSideTiers(unittest.TestCase):
         self.assertEqual((taken, s["skipped"]["under bar"]), ([], 1))
 
 
+class SizeUpToTheBar(CheapSideTiers):
+    """Jack 2026-11-18 on the w1113-fxmetals relight's 211 "under bar" strikes: "1.5-3x the
+    size" -- judged again at the wave's bank max (the size its tune rests a market that
+    can't bank), then up to scan_max_mult x that, and listed with the multiple that clears."""
+    WAVE = dict(BAND_LO=1, BAND_HI=99, WAVE_CUSHION=0, WAVE_FOLLOW_BOOK=True, CHEAP_TIERS=[(2.0, 10.0), (5.0, 5.0)])
+
+    def f(self, b, a):
+        y, n = [[p, q] for p, q in self.YES], [[p, q] for p, q in self.NO]
+        return imm.estimate_reward_share(y, n, [("bid", 1, b), ("ask", 2, a)], 1000.0, 0.5, own_in_book=False)[0]
+
+    def test_the_smallest_quarter_step_of_the_bank_max_that_clears(self):
+        # under at the tier size (2,000 / 200) and at the bank max (3,000 / 300), over at x1.5
+        self.assertLess(self.f(3750, 375), self.f(4500, 450))
+        pd = 1.10 / self.f(4500, 450) * 1.0001
+        taken, s = self.score(pd, MAX_MULT=1.0, **self.WAVE)               # off: under the bar
+        self.assertEqual((taken, s["skipped"]["under bar"]), ([], 1))
+        taken, s = self.score(pd, MAX_MULT=2.0, MULT_BASE=300, **self.WAVE)
+        self.assertEqual(len(taken), 1)
+        x = taken[0]
+        self.assertEqual((x["mult"], x["sized"], x["tiered"], x["size"]), (1.5, (4500, 450), None, 200))
+        self.assertAlmostEqual(x["coll"], 4500 * 1 / 100 + 450 * 98 / 100)
+        self.assertEqual(s["sized_taken"], 1)
+
+    def test_the_bank_max_alone_clears_at_x1(self):
+        pd = 1.10 / self.f(3000, 300) * 1.0001
+        taken, _s = self.score(pd, MAX_MULT=2.0, MULT_BASE=300, **self.WAVE)
+        self.assertEqual((taken[0]["mult"], taken[0]["sized"]), (1.0, (3000, 300)))
+
+    def test_still_under_at_the_cap_is_left_out(self):
+        pd = 1.10 / self.f(6000, 600) * 0.95
+        taken, s = self.score(pd, MAX_MULT=2.0, MULT_BASE=300, **self.WAVE)
+        self.assertEqual((taken, s["skipped"]["under bar"]), ([], 1))
+
+    def test_the_multiples_file_never_lowers_and_never_lifts_an_off(self):
+        import json
+        import os
+        import tempfile
+        p = os.path.join(tempfile.mkdtemp(prefix="pvdscan_mult_"), "size_mult_w.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"KXA-1": 0, "KXA-2": 3.0}, fh)
+        taken = [{"t": "KXA-1", "sized": (1, 1), "mult": 1.5}, {"t": "KXA-2", "sized": (1, 1), "mult": 2.0},
+                 {"t": "KXA-3", "sized": (1, 1), "mult": 1.25}, {"t": "KXA-4", "sized": (1, 1), "mult": 1.0},
+                 {"t": "KXA-5", "sized": None, "mult": 1.0}]
+        with mock.patch.object(ps, "MULT_FILE", p), mock.patch.object(ps, "log", lambda *a, **k: None):
+            self.assertEqual(ps.write_multiples(taken), 1)
+        with open(p, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), {"KXA-1": 0, "KXA-2": 3.0, "KXA-3": 1.25})
+
+
 if __name__ == "__main__":
     unittest.main()

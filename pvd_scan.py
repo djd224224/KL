@@ -40,6 +40,7 @@ stands). Nothing is removed; every entry stops at its own program end.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import math
 import os
@@ -119,6 +120,23 @@ BAND_HI = int(os.environ.get("PVD_SCAN_PRICE_MAX", "97"))
 WAVE_CUSHION = (int(os.environ["PVD_SCAN_CUSHION"]) if os.environ.get("PVD_SCAN_CUSHION", "") != ""
                 else None)
 WAVE_FOLLOW_BOOK = os.environ.get("PVD_SCAN_FOLLOW_BOOK", "") == "1"
+# SIZE-UP TO THE BAR (Jack 2026-11-18, the w1113-fxmetals relight: "1.5-3x the size"): 211
+# new FX strikes, walled at ~80k contracts a side by other makers, were "under bar" at the
+# wave's 1,000 a side (its 200 x the 5x cheap tier): 1-1.5% of a $17.57/day pool, ~$0.70 by
+# the period end, and most cleared at 1.5-3x that. With PVD_SCAN_MAX_MULT above 1 (the
+# wave's "scan_max_mult"; pvd_waves.py scan_cmd sets these three), a market still under the
+# bar after the cheap tiers is judged again at PVD_SCAN_MULT_BASE -- the wave's --bank-max,
+# the size its tune's bank step rests a market that can't bank at the flat size, which is
+# every market under the bar -- with the cheap tiers, then at quarter-step multiples of that
+# up to PVD_SCAN_MAX_MULT; the first that clears the bar is the market's multiple. --write
+# puts a multiple above 1 into the wave's multiples file (PVD_SCAN_MULT_FILE, its tune's
+# --size-mult-file: the tune rests the market at the bank max x the multiple, the cheap
+# tiers on top), never lowering one and never lifting an off (0). Its collateral counts at
+# that size. No multiples file: no size-up (the tune would have no way to rest it).
+MULT_FILE = os.environ.get("PVD_SCAN_MULT_FILE", "").strip() or None
+MAX_MULT = float(os.environ.get("PVD_SCAN_MAX_MULT", "1") or 1) if MULT_FILE else 1.0
+MULT_BASE = int(float(os.environ.get("PVD_SCAN_MULT_BASE", "0") or 0))
+MULT_STEP = 0.25
 
 
 def tier_mult(cost: float) -> float:
@@ -313,6 +331,9 @@ def scan(write: bool) -> int:
                 e["bid_size"] = x["bs"]
             if x["as_"] != x["size"]:
                 e["ask_size"] = x["as_"]
+            if x.get("sized"):
+                e["scan_mult"] = (f"x{x['mult']:g} of the bank max {MULT_BASE} -> {x['sized'][0]}/"
+                                  f"{x['sized'][1]} clears ${BAR:.2f} (the multiples file holds it)")
             if old.get("no_losing_side"):
                 e["no_losing_side"] = True              # Jack's per-market call (abc97d5) carries over
             # ...and an OFF side (sized 0: the tune's 90c+ cap or twin block, 1b58188) stays
@@ -335,6 +356,7 @@ def scan(write: bool) -> int:
             json.dump(cur, fh, indent=1, sort_keys=True)
         os.replace(tmp, LIST)
         log(f"WROTE {len(taken)} entries -> {LIST} (now {len(L)} listed)")
+        write_multiples(taken)
     elif not write:
         log("dry run: nothing written")
     summary["secs"] = round(time.time() - t0, 1)
@@ -343,6 +365,34 @@ def scan(write: bool) -> int:
             json.dump(summary, fh, indent=1)
         os.replace(LAST + ".tmp", LAST)
     return 0
+
+
+def write_multiples(taken: list) -> int:
+    """SIZE-UP TO THE BAR: each taken market's multiple above 1 into the wave's multiples
+    file (MULT_FILE), atomically; never lowers one, never lifts an off (0). Returns how
+    many it raised."""
+    ups = {x["t"]: x["mult"] for x in taken if x.get("sized") and x.get("mult", 1.0) > 1.0}
+    if not MULT_FILE or not ups:
+        return 0
+    try:
+        with open(MULT_FILE, encoding="utf-8") as fh:
+            cur = {str(k): float(v) for k, v in (json.load(fh) or {}).items()}
+    except (OSError, ValueError):
+        cur = {}
+    n = 0
+    for t, m in ups.items():
+        if cur.get(t, 1.0) != 0 and m > cur.get(t, 1.0) + 1e-9:
+            cur[t] = m
+            n += 1
+    if n:
+        tmp = MULT_FILE + ".scan.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cur, fh, indent=0, sort_keys=True)
+        os.replace(tmp, MULT_FILE)
+    log(f"WROTE {n} multiple(s) -> {MULT_FILE} ("
+        + ", ".join(f"x{m:g} {c}" for m, c in sorted(collections.Counter(ups.values()).items()))
+        + f"; {len(ups) - n} already at or above it, or off)")
+    return n
 
 
 def own_live_collateral(L: dict, now, past) -> float:
@@ -494,7 +544,8 @@ def score_and_pick(client, cands, L, now, summary):
         as_ = DECIDED_SIZE if dec == "ask" else s
         r = rate(bs, as_)
         tiered = None
-        if r * hrs / 24 < BAR and CHEAP_TIERS and t not in TIER_SKIP and t.split("-")[0] not in TIER_SKIP:
+        tiers_on = bool(CHEAP_TIERS) and t not in TIER_SKIP and t.split("-")[0] not in TIER_SKIP
+        if r * hrs / 24 < BAR and tiers_on:
             # CHEAP SIDES AT THE WAVE'S SIZE: judged again with each cheap side at the
             # tier size the wave's tune will rest it at (the entry keeps the flat size)
             tb = int(round(bs * tier_mult(qb))) if ok_b else bs
@@ -503,12 +554,24 @@ def score_and_pick(client, cands, L, now, summary):
                 r2 = rate(tb, ta)
                 if r2 * hrs / 24 >= BAR:
                     r, tiered = r2, (tb, ta)
+        sized, mult = None, 1.0
+        if r * hrs / 24 < BAR and MAX_MULT > 1.0:
+            # SIZE-UP TO THE BAR: at the bank max, then quarter steps of it up to MAX_MULT
+            mb_b, mb_a = max(bs, MULT_BASE), max(as_, MULT_BASE)
+            for k in range(int(round(1.0 / MULT_STEP)), int(round(MAX_MULT / MULT_STEP + 1e-9)) + 1):
+                x_ = k * MULT_STEP
+                sb = int(round(mb_b * (tier_mult(qb) if tiers_on else 1.0) * x_)) if ok_b else bs
+                sa = int(round(mb_a * (tier_mult(100 - qa) if tiers_on else 1.0) * x_)) if ok_a else as_
+                r3 = rate(sb, sa)
+                if r3 * hrs / 24 >= BAR:
+                    r, sized, mult = r3, (sb, sa), x_
+                    break
         if r * hrs / 24 < BAR:
             why["under bar"] += 1         # can't clear $1.30 by its program end even at full size
             continue
-        cb, ca = tiered or (bs, as_)
+        cb, ca = sized or tiered or (bs, as_)
         coll = (cb * qb / 100 if ok_b else 0) + (ca * (100 - qa) / 100 if ok_a else 0)
-        scored.append(dict(tiered=tiered,
+        scored.append(dict(tiered=tiered, sized=sized, mult=mult,
                            t=t, ev=m.get("event_ticker"), kind=kind, dec=dec, last=last, size=s, bs=bs, as_=as_,
                            rate=r, proj=r * hrs / 24, coll=coll, roi=r / coll if coll else 0.0, pd=pr["pd"],
                            start=pr["start"], end=pr["end"], ext=bool(pr.get("extend")),
@@ -542,12 +605,18 @@ def score_and_pick(client, cands, L, now, summary):
         f"new at risk if filled ${sum(x['coll'] for x in taken if not x['ext']):,.0f} (budget ${BUDGET:,.0f}), "
         f"~${sum(x['rate'] for x in taken):,.0f}/day; {len(scored) - len(taken)} over budget"
         + (f"; {sum(1 for x in taken if x.get('tiered'))} clear the bar only at the cheap-side tier size "
-           f"(tiers {','.join(f'{c:g}:{x:g}' for c, x in CHEAP_TIERS)})" if CHEAP_TIERS else ""))
+           f"(tiers {','.join(f'{c:g}:{x:g}' for c, x in CHEAP_TIERS)})" if CHEAP_TIERS else "")
+        + (f"; {sum(1 for x in taken if x.get('sized'))} only at the bank max {MULT_BASE} x up to "
+           f"{MAX_MULT:g} (" + ", ".join(f"x{m:g} {n}" for m, n in sorted(collections.Counter(
+               x['mult'] for x in taken if x.get('sized')).items())) + ")" if MAX_MULT > 1.0 else ""))
     summary["tiered_taken"] = sum(1 for x in taken if x.get("tiered"))
+    summary["sized_taken"] = sum(1 for x in taken if x.get("sized"))
     for x in taken[:20]:
         log(f"  {'EXTEND' if x['ext'] else 'RELIT ' if x['relit'] else 'NEW   '} {x['t']} {x['kind']} last {x['last']} book {x['book']} "
             f"size {x['bs']}/{x['as_']}"
             + (f" (cheap side at the tier size: {x['tiered'][0]}/{x['tiered'][1]})" if x.get("tiered") else "")
+            + (f" (sized up to the bar: x{x['mult']:g} of the bank max -> {x['sized'][0]}/{x['sized'][1]})"
+               if x.get("sized") else "")
             + f" ${x['rate']:.2f}/day proj ${x['proj']:.2f} "
             f"ROI {x['roi'] * 100:.1f}%/day {zs(x['start'])[5:16]}->{zs(x['end'])[5:16]}")
     return taken
