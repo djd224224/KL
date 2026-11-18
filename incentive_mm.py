@@ -7787,6 +7787,34 @@ def league_auto_season(series: str) -> bool:
     return bool(e) and e["kind"] == "season"
 
 
+# A SEASON MEMBER'S TICKER DATE IS ITS LISTING DATE (Jack 2026-11-18: "Yes,
+# fix it", of KXNBA30PTSTREAK-26NOV10LDONCIC77). The family enrolled the Luka
+# Doncic 30-point-streak event (programs from 11/19 02:10Z, 8 strikes x $85)
+# as an NBA season prop, but trade_cutoff_utc read its 26NOV10 -- the day
+# Kalshi LISTED it (open 11/10 16:45Z; the streak counts from Oct 25) -- as
+# the event day and cut it off at 00:00 ET Nov 10, so it could never quote;
+# Kalshi expires it Apr 30 2027. The mention family's listing-date rule
+# (ticker_date_is_listing_date) and the politics window rule
+# (politics_window_start) never reached the league family. Now a SEASON
+# member's ticker date more than LEAGUE_SEASON_LISTING_GAP_DAYS before the
+# market's own expiration is a listing date: the market quotes to that
+# expiration, standing aside while its league plays (the season hold) and on
+# its "until". A game member keeps the midnight-of-the-ticker-date rule, and a
+# season member whose expiration sits within the gap keeps it too.
+LEAGUE_SEASON_LISTING_GAP_DAYS = _env_float("IMM_LEAGUE_SEASON_LISTING_GAP_DAYS", 5.0)
+
+
+def league_season_listing_date(event_ticker: str, td: datetime,
+                               expected_expiration: Optional[datetime]) -> bool:
+    """True when a league auto-family SEASON member's ticker date is the day
+    Kalshi listed it, not the day it resolves: more than
+    LEAGUE_SEASON_LISTING_GAP_DAYS before the market's expiration. No
+    expiration = no proof: the date stands."""
+    return (league_auto_season(series_of(event_ticker))
+            and expected_expiration is not None
+            and expected_expiration - td > timedelta(days=LEAGUE_SEASON_LISTING_GAP_DAYS))
+
+
 def league_auto_pilot(series: str) -> bool:
     e = league_auto_entry(series)
     return bool(e) and e["size"] == "pilot"
@@ -25533,6 +25561,12 @@ def trade_cutoff_utc(event_ticker: str, occurrence: Optional[datetime],
         # a politics member's ticker date that OPENS its window (2026-11-06:
         # KXFBUSTER-26JAN01, "Before Jan 1, 2027" .. "Before Jan 1, 2030")
         # is no day to be out before; the market's expiration bounds it
+        candidates.append(expected_expiration)
+        td = None
+    if td is not None and league_season_listing_date(event_ticker, td, expected_expiration):
+        # a league season member's listing date (2026-11-18:
+        # KXNBA30PTSTREAK-26NOV10LDONCIC77, see LEAGUE_SEASON_LISTING_GAP_DAYS):
+        # quoted to its expiration, the season hold standing it aside in games
         candidates.append(expected_expiration)
         td = None
     if td is not None:

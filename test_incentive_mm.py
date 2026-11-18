@@ -25297,6 +25297,35 @@ class _LeagueAutoFixture(unittest.TestCase):
 class TestLeagueAutoFamilies(_LeagueAutoFixture):
     """The NBA / WNBA / MLB rules (the fixture above)."""
 
+    def test_a_season_members_listing_dated_ticker_quotes_to_its_expiration(self):
+        # Jack 2026-11-18 ("Yes, fix it"): KXNBA30PTSTREAK-26NOV10LDONCIC77,
+        # enrolled as an NBA season prop, was cut off at 00:00 ET Nov 10 -- the
+        # day Kalshi LISTED it (the streak counts from Oct 25) -- though its
+        # markets expire Apr 30 2027, so it could never quote
+        ev = "KXNBA30PTSTREAK-26NOV10LDONCIC77"
+        exp = datetime(2027, 4, 30, 14, 0, tzinfo=timezone.utc)
+        listed = datetime(2026, 11, 10, 5, 0, tzinfo=timezone.utc)       # 00:00 ET
+        self._write({"KXNBAPTS": {"league": "NBA", "kind": "game", "size": "pilot",
+                                  "buffer_min": 90}})
+        # not a season member: the ticker date stands
+        self.assertEqual(imm.trade_cutoff_utc(ev, exp, exp), listed)
+        self._write({"KXNBA30PTSTREAK": {"league": "NBA", "kind": "season", "size": "pilot"},
+                     "KXNBAPTS": {"league": "NBA", "kind": "game", "size": "pilot",
+                                  "buffer_min": 90}})
+        self.assertTrue(imm.league_season_listing_date(ev, listed, exp))
+        self.assertEqual(imm.trade_cutoff_utc(ev, exp, exp), exp)
+        # an expiration within LEAGUE_SEASON_LISTING_GAP_DAYS: the ticker date
+        # is the event day; no expiration is no proof
+        near = listed + timedelta(days=4)
+        self.assertFalse(imm.league_season_listing_date(ev, listed, near))
+        self.assertEqual(imm.trade_cutoff_utc(ev, near, near), listed)
+        self.assertEqual(imm.trade_cutoff_utc(ev, None, None), listed)
+        # a game member keeps the midnight-of-the-ticker-date rule
+        self.assertFalse(imm.league_season_listing_date(
+            "KXNBAPTS-26NOV18LALGSW", datetime(2026, 11, 18, 5, 0, tzinfo=timezone.utc), exp))
+        self.assertEqual(imm.trade_cutoff_utc("KXNBAPTS-26NOV18LALGSW", exp, exp),
+                         datetime(2026, 11, 18, 5, 0, tzinfo=timezone.utc))
+
     def test_the_file_sets_membership_and_guard_sets(self):
         mvp_ov = imm.SERIES_OVERRIDES["KXMLBWSMVP"]
         lad_ov = imm.SERIES_OVERRIDES.get("KXNBALADDERPTS")
