@@ -247,6 +247,9 @@ def setUpModule():
     imm.HOME_STATUS_FILE = os.path.join(tmp, "home_value_fair.json")
     imm.HOME_CACHE_FILE = os.path.join(tmp, "zillow_home_cache.json")
     imm._home_state["snap"] = None
+    # THE FAR MONTHS x5 (2026-11-18): the Zillow fixtures are dated 2067, so
+    # every one would read as a far month -- x1 here; TestHomeFarSize turns it on
+    imm.HOME_FAR_SIZE_MULT = 1.0
     # the Pokemon gate's status file and in-memory snapshot (2026-10-03):
     # the same -- only its refresher thread writes them
     imm.POKE_STATUS_FILE = os.path.join(tmp, "pokemon_fair.json")
@@ -26303,17 +26306,23 @@ class TestZillowHomeGate(unittest.TestCase):
         self.assertNotIn(self.T, bot._home_stood)
         self.assertEqual(cycle(0.60), ({45}, {90, 91, 92}))   # bids capped at 45
         self.assertEqual(cycle(0.80), ({48, 49, 50}, {95}))   # asks lifted to 95
-        # bid touch 50 over 30 + 15: the 1c bid / 99c ask alone (HOME_EDGES),
-        # no lead beside them
+        # bid touch 50 over 30 + 15: the bid to its 1c edge, the asks at the
+        # book as ever (ONE SIDE OFF A BREACH, 2026-11-18), no lead
         self._snap(p=0.30)
         lines = []
         with mock.patch.object(imm, "log", lines.append):
             bot.run_cycle()
-        self.assertEqual(set(self._quotes(bot)), {("bid", 1), ("ask", 99)})
-        self.assertTrue(any(f"home-value edges only {self.T}" in s for s in lines), lines)
+        self.assertEqual(set(self._quotes(bot)),
+                         {("bid", 1), ("ask", 90), ("ask", 91), ("ask", 92)}, lines[-30:])
+        self.assertTrue(any(f"home-value edges only {self.T}" in s
+                            and "the other at its cap" in s for s in lines), lines)
         self.assertFalse(any(f"fair lead {self.T}" in s and " @ " in s for s in lines))
         self.assertIn(self.T, bot._home_edges)
         self.assertNotIn(self.T, bot._home_stood)
+        # ...both sides to the edges with it off (the 11/13 rule)
+        with mock.patch.object(imm, "HOME_ONE_SIDE_BREACH", False):
+            bot.run_cycle()
+            self.assertEqual(set(self._quotes(bot)), {("bid", 1), ("ask", 99)})
         # ...the whole market stood aside before them
         with mock.patch.object(imm, "HOME_EDGES", False):
             bot.run_cycle()
@@ -26325,6 +26334,63 @@ class TestZillowHomeGate(unittest.TestCase):
         bot.run_cycle()
         self.assertEqual(self._quotes(bot), [])
         self.assertNotIn(self.T, bot._home_edges)
+
+
+class TestHomeFarSize(unittest.TestCase):
+    """THE FAR MONTHS, x5 (Jack 2026-11-18: "you can go heavier on markets 3M
+    out, 5x the size"): a Zillow market HOME_FAR_DAYS or more from its cutoff
+    rests HOME_FAR_SIZE_MULT its size -- rungs, per-market cap, event cap
+    together; a near month stays x1. TestZillowHomeGate's fixture (cutoff
+    2067)."""
+
+    T, EV, CLOSE = TestZillowHomeGate.T, TestZillowHomeGate.EV, TestZillowHomeGate.CLOSE
+    setUp, tearDown = TestZillowHomeGate.setUp, TestZillowHomeGate.tearDown
+    _snap, _bot = TestZillowHomeGate._snap, TestZillowHomeGate._bot
+
+    def _sizes(self, bot):
+        out = {"bid": 0.0, "ask": 0.0}
+        for o in bot.state.sim_orders.values():
+            if o["ticker"] == self.T:
+                out[o["book_side"]] += o["remaining_count"]
+        return out
+
+    def test_far_reads_the_cutoff(self):
+        now = time.time()
+        et = datetime.now(timezone.utc).astimezone(imm.ET)
+
+        def ev(days):
+            return "KXSEAHOME-" + (et + timedelta(days=days)).strftime("%d%b%y").upper()
+        with mock.patch.object(imm, "HOME_FAR_SIZE_MULT", 5.0):
+            self.assertEqual(imm.home_far_mult(self.T, now), 5.0)
+            self.assertEqual(imm.home_far_mult(self.EV, now), 5.0)        # an event too
+            self.assertEqual(imm.home_far_mult(ev(30) + "-GT1", now), 1.0)   # 30 days
+            self.assertEqual(imm.home_far_mult(ev(100) + "-GT1", now), 5.0)  # 100 days
+            self.assertEqual(imm.home_far_mult("KXSEAHOME-NOV67-GT1", now), 1.0)  # no day
+            self.assertEqual(imm.home_far_mult("KXRT-67OCT01-T80", now), 1.0)     # not Zillow
+            base = imm.series_max_position("KXSEAHOME")
+            self.assertEqual(imm.market_max_position(self.T), base * 5.0)
+            self.assertEqual(imm.market_max_position(ev(30) + "-GT1"), base)
+            self.assertEqual(imm.event_cap_contracts(self.EV),
+                             imm.MAX_EVENT_CONTRACTS * imm.applied_mention_mult("KXSEAHOME") * 5.0)
+        self.assertEqual(imm.home_far_mult(self.T, now), 1.0)              # off
+
+    def test_the_quote_loop_rests_five_times_the_size(self):
+        self._snap(p=0.70)
+        one = self._bot()
+        one.run_cycle()
+        s1 = self._sizes(one)
+        _clean_persist()
+        with mock.patch.object(imm, "HOME_FAR_SIZE_MULT", 5.0):
+            self._snap(p=0.70)
+            five = self._bot()
+            five.run_cycle()
+            s5 = self._sizes(five)
+            self.assertEqual(five._market_size_mult(self.T), 5.0)
+        self.assertGreater(s1["bid"], 0)
+        self.assertGreater(s1["ask"], 0)
+        for side in ("bid", "ask"):
+            self.assertAlmostEqual(s5[side], 5 * s1[side], delta=0.02 * 5 * s1[side] + 2,
+                                   msg=(side, s1, s5))
 
 
 class TestHomeAutoFamily(TestZillowHomeGate):
@@ -43318,11 +43384,18 @@ class TestHomeLead(unittest.TestCase):
         self.assertIsNone(imm.home_gate(self.T, now, None, None)[2])
         self._snap(p=0.094, decided=True)
         self.assertIsNone(imm.home_gate(self.T, now, None, None)[2])
-        # a touch fighting the fair: the edges alone
+        # a touch fighting the fair: that side to its edge, the other at its
+        # cap (ONE SIDE OFF A BREACH, 2026-11-18) -- the bid touch 30 is over
+        # 9.4 + 15, so the bid rests 1c and the ask keeps 25c and up
         self._snap(p=0.094)
         why, inputs, c = imm.home_gate(self.T, now, 30, 99)
         self.assertTrue(why)
-        self.assertEqual((c, inputs["reason"], inputs["edges_only"]), ((1, 99), "band", True))
+        self.assertEqual((c, inputs["reason"], inputs["edges_only"]), ((1, 25), "band", True))
+        self._snap(p=0.99)                          # the ask touch 60 under 99 - 15
+        self.assertEqual(imm.home_gate(self.T, now, 50, 60)[2], (84, 99))
+        with mock.patch.object(imm, "HOME_ONE_SIDE_BREACH", False):   # both edges
+            self._snap(p=0.094)
+            self.assertEqual(imm.home_gate(self.T, now, 30, 99)[2], (1, 99))
         # ...and the fair lead still reads the fair (the lead's own guard
         # judges the book)
         self.assertAlmostEqual(imm.home_fair_c(self.T, now), 9.4)

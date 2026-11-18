@@ -2813,6 +2813,14 @@ def series_max_position(series: str, now_utc: Optional[datetime] = None,
     return base * applied_mention_mult(series)
 
 
+def market_max_position(ticker: str, now_utc: Optional[datetime] = None,
+                        peak: bool = False) -> float:
+    """series_max_position for one market: x its Zillow far-month size
+    (home_far_mult, THE FAR MONTHS), which scales its rungs too."""
+    return (series_max_position(series_of(ticker), now_utc, peak)
+            * globals().get("home_far_mult", lambda t: 1.0)(ticker))
+
+
 def series_price_min(series: str) -> int:
     ov = SERIES_OVERRIDES.get(series)
     if ov and ov.price_min_cents is not None:
@@ -3500,7 +3508,9 @@ def event_cap_contracts(event_ticker: str) -> float:
                    globals()["FAIR_LEAD_EVENT_PER_MARKET"]
                    * EVENT_PROGRAMMED_N.get(event_ticker, 0),
                    MAX_EVENT_CONTRACTS * applied_mention_mult(series))
-    return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
+    # (a Zillow far month's x5 too: THE FAR MONTHS, home_far_mult)
+    return (MAX_EVENT_CONTRACTS * applied_mention_mult(series)
+            * globals().get("home_far_mult", lambda t: 1.0)(event_ticker))
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 # Selection reserves worst-case (full two-sided ladder at the touch) collateral
 # per market, but skew / one-sided books / churn / partial fills mean only a
@@ -14997,6 +15007,7 @@ _CONFIG_CODE_KNOBS = (
     # ride in its status file's "model" block
     "HOME_ENABLE", "HOME_SERIES", "HOME_FAIR_TOL_CENTS", "HOME_FAIR_TTL_MIN",
     "HOME_FAIR_REFRESH_SECS", "HOME_RELEASE_HOLD_MIN", "HOME_SIZE_MULT", "HOME_EDGES",
+    "HOME_FAR_SIZE_MULT", "HOME_FAR_DAYS", "HOME_ONE_SIDE_BREACH",     # (2026-11-18)
     "HOME_AUTO", "HOME_AUTO_PATTERN",
     # placement queue priority (2026-11-14)
     "PLACE_PRIORITY", "RENEW_URGENT_SECS",
@@ -22125,6 +22136,28 @@ HOME_FAIR_TTL_MIN = _env_int("IMM_HOME_FAIR_TTL_MIN", 20)
 HOME_FAIR_REFRESH_SECS = _env_int("IMM_HOME_FAIR_REFRESH_SECS", 60)
 HOME_RELEASE_HOLD_MIN = _env_int("IMM_HOME_RELEASE_HOLD_MIN", 60)
 HOME_SIZE_MULT = _env_float("IMM_HOME_SIZE_MULT", 1.0)
+# THE FAR MONTHS, x5 (Jack 2026-11-18: "you can go heavier on markets 3M out,
+# 5x the size"). A Zillow market whose cutoff (00:00 ET on its ticker day) is
+# HOME_FAR_DAYS or more away rests HOME_FAR_SIZE_MULT its size -- the rungs
+# (_market_size_mult: the quote loop, estimator, collateral and placement
+# guard alike), the per-market position cap (market_max_position), the event
+# cap and the skew knees together. On 11/18 that is Houston's June and August
+# 2027 ladders; the 30NOV26 cities (13 days) and KXMEMHOME-31DEC26 (44) stay
+# x1, and a Feb-2027 event drops back to x1 90 days before its cutoff. The
+# gate's fair -/+ HOME_FAIR_TOL_CENTS bound and the no-lead rule apply as
+# ever. IMM_HOME_FAR_SIZE_MULT=1 turns it off.
+HOME_FAR_SIZE_MULT = _env_float("IMM_HOME_FAR_SIZE_MULT", 5.0)
+HOME_FAR_DAYS = _env_float("IMM_HOME_FAR_DAYS", 90.0)
+# ONE SIDE OFF A BREACH (Jack 2026-11-18: "i dont see the Zillow bids"). A
+# touch fighting the fair took BOTH sides to the 1c / 99c edges, which sit
+# behind 1,000+ contract walls and earn nothing, so neither rested. 00:48Z
+# 11/18: Houston's far books had moved up to 51-89c on the high LT strikes
+# while the fair (mostly the re-anchor drift) read 98-99c -- the asks fought
+# it, and the bids, the side the model agrees with, went with them. Now only
+# the side that fights the fair goes to its edge; the other keeps its usual
+# cap (fair -/+ HOME_FAIR_TOL_CENTS) and rests at the book's reference, no
+# lead. IMM_HOME_ONE_SIDE_BREACH=0: both sides to the edges again.
+HOME_ONE_SIDE_BREACH = os.environ.get("IMM_HOME_ONE_SIDE_BREACH", "1") == "1"
 # THE 1c / 99c EDGES (Jack 2026-11-13: "why not quote 1c side on the Zillow
 # markets? expand range to 1-99c"). A 1c bid or a 99c ask risks at most 1c a
 # contract, so the gate never takes a side off the book for sitting too close
@@ -22241,14 +22274,28 @@ def home_cutoff_utc(event_ticker: str) -> Optional[datetime]:
     return ET.localize(d).astimezone(timezone.utc)
 
 
+def home_far_mult(ticker: str, now_ts: Optional[float] = None) -> float:
+    """HOME_FAR_SIZE_MULT for a Zillow market (or event) whose cutoff is
+    HOME_FAR_DAYS or more away, else 1.0 (THE FAR MONTHS, x5)."""
+    if HOME_FAR_SIZE_MULT == 1.0 or HOME_FAR_SIZE_MULT <= 0 \
+            or not home_series(series_of(ticker)):
+        return 1.0
+    cut = home_cutoff_utc("-".join(str(ticker).split("-")[:2]))
+    if cut is None:
+        return 1.0
+    ts = time.time() if now_ts is None else now_ts
+    return HOME_FAR_SIZE_MULT if cut.timestamp() - ts >= HOME_FAR_DAYS * 86400 else 1.0
+
+
 def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
               ext_ask: Optional[float]
               ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
     """('', inputs, (bid_cap, ask_floor)) when a home-value market may quote
     -- bids at most bid_cap, asks at least ask_floor, None = that side not at
     all -- else (why, guard-skip inputs, None). Fails CLOSED. One exception
-    (HOME_EDGES): a touch fighting the fair returns (why, inputs, edges) --
-    the 1c bid / 99c ask alone (inputs["edges_only"])."""
+    (HOME_EDGES): a touch fighting the fair returns (why, inputs, caps) --
+    that side at its 1c / 99c edge, the other at its usual cap
+    (HOME_ONE_SIDE_BREACH; off, both edges alone) (inputs["edges_only"])."""
     snap = _home_state.get("snap")
     if snap is None or snap.get("checked_ts") is None:
         return "no zillow read yet", {"reason": "no_read"}, None
@@ -22278,16 +22325,6 @@ def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     # the band edges a fair of `fair` never argues with (HOME_EDGES)
     edges = ((1 if fair >= 1.0 else None, 99 if fair <= 99.0 else None)
              if HOME_EDGES else (None, None))
-    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair, HOME_FAIR_TOL_CENTS)
-    if bid_bad or ask_bad:
-        why = (f"book {ext_bid}x{ext_ask} vs fair {fair:.0f}c (tol "
-               f"{HOME_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
-               f"mu ${e.get('mu') or 0:,})")
-        band_in = dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad)
-        if edges != (None, None):
-            return why, dict(band_in, edges_only=True, bid_cap=edges[0],
-                             ask_floor=edges[1]), edges
-        return why, band_in, None
     bid_cap = int(math.floor(fair - HOME_FAIR_TOL_CENTS + 1e-9))
     ask_floor = int(math.ceil(fair + HOME_FAIR_TOL_CENTS - 1e-9))
     if edges[0] is not None:
@@ -22296,6 +22333,20 @@ def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
         ask_floor = min(ask_floor, edges[1])
     caps = (bid_cap if bid_cap >= 1 else None,
             ask_floor if ask_floor <= 99 else None)
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair, HOME_FAIR_TOL_CENTS)
+    if bid_bad or ask_bad:
+        why = (f"book {ext_bid}x{ext_ask} vs fair {fair:.0f}c (tol "
+               f"{HOME_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
+               f"mu ${e.get('mu') or 0:,})")
+        band_in = dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad)
+        if edges != (None, None):
+            # the side fighting the fair to its edge; the other keeps its
+            # cap (ONE SIDE OFF A BREACH), or both to the edges
+            out = ((edges[0] if bid_bad else caps[0], edges[1] if ask_bad else caps[1])
+                   if HOME_ONE_SIDE_BREACH else edges)
+            return why, dict(band_in, edges_only=True, bid_cap=out[0],
+                             ask_floor=out[1]), out
+        return why, band_in, None
     if caps == (None, None):
         return (f"no side {HOME_FAIR_TOL_CENTS}c clear of fair {fair:.0f}c",
                 dict(inputs, reason="decided"), None)
@@ -35835,7 +35886,8 @@ class IncentiveMarketMaker:
             return 1.0
         return (max(self._near_cliff_size_mult(ticker), self._rt_floor_boost.get(ticker, 1.0),
                     self._vercel_boost_mult(ticker), self._art_boost_mult(ticker))
-                * self._yield_size_mult(ticker))
+                * self._yield_size_mult(ticker)
+                * home_far_mult(ticker))           # (a Zillow far month: THE FAR MONTHS)
 
     def _yield_size_verdict(self, meta: "MarketMeta", now_ts: float) -> None:
         """Arm / keep / drop the yield size mode on this refresh's estimate.
@@ -40413,7 +40465,7 @@ class IncentiveMarketMaker:
             smb, sma = clamp_side_max_to_position_cap(
                 max(int(round(_bsum * rmb)), _rl if _bsum > 0 else 0),
                 max(int(round(_asum * rma)), _rl if _asum > 0 else 0),
-                max(vercel_boost_cap(series_max_position(meta.series), _b), _rl, _apos))
+                max(vercel_boost_cap(market_max_position(meta.ticker), _b), _rl, _apos))
             if _acb:
                 smb, sma = min(smb, _acb), min(sma, _aca)
             if quake_ask_strike(meta.ticker):
@@ -40438,7 +40490,7 @@ class IncentiveMarketMaker:
                     (LADDER_MODE == "atref" and rpa is not None)
                     or ea <= series_price_max(meta.series))
             lb, la = leads
-            _cap = int(series_max_position(meta.series))
+            _cap = int(market_max_position(meta.ticker))
             if lb is not None or la is not None:    # a leading market's cap
                 _cap = max(_cap, int(FAIR_LEAD_MAX_POSITION if _lsrc == "fair"
                                      else COMP_LEAD_MAX_POSITION))
@@ -41621,7 +41673,7 @@ class IncentiveMarketMaker:
                 continue                      # below standoff threshold: harmless
             # (judged on the Saturday cap whatever the day: a position built
             # under it may outlive the Saturday)
-            if abs(acct) > series_max_position(series_of(t), peak=True):
+            if abs(acct) > market_max_position(t, peak=True):
                 continue                      # too big to be ours -> it's manual
             if t not in positions:
                 self._settle_or_drop(t, via="startup_reconcile")
@@ -43391,7 +43443,9 @@ class IncentiveMarketMaker:
                     if home_edges_only:
                         self._home_edges.add(t)
                         log(f"{self.tag} home-value edges only {t}: {hg_why} -- "
-                            f"the 1c bid / 99c ask alone {home_caps}")
+                            + ("that side at its edge, the other at its cap "
+                               if HOME_ONE_SIDE_BREACH else "the 1c bid / 99c ask alone ")
+                            + f"{home_caps}")
                     else:
                         self._home_edges.discard(t)
                         log(f"{self.tag} home-value edges clear {t}")
@@ -43861,7 +43915,7 @@ class IncentiveMarketMaker:
                     lead_a[0] if lead_a is not None else None)
                 side_max_bid = min(side_max_bid, art_cb)
                 side_max_ask = min(side_max_ask, art_ca)
-            maxpos = series_max_position(meta.series, now_utc)
+            maxpos = market_max_position(t, now_utc)
             if lead_b is not None or lead_a is not None:       # a leading market's cap
                 maxpos = max(maxpos, FAIR_LEAD_MAX_POSITION if lead_src == "fair"
                              else COMP_LEAD_MAX_POSITION)
@@ -43951,7 +44005,7 @@ class IncentiveMarketMaker:
                                        else pvd.get("asize", pvd["size"]))
             room_buy = min(pos_room_buy, share_buy, side_max_bid)
             room_sell = min(pos_room_sell, share_sell, side_max_ask)
-            fam_m = applied_mention_mult(meta.series)
+            fam_m = applied_mention_mult(meta.series) * home_far_mult(t)
             sk_soft, sk_hard = skew_knees(meta.series, fam_m)
             room_buy = skewed_side_room(room_buy, skew_b, accumulating=skew_b > 0,
                                         side_max=side_max_bid,
@@ -45836,7 +45890,7 @@ class IncentiveMarketMaker:
             # FULL UNWIND: the side that reduces the bot's own position may
             # rest the whole position (the quote loop sized it the same way)
             _ub, _ua = unwind_side_sizes(series, self.pnl.pos.get(q.ticker, 0.0),
-                                         series_max_position(series))
+                                         market_max_position(q.ticker))
             _u = _ub if q.book_side == "bid" else _ua
             side_cap = max(side_cap, _u)
             max_level_size = max(max_level_size, _u)
@@ -48517,8 +48571,11 @@ class IncentiveMarketMaker:
                 + f" fail-closed, "
                 f"bids <= fair - {HOME_FAIR_TOL_CENTS}c, asks >= fair + "
                 f"{HOME_FAIR_TOL_CENTS}c, a touch fighting the fair by more "
-                f"stands aside, {HOME_RELEASE_HOLD_MIN}m out after a Zillow "
-                f"release, size x{HOME_SIZE_MULT:g}, 1-99c, out 00:00 ET on the "
+                + ("sends that side to its 1c / 99c edge (the other keeps its cap)"
+                   if HOME_ONE_SIDE_BREACH else "rests the 1c / 99c edges alone")
+                + f", {HOME_RELEASE_HOLD_MIN}m out after a Zillow "
+                f"release, size x{HOME_SIZE_MULT:g} (x{HOME_FAR_SIZE_MULT:g} with "
+                f"{HOME_FAR_DAYS:g}+ days to the cutoff), 1-99c, out 00:00 ET on the "
                 f"ticker day, ttl {HOME_FAIR_TTL_MIN}m, leads "
                 + ("on" if HOME_LEADS else "OFF (fair closes only; IMM_HOME_LEADS=1 "
                    "restores them)")
