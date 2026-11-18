@@ -27737,13 +27737,21 @@ def natnom_ask_floor(ticker: str, names: Dict[str, str],
 # Massie $5,812 ... Warnock $5,376 still trimmed; Vance $4,821, Rubio $4,696
 # and the rest whole.
 #
+# RAISED TO $13,000 (Jack 2026-11-18: "1", to "Raise the name cap to ~$13k"):
+# the w1111-elec2028 size-ups that day (the $1.20 resize up to 3x, then 1.5x
+# twice on the 5-30c tiers) took 16 names to $8.4-12.9k of wanted YES bids
+# ($177k in all), so at $5k the cap left 326 states with no bid; 33 of those
+# 326 paced to $1+ against 511 of the 566 markets quoting normally. $13k fits
+# every name's wanted bids (TMAS $12,925 the most).
+#
 # Knobs:
 #   * IMM_NAME_BID_CAP: "on" (default), "dry" (logged, nothing cut), "off".
-#   * IMM_NAME_BID_CAP_USD: the cap, default 5000 (1500 from 11/16 to 11/17).
+#   * IMM_NAME_BID_CAP_USD: the cap, default 13000 (1500 from 11/16 to 11/17,
+#     5000 from 11/17 to 11/18).
 NAME_BID_CAP_MODE = os.environ.get("IMM_NAME_BID_CAP", "on").strip().lower()
 if NAME_BID_CAP_MODE not in ("on", "dry", "off"):
     NAME_BID_CAP_MODE = "on"
-NAME_BID_CAP_USD = max(0.0, _env_float("IMM_NAME_BID_CAP_USD", 5000.0))
+NAME_BID_CAP_USD = max(0.0, _env_float("IMM_NAME_BID_CAP_USD", 13000.0))
 
 
 def name_bid_cap(quotes: List["Quote"], value_per_day: Dict[str, float],
