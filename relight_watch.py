@@ -35,6 +35,10 @@ RX_PASS = re.compile(r"^=+ .*?pass (\d+): (.*?)\s*$")
 RX_WAVE = re.compile(r"^== wave (\S+)(?: (main|near)\b)?")
 RX_WROTE = re.compile(TS + r" WROTE (\d+) entries .*?\(now (\d+) listed\)")
 RX_SKIP = re.compile(r"skipped (\{[^}]*\})")    # the scan's left-out markets by reason (wave_alert.py)
+# ...the bar it judged them against, and how many cleared it only sized up (pvd_scan.py's
+# size-up to the bar, Jack 2026-11-18 "1.5-3x the size"): the alert says why in words
+RX_BAR = re.compile(r"scored \d+ clearing \$([\d.]+)")
+RX_SIZED = re.compile(r"; (\d+) only at the bank max (\d+) x up to ([\d.]+)")
 
 
 def scan(since: str):
@@ -73,6 +77,13 @@ def scan(since: str):
                             takes[-1]["skipped"] = {str(a): int(b) for a, b in ast.literal_eval(k.group(1)).items()}
                         except (ValueError, SyntaxError):
                             pass
+                    k = RX_BAR.search(line)
+                    if k:
+                        takes[-1]["bar"] = float(k.group(1))
+                    k = RX_SIZED.search(line)
+                    if k:
+                        takes[-1].update(sized=int(k.group(1)), bank_max=int(k.group(2)),
+                                         sized_cap=float(k.group(3)))
                 m = RX_WROTE.search(line)
                 if m and m.group(1) > since and took and takes and takes[-1]["ts"][:16] == m.group(1)[:16]:
                     takes[-1]["now_listed"] = int(m.group(3))

@@ -363,19 +363,41 @@ def relight_names(r: dict):
     return out
 
 
+def deny_reason_text(reason: str, n: int, bar: float, cap=None, bank_max=None) -> str:
+    """One relight denial reason in words (Jack 2026-11-18, "reword the alert", after asking
+    "why denied" of "211 mkts denied ... Denied because: 211 under bar")."""
+    if reason == "under bar":
+        at = (f"even sized up to {cap:g}x the wave's bank size ({bank_max:,} a side, cheap tiers on top)"
+              if cap and bank_max else "at the wave's size")
+        return (f"{n:,} under the ${bar:.2f} bar: their share of the pool {at} projects under ${bar:.2f} "
+                f"by the period end (Kalshi pays nothing under $1 a market per period)")
+    if reason == "no book":
+        return f"{n:,} with no book to judge (an empty side, or no book read)"
+    if reason == "no quotable side":
+        return f"{n:,} with no quotable side (both sides outside the wave's price band)"
+    return f"{n:,} {reason}"
+
+
 def relight_msg(r: dict):
     n_mk, usd = r.get("listed") or 0, r.get("usd_day") or 0
     p0, p1, jump = r.get("programs_before"), r.get("programs_now"), r.get("programs_jump") or 0
     evs = relight_names(r)
     # each list's latest pass only: the same wave's 15-min passes skip the same markets again
-    last_skip = {}
+    last_pass = {}
     for p in r.get("passes") or []:
         if p.get("skipped") is not None:
-            last_skip[p["where"]] = p["skipped"]
+            last_pass[p["where"]] = p
     skipped = collections.Counter()
-    for sk in last_skip.values():
-        skipped.update(sk)
+    for p in last_pass.values():
+        skipped.update(p["skipped"])
     d_mk = sum(skipped.values())
+    # the bar the scan judged against, and the size-up it judged with (relight_watch reads
+    # both): a wave with the size-up judged its "under bar" ones at up to its cap
+    ps_ = r.get("passes") or []
+    bar = next((p["bar"] for p in reversed(ps_) if p.get("bar")), 1.10)
+    n_sized = sum(p.get("sized") or 0 for p in ps_)
+    up = max((p for p in ps_ if p.get("sized_cap")), key=lambda p: p["sized_cap"], default={})
+    ub_up = sum(p["skipped"].get("under bar") or 0 for p in last_pass.values() if p.get("sized_cap"))
     named = sum(e["markets"] for e in evs)
     g = (f"{plural(len(evs), 'event')} ({n_mk:,} mkts)" if evs and named == n_mk
          else plural(n_mk, "market"))
@@ -390,7 +412,8 @@ def relight_msg(r: dict):
     nw_mk, nw_usd = sum(w.get("markets") or 0 for w in nw), sum(w.get("usd_day") or 0 for w in nw)
     nw_names = ", ".join(w["name"] for w in nw)
     if n_mk:
-        head = f"RELIGHT: {g} listed, {d_mk:,} mkts denied (~${usd:,.0f}/day)"
+        # the $/day is the LISTED markets' (it read as the denied ones' after "denied")
+        head = f"RELIGHT: {g} listed (~${usd:,.0f}/day), {d_mk:,} mkts denied"
     elif nw:
         head = (f"RELIGHT: programs {p0} -> {p1} (+{jump:,}) = new wave {nw_names}, "
                 f"{nw_mk:,} mkts listed (~${nw_usd:,.0f}/day)")
@@ -404,13 +427,24 @@ def relight_msg(r: dict):
                     "unsplit": p.get("unsplit") or 0})
         w = str(p.get("where") or "").split(" / ", 1)[-1]
         where[w[5:].replace(" main", "") if w.startswith("wave ") else w] += p["taken"]
-    whys = [f"Listed because: pool ROI over the $1.10/day bar (new {tot['new']}, relit {tot['relit']}, "
-            f"extended {tot['extended']}" + (f", split unknown {tot['unsplit']}" if tot["unsplit"] else "") + ")",
+    whys = [f"Listed because: their share of the pool projects over the ${bar:.2f} bar by the period end "
+            f"(new {tot['new']}, relit {tot['relit']}, extended {tot['extended']}"
+            + (f", split unknown {tot['unsplit']}" if tot["unsplit"] else "") + ")"
+            + (f"; {n_sized:,} of them only sized up, to at most {up['sized_cap']:g}x the wave's bank size"
+               if n_sized and up else ""),
             "By wave: " + ", ".join(f"{w} {n:,}" for w, n in where.most_common()),
             "Quoting checked on Kalshi 20 min after listing: a DARK alert follows if they rest nothing"
             ] if n_mk else []
     if d_mk:
-        whys.append("Denied because: " + "; ".join(f"{v} {k}" for k, v in skipped.most_common() if v))
+        parts = []
+        for k, v in skipped.most_common():
+            if k == "under bar" and ub_up:
+                if v - ub_up:
+                    parts.append(deny_reason_text(k, v - ub_up, bar))
+                parts.append(deny_reason_text(k, ub_up, bar, up.get("sized_cap"), up.get("bank_max")))
+            elif v:
+                parts.append(deny_reason_text(k, v, bar))
+        whys.append("Denied because: " + "; ".join(parts))
     auto = [w for w in nw if str(w.get("note") or "").startswith("auto")]   # the check's own adds
     for w in nw:
         by = ("by the 24/7 wave check, its own WAVE alert sent" if w in auto

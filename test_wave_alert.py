@@ -169,8 +169,41 @@ class DarkAndRelightWordingTests(unittest.TestCase):
                          "usd_day": 73.0, "skipped": {"under bar": 548}}]}
         text = wa.relight_msg(r)[0]
         self.assertNotIn("greenlit", text)
-        self.assertTrue(text.splitlines()[0].startswith("RELIGHT: 247 markets listed, 548 mkts denied"), text)
+        self.assertTrue(text.splitlines()[0].startswith("RELIGHT: 247 markets listed (~$73/day), 548 mkts denied"),
+                        text)
         self.assertIn("a DARK alert follows if they rest nothing", text)
+
+    def test_the_denials_say_why_in_words(self):
+        # Jack 2026-11-18, "why denied" of "RELIGHT: 16 events (125 mkts) listed, 211 mkts denied
+        # (~$84/day) ... Denied because: 211 under bar", then "reword the alert": the $/day is
+        # the listed markets', and "under bar" says what bar, at what size, and why it matters
+        fx = {"ts": "2026-11-18 19:18:39Z", "where": "waves task / wave w1113-fxmetals main", "taken": 125,
+              "new": 125, "relit": 0, "extended": 0, "usd_day": 84.0, "bar": 1.10,
+              "skipped": {"no book": 0, "no quotable side": 0, "under bar": 211}}
+        r = {"listed": 125, "usd_day": 84.0, "programs_before": 6343, "programs_now": 6348, "programs_jump": 5,
+             "passes": [fx]}
+        lines = wa.relight_msg(r)[0].splitlines()
+        self.assertEqual(lines[0], "RELIGHT: 125 markets listed (~$84/day), 211 mkts denied")
+        self.assertEqual(lines[1], "Listed because: their share of the pool projects over the $1.10 bar by the "
+                                   "period end (new 125, relit 0, extended 0)")
+        den = [ln for ln in lines if ln.startswith("Denied because: ")]
+        self.assertEqual(den, ["Denied because: 211 under the $1.10 bar: their share of the pool at the wave's size "
+                               "projects under $1.10 by the period end (Kalshi pays nothing under $1 a market per "
+                               "period)"])
+        # with the size-up (Jack: "1.5-3x the size"), and a second wave without it in the window
+        sized = dict(fx, ts="2026-11-18 20:02:29Z", taken=201, new=201, usd_day=76.0, sized=189, bank_max=300,
+                     sized_cap=2.0, skipped={"no book": 2, "no quotable side": 0, "under bar": 1})
+        other = {"ts": "2026-11-18 20:03:00Z", "where": "waves task / wave w1111-elec2028 main", "taken": 1,
+                 "new": 0, "relit": 1, "extended": 0, "usd_day": 2.0, "skipped": {"under bar": 3}}
+        lines = wa.relight_msg(dict(r, listed=202, usd_day=78.0, passes=[sized, other]))[0].splitlines()
+        self.assertTrue(lines[1].endswith("; 189 of them only sized up, to at most 2x the wave's bank size"), lines[1])
+        den = [ln for ln in lines if ln.startswith("Denied because: ")][0]
+        self.assertEqual(den, "Denied because: 3 under the $1.10 bar: their share of the pool at the wave's size "
+                              "projects under $1.10 by the period end (Kalshi pays nothing under $1 a market per "
+                              "period); 1 under the $1.10 bar: their share of the pool even sized up to 2x the "
+                              "wave's bank size (300 a side, cheap tiers on top) projects under $1.10 by the period "
+                              "end (Kalshi pays nothing under $1 a market per period); 2 with no book to judge "
+                              "(an empty side, or no book read)")
 
     def test_a_big_relight_names_its_wave_and_texts(self):
         # Jack 2026-11-18: "i didnt get an email and text confirming the relight" -- the
@@ -186,7 +219,8 @@ class DarkAndRelightWordingTests(unittest.TestCase):
         text, push, subject, body, big = wa.relight_msg(r)
         lines = text.splitlines()
         self.assertTrue(lines[0].startswith("RELIGHT: 977 markets listed"), text)
-        self.assertEqual(lines[1], "Listed because: pool ROI over the $1.10/day bar (new 0, relit 977, extended 0)")
+        self.assertEqual(lines[1], "Listed because: their share of the pool projects over the $1.10 bar by the "
+                                   "period end (new 0, relit 977, extended 0)")
         self.assertEqual(lines[2], "By wave: w1111-elec2028 976, w1111-pol 1")
         self.assertTrue(big)
         # a pass whose summary line was lost (relight_watch's WROTE fallback) says so

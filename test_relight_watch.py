@@ -88,6 +88,17 @@ class ScanCounts(unittest.TestCase):
                           for t in takes],
                          [("waves task / wave w1111-elec2028 main", 975, 975, None, 6159, 600.0),
                           ("waves task / wave w1111-pol main", 1, 1, None, 6159, 2.0)])
+        self.assertEqual((takes[0]["bar"], takes[0].get("sized")), (1.10, None))
+
+    def test_the_bar_and_the_size_up_count_are_read(self):
+        # the 20:02Z 11/18 FX pass, the first with the size-up to the bar
+        line = ("    2026-11-18 05:07:10Z scored 201 clearing $1.10 | skipped {'no book': 0, 'no quotable side': 0, "
+                "'under bar': 1} | taking 201 by ROI (extended 0, relit 0, new 201), new at risk if filled $26,665 "
+                "(budget $700,000), ~$76/day; 0 over budget; 12 clear the bar only at the cheap-side tier size "
+                "(tiers 2:10,5:5); 189 only at the bank max 300 x up to 2 (x1 87, x1.25 56, x1.5 43, x1.75 2, x2 1)\n")
+        t = self.counts("== wave w1113-fxmetals main 2026-11-18T05:00:21Z: scan (write)\n" + line)[0]
+        self.assertEqual((t["taken"], t["skipped"]["under bar"], t["bar"], t["sized"], t["bank_max"], t["sized_cap"]),
+                         (201, 1, 1.10, 189, 300, 2.0))
 
 
 if __name__ == "__main__":
