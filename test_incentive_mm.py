@@ -25415,26 +25415,76 @@ class TestLeagueAutoFamilies(_LeagueAutoFixture):
         self.assertEqual(bot.state.halted_until, 0.0)                 # whole book untouched
 
 
-class TestLeagueHandNcaaf(_LeagueAutoFixture):
-    """College football by hand (Jack 2026-11-17: "quote KXNCAAFTOPSEED-27T4,
-    but not when college football games are live"): a hand entry in the
-    league auto file with "league": "NCAAF" is a season member held while any
-    game on ESPN's college-football board is live, out for good from its
-    "until" day; the new-series pass never enrolls a KXNCAAF series."""
+class TestLeagueCollege(_LeagueAutoFixture):
+    """College football and basketball in the league family (Jack 2026-11-18:
+    "add college football and college basketball to the family that has
+    NBA, WNBA, MLB, and NHL"), after the first member went in by hand (Jack
+    2026-11-17: "quote KXNCAAFTOPSEED-27T4, but not when college football
+    games are live"): a season member is held while any game on its league's
+    ESPN board is live, an NCAAF one through the CFP rankings shows (Jack
+    2026-11-18: "Yes, add that hold"), and a hand "until" ends one."""
 
     T = "KXNCAAFTOPSEED-67T4-OSU"
     ENTRY = {"league": "NCAAF", "kind": "season", "size": "pilot",
              "title": "College Football Playoff: Top 4 Seeds"}
 
-    def test_the_loader_takes_hand_season_members_only(self):
-        self.assertIsNone(imm.series_league("KXNCAAFTOPSEED"))       # never auto
+    @staticmethod
+    def _se(tag, contract="NCAAF", title="t"):
+        return {"category": "Sports", "tags": [tag], "title": title,
+                "contract_url": f"https://kalshi.example/{contract}.pdf"}
+
+    def test_the_prefixes_and_the_enrollment(self):
+        sl = imm.series_league
+        self.assertEqual([sl(s) for s in ("KXNCAAFTOPSEED", "KXNCAAMBTEAMSQUAL",
+                                          "KXNCAABBIG10", "KXNCAAMSEC", "KXNCAAWBCONFSTREAK")],
+                         ["NCAAF", "NCAAB", "NCAAB", "NCAAB", "NCAAWB"])
+        self.assertIsNone(sl("KXNCAAWVMATCH"))                           # volleyball
+        import imm_earnings_overrides as ieo
+        e, why = ieo.league_auto_entry_for(None, "KXNCAAFUNDEFEATED",
+                                           "KXNCAAFUNDEFEATED-26-OSU",
+                                           self._se("Football", "NCAAFUNDEFEATED"))
+        self.assertEqual((e["league"], e["kind"]), ("NCAAF", "season"), why)
+        e, why = ieo.league_auto_entry_for(None, "KXNCAAMBTEAMSQUAL",
+                                           "KXNCAAMBTEAMSQUAL-27F4-DUKE",
+                                           self._se("Basketball", "NCAAMBTEAMSMAKEROUND"))
+        self.assertEqual((e["league"], e["kind"]), ("NCAAB", "season"), why)
+        e, why = ieo.league_auto_entry_for(None, "KXNCAAWBCONFSTREAK",
+                                           "KXNCAAWBCONFSTREAK-27-UCONN",
+                                           self._se("Basketball", "UCONNBIGEASTSTREAK"))
+        self.assertEqual((e["league"], e["kind"]), ("NCAAWB", "season"), why)
+        e, why = ieo.league_auto_entry_for(None, "KXNCAAFGAME", "KXNCAAFGAME-26NOV21OSUMICH-OSU",
+                                           self._se("Football", "FOOTBALLGAMEWIN"))
+        self.assertEqual((e["league"], e["kind"], e["buffer_min"]),
+                         ("NCAAF", "game", imm.LEAGUE_AUTO_GAME_BUFFER_MIN), why)
+        refused = [
+            ("KXNCAABBGAME", "KXNCAABBGAME-26MAY01LSUTEX-LSU", self._se("Baseball", "BASEBALLGAMEWIN")),
+            ("KXNCAAMLAXGAME", "KXNCAAMLAXGAME-27-X", self._se("Lacrosse", "ACHIEVEMENTS")),
+            ("KXNCAAFTRANSFER", "KXNCAAFTRANSFER-26-X", self._se("Football", "TRANSFERSCHOOL")),
+            ("KXNCAAFDELAY", "KXNCAAFDELAY-26-X", self._se("Football", "WEATHERDELAYSPORTS")),
+            ("KXNCAAFDRAFTDECLARE", "KXNCAAFDRAFTDECLARE-26-X", self._se("Football", "ENTITYOUTCOME")),
+            ("KXNCAABACKPAY", "KXNCAABACKPAY-26-X", self._se("Basketball", "ENTITYOUTCOME")),
+            ("KXNCAAFCS", "KXNCAAFCS-26-X", self._se("Football", "NCAAF")),            # FCS
+            ("KXNCAAFAPRANK", "KXNCAAFAPRANK-26NOV22-OSU", self._se("Football", "SPORTAPPOLL"))]
+        for s, sample, se in refused:
+            e, why = ieo.league_auto_entry_for(None, s, sample, se)
+            self.assertIsNone(e, (s, e))
+        # the basketball boards ask for every D-I game, football's default is FBS
+        self.assertEqual(imm.espn_board_qs("basketball/mens-college-basketball"),
+                         "&groups=50&limit=500")
+        self.assertEqual(imm.espn_board_qs("basketball/womens-college-basketball"),
+                         "&groups=50&limit=500")
+        self.assertEqual(imm.espn_board_qs("football/college-football"), "")
+        self.assertEqual(imm.espn_board_qs("basketball/nba"), "")
+
+    def test_the_loader_and_a_hand_until(self):
         self.assertEqual(self._write({
             "KXNCAAFTOPSEED": dict(self.ENTRY, until="2067-12-06"),
-            "KXNCAAFGAME": {"league": "NCAAF", "kind": "game"},        # season only
-            "KXNCAAFNOLEAGUE": {"kind": "season"},                    # no league named
-            "KXNFLTOPSEED": {"league": "NCAAF", "kind": "season"},     # not KXNCAAF
-            "KXNCAAFBADDAY": dict(self.ENTRY, until="Dec 6")}), 1)     # no usable end
-        self.assertEqual(set(imm.LEAGUE_AUTO_SERIES), {"KXNCAAFTOPSEED"})
+            "KXNCAAFGAME": {"league": "NCAAF", "kind": "game"},
+            "KXNCAAMBTEAMSQUAL": {"league": "NCAAB", "kind": "season"},
+            "KXNFLTOPSEED": {"league": "NCAAF", "kind": "season"},     # not a college name
+            "KXNCAAFBADDAY": dict(self.ENTRY, until="Dec 6")}), 3)     # no usable end
+        self.assertEqual(set(imm.LEAGUE_AUTO_SERIES),
+                         {"KXNCAAFTOPSEED", "KXNCAAFGAME", "KXNCAAMBTEAMSQUAL"})
         e = imm.LEAGUE_AUTO_SERIES["KXNCAAFTOPSEED"]
         self.assertEqual((e["league"], e["kind"], e["until"]), ("NCAAF", "season", "2067-12-06"))
         self.assertEqual(datetime.fromtimestamp(e["until_ts"], timezone.utc),
@@ -25445,18 +25495,108 @@ class TestLeagueHandNcaaf(_LeagueAutoFixture):
         self.assertTrue(ov.safe_join)
         self.assertEqual(ov.size_mult, imm.LEAGUE_AUTO_SIZE_MULT)
         self.assertIsNone(ov.start_buffer_min)                           # no cutoff
-        import imm_earnings_overrides as ieo
-        entry, why = ieo.league_auto_entry_for(
-            None, "KXNCAAFTOPSEED", self.T,
-            {"category": "Sports", "tags": ["Football"], "title": "CFP top 4"})
-        self.assertIsNone(entry)
-        self.assertIn("not an NBA", why)
+
+    def test_the_cfp_shows(self):
+        w = imm._parse_et_windows("2067-11-22 19:30-20:00")
+        self.assertEqual(datetime.fromtimestamp(w[0][0], timezone.utc),
+                         datetime(2067, 11, 23, 0, 30, tzinfo=timezone.utc))
+        with self.assertRaises(ValueError):
+            imm._parse_et_windows("2067-11-22 20:00-19:30")
+        with self.assertRaises(ValueError):
+            imm._parse_et_windows("Nov 22 7:30pm")
+        a, b = w[0][0], w[0][1]
+        with mock.patch.object(imm, "CFP_SHOWS", w):
+            self.assertEqual(imm.cfp_show_hold(a - 31 * 60), "")
+            self.assertIn("CFP rankings show", imm.cfp_show_hold(a - 29 * 60))
+            self.assertIn("CFP rankings show", imm.cfp_show_hold(b + 29 * 60))
+            self.assertEqual(imm.cfp_show_hold(b + 31 * 60), "")
+        # the shipped schedule parses, Selection Day last
+        self.assertEqual(imm.CFP_SHOWS[-1][2], "2026-12-06 12:00-15:00")
+
+    def test_a_cfp_show_holds_football_season_members_only(self):
+        self._write({"KXNCAAFTOPSEED": dict(self.ENTRY),
+                     "KXNCAAMBTEAMSQUAL": {"league": "NCAAB", "kind": "season"}})
+        bb = "KXNCAAMBTEAMSQUAL-67F4-DUKE"
+        bot = self._bot([self.T, bb], close="2068-01-10T00:00:00Z")
+        self.boards["/college-football/"] = {"events": []}
+        self.boards["/mens-college-basketball/"] = {"events": []}
+        now = time.time()
+        live = ((now - 600, now + 600, "2067-11-22 19:30-20:00"),)
+        with mock.patch.object(imm, "CFP_SHOWS", ()):
+            bot.run_cycle()
+        self.assertEqual(self._sides(bot, self.T), {"bid", "ask"})
+        self.assertEqual(self._sides(bot, bb), {"bid", "ask"})
+        self.assertTrue(any("/mens-college-basketball/scoreboard" in u and "groups=50" in u
+                            for u in self.urls), self.urls)
+        bot._mlb_get_cache.clear()
+        with mock.patch.object(imm, "CFP_SHOWS", live):
+            bot.run_cycle()
+        self.assertEqual(self._sides(bot, self.T), set())              # the show
+        self.assertEqual(self._sides(bot, bb), {"bid", "ask"})          # basketball quotes on
+
+    @staticmethod
+    def _game(state, start, gid, away, home):
+        return {"id": gid, "shortName": f"{away} @ {home}",
+                "date": start.strftime("%Y-%m-%dT%H:%MZ"),
+                "status": {"type": {"state": state, "detail": "Q2", "completed": state == "post",
+                                    "name": {"in": "STATUS_IN_PROGRESS", "post": "STATUS_FINAL",
+                                             "pre": "STATUS_SCHEDULED"}[state]}},
+                "competitions": [{"competitors": [{"team": {"abbreviation": away}},
+                                                  {"team": {"abbreviation": home}}]}]}
+
+    @staticmethod
+    def _teams(*abbrs):
+        return {"sports": [{"leagues": [{"teams": [{"team": {"abbreviation": a}}
+                                                   for a in abbrs]}]}]}
+
+    def test_a_teams_member_holds_only_on_its_teams_games(self):
+        # (Jack 2026-11-18: "KXNCAAFTOPSEED-27T4 shouldnt holdout during any
+        # college game, but only games that involve one of the teams listed")
+        self._write({"KXNCAAFTOPSEED": dict(self.ENTRY, teams=True)})
+        self.assertTrue(imm.LEAGUE_AUTO_SERIES["KXNCAAFTOPSEED"]["teams"])
+        ind = "KXNCAAFTOPSEED-67T4-IND"                      # ESPN's IU (an alias)
+        bot = self._bot([self.T, ind], close="2068-01-10T00:00:00Z")
+        now = datetime.now(timezone.utc)
+        boards = {"/college-football/teams": self._teams("OSU", "IU", "NEB", "BALL", "OHIO", "PUR"),
+                  "/college-football/": {"events": []}}
+        boards.update(self.boards)
+        self.boards = boards
+        _no_shows = mock.patch.object(imm, "CFP_SHOWS", ())
+        _no_shows.start()
+        self.addCleanup(_no_shows.stop)
+
+        def cycle(*games):
+            self.boards["/college-football/"] = {"events": list(games)}
+            bot._mlb_get_cache.clear()
+            bot.run_cycle()
+            return self._sides(bot, self.T), self._sides(bot, ind)
+        both = ({"bid", "ask"}, {"bid", "ask"})
+        self.assertEqual(cycle(), both)
+        self.assertEqual(imm.EVENT_PROGRAMMED_SUFFIXES["KXNCAAFTOPSEED-67T4"],
+                         frozenset({"OSU", "IND"}))
+        hour_ago = now - timedelta(hours=1)
+        self.assertEqual(cycle(self._game("in", hour_ago, "1", "BALL", "OHIO")), both)  # not ours
+        self.assertEqual(cycle(self._game("in", hour_ago, "2", "PUR", "IU")), (set(), set()))
+        self.assertEqual(cycle(self._game("in", hour_ago, "3", "OSU", "NEB")), (set(), set()))
+        # a code ESPN does not carry: every game holds it (fail closed), logged
+        self.boards["/college-football/teams"] = self._teams("OSU", "NEB", "BALL", "OHIO")
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            got = cycle(self._game("in", hour_ago, "1", "BALL", "OHIO"))
+        self.assertEqual(got, (set(), set()))
+        self.assertTrue(any("codes not on ESPN's team list: IU" in s for s in lines), lines)
+        # ...and an unreadable team list too
+        self.boards["/college-football/teams"] = RuntimeError("espn down")
+        self.assertEqual(cycle(self._game("in", hour_ago, "1", "BALL", "OHIO")), (set(), set()))
 
     def test_out_while_any_college_game_is_live_and_from_its_last_day(self):
         self._write({"KXNCAAFTOPSEED": dict(self.ENTRY, until="2067-12-06")})
         bot = self._bot([self.T], close="2068-01-10T00:00:00Z")
         now = datetime.now(timezone.utc)
         self.boards["/college-football/"] = {"events": []}
+        _no_shows = mock.patch.object(imm, "CFP_SHOWS", ())
+        _no_shows.start()
+        self.addCleanup(_no_shows.stop)
 
         def cycle():
             bot._mlb_get_cache.clear()

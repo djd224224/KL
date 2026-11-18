@@ -1239,12 +1239,28 @@ def nfl_auto_notify(additions: dict) -> None:
 # or has hand-set rules (incentive_mm.league_hand_configured). Every
 # enrollment is emailed (league_auto_notify).
 LEAGUE_AUTO_WHY = "league auto family"
+# (COLLEGE FOOTBALL AND BASKETBALL, Jack 2026-11-18: "add college football and
+# college basketball to the family that has NBA, WNBA, MLB, and NHL". The tag
+# is what keeps KXNCAAB college baseball and KXNCAAM lacrosse / soccer /
+# wrestling out -- incentive_mm.LEAGUE_AUTO_PREFIXES.)
 LEAGUE_AUTO_TAGS = {"NBA": "Basketball", "WNBA": "Basketball", "MLB": "Baseball",
-                    "NHL": "Hockey"}
+                    "NHL": "Hockey", "NCAAF": "Football", "NCAAB": "Basketball",
+                    "NCAAWB": "Basketball"}
 LEAGUE_AUTO_OFFFIELD_CONTRACTS = NFL_AUTO_OFFFIELD_CONTRACTS | frozenset({
-    "FRANCHISECOST", "SPORTSTEAMSOLD", "BBALLWHATTEND"})
+    "FRANCHISECOST", "SPORTSTEAMSOLD", "BBALLWHATTEND",
+    # college: transfers, realignment, coaching, weather delays, whether games
+    # happen, playoff expansion (Kalshi's 11/18 contract names)
+    "TRANSFERSCHOOL", "CONFERENCEREALIGNMENT", "JOINCONFERENCE", "EVENTCONFIRMED",
+    "WEATHERDELAYSPORTS", "SPORTEVENTOCCUR", "NEXTCOACH", "NEXTCOACHNCAAMB",
+    "NCAAFCOACHLEAVE", "NCAAFCOACHOUT"})
 LEAGUE_AUTO_OFFFIELD_WORDS = NFL_AUTO_OFFFIELD_WORDS + (
-    "FRANCHISE", "SALE", "SOLD", "ATTEND", "EXPANSION", "RELOCAT", "ROSTER")
+    "FRANCHISE", "SALE", "SOLD", "ATTEND", "EXPANSION", "RELOCAT", "ROSTER",
+    "TRANSFER", "BACKPAY", "DECLARE", "CONFLEAVE", "JOINCONF", "EXPAND", "DELAY",
+    "OCCUR")
+# a college football series of another division (FCS, Division III): ESPN's
+# college-football board carries FBS games, not theirs, so the live rule
+# could not hold them
+COLLEGE_OTHER_DIVISION_WORDS = ("FCS", "D3")
 # incentive_mm.EventStartResolver._espn_game_start's game segment
 _LEAGUE_GAME_SEG_RE = re.compile(r"^\d{2}[A-Z]{3}\d{2}[A-Z]{4,10}$")
 
@@ -1341,7 +1357,7 @@ def league_auto_entry_for(client, series: str, sample: str, se: dict):
             and "Esports" in (se.get("tags") or []):
         return esports_entry_for(series, sample, se)
     if league is None:
-        return None, "not an NBA / WNBA / MLB / NHL series"
+        return None, "not an NBA / WNBA / MLB / NHL / college football / basketball series"
     if imm.league_hand_configured(series):
         return None, ("hand-configured family (ladder / escalator, MLB MVP, "
                       "mentions or the exact sports allowlist)")
@@ -1350,10 +1366,20 @@ def league_auto_entry_for(client, series: str, sample: str, se: dict):
         return None, f"Kalshi category {se.get('category')!r}, tags {se.get('tags')!r}"
     contract = str(se.get("contract_url") or "").rsplit("/", 1)[-1].replace(".pdf", "")
     rest = series[len(_league_prefix(series)):]
+    if league in imm.COLLEGE_LEAGUES:
+        # the words read past "KXNCAA": KXNCAABACKPAY's prefix KXNCAAB would
+        # leave "ACKPAY"
+        rest = series[len("KXNCAA"):]
     if contract in LEAGUE_AUTO_OFFFIELD_CONTRACTS \
             or any(w in rest for w in LEAGUE_AUTO_OFFFIELD_WORDS):
         return None, f"off-field ({contract or 'by name'})"
+    if league == "NCAAF" and any(w in rest for w in COLLEGE_OTHER_DIVISION_WORDS):
+        return None, "another division (ESPN's college-football board is FBS)"
     game = league_game_event(sample)
+    if not game and league in imm.COLLEGE_LEAGUES and imm.parse_event_date(sample) is not None:
+        # a dated college event the game shape does not read (a long team
+        # code, a weekly poll): no cutoff a season member's rules would trust
+        return None, "a dated college event that is not one game's shape"
     title = str(se.get("title") or "")
     entry = {"league": league, "kind": "game" if game else "season",
              "size": "pilot", "title": title, "contract": contract,

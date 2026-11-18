@@ -3430,17 +3430,27 @@ SHARE_EVENT_CAP = _env_float("IMM_SHARE_EVENT_CAP", 100)
 # programs read (note_programmed): a fair-lead family's event room is
 # FAIR_LEAD_EVENT_PER_MARKET a market (2026-10-31)
 EVENT_PROGRAMMED_N: Dict[str, int] = {}
+# ...and their last ticker segments (a league "teams" member's team codes,
+# league_event_teams, 2026-11-18)
+EVENT_PROGRAMMED_SUFFIXES: Dict[str, frozenset] = {}
 
 
 def note_programmed(tickers) -> None:
     """Count each event's programmed markets from the programs feed's market
     tickers (an event is its market's ticker less the last segment)."""
     counts: Dict[str, int] = {}
+    sufs: Dict[str, set] = {}
     for t in tickers:
-        ev = t.rsplit("-", 1)[0]
+        ev, _, suf = t.rpartition("-")
+        if not ev:
+            ev, suf = t, ""
         counts[ev] = counts.get(ev, 0) + 1
+        if suf:
+            sufs.setdefault(ev, set()).add(suf)
     EVENT_PROGRAMMED_N.clear()
     EVENT_PROGRAMMED_N.update(counts)
+    EVENT_PROGRAMMED_SUFFIXES.clear()
+    EVENT_PROGRAMMED_SUFFIXES.update({k: frozenset(v) for k, v in sufs.items()})
 
 
 def event_cap_contracts(event_ticker: str) -> float:
@@ -6929,8 +6939,17 @@ ESPN_LEAGUE_PATHS = {
     "NCAAF": "football/college-football", "CFB": "football/college-football",
     "NCAAB": "basketball/mens-college-basketball",
     "CBB": "basketball/mens-college-basketball", "MLS": "soccer/usa.1",
+    "NCAAWB": "basketball/womens-college-basketball",
 }
 ESPN_SITE_API = "https://site.web.api.espn.com/apis/site/v2/sports"
+
+
+def espn_board_qs(path: str) -> str:
+    """The query a scoreboard read adds past its date: every D-I game on a
+    college basketball board (groups=50 -- the default board carries only
+    the ranked teams' games: 11 of 68 men's on 11/17), else nothing (the
+    college-football default is already every FBS game)."""
+    return "&groups=50&limit=500" if path.endswith("college-basketball") else ""
 
 
 def series_pattern_allowed(series: str) -> bool:
@@ -7383,19 +7402,22 @@ def nfl_live_verdict(get_json, now_ts: float,
 
 def espn_live_verdict(league: str, get_json, now_ts: float,
                       final_seen: Dict[str, float], cooldown_min: float,
-                      over_after_h: float, start_word: str
+                      over_after_h: float, start_word: str,
+                      teams: Optional[Set[str]] = None
                       ) -> Tuple[Optional[bool], str]:
     """nfl_live_verdict for any ESPN_LEAGUE_PATHS league: live while a game
     is past its scheduled start and not final, or final less than
     `cooldown_min` ago (a final that started over `over_after_h` hours ago is
-    long over); None when the scoreboard cannot be read."""
+    long over); None when the scoreboard cannot be read. With `teams` (ESPN
+    abbreviations, upper case), only a game one of them plays counts."""
     now = datetime.fromtimestamp(now_ts, timezone.utc)
     et = now.astimezone(ET)
     days = [et.date()] + ([et.date() - timedelta(days=1)] if et.hour < 4 else [])
     for d in days:
         try:
             data = get_json(f"{ESPN_SITE_API}/{ESPN_LEAGUE_PATHS[league]}/"
-                            f"scoreboard?dates={d.strftime('%Y%m%d')}")
+                            f"scoreboard?dates={d.strftime('%Y%m%d')}"
+                            f"{espn_board_qs(ESPN_LEAGUE_PATHS[league])}")
         except Exception as e:                       # noqa: BLE001
             return None, f"{league} scoreboard unreadable ({type(e).__name__})"
         for ev in (data or {}).get("events") or []:
@@ -7403,6 +7425,11 @@ def espn_live_verdict(league: str, get_json, now_ts: float,
             name, state = str(st.get("name") or ""), str(st.get("state") or "")
             if name in ("STATUS_POSTPONED", "STATUS_CANCELED", "STATUS_CANCELLED"):
                 continue
+            if teams is not None:
+                comps = (ev.get("competitions") or [{}])[0].get("competitors") or []
+                if not teams & {str((c.get("team") or {}).get("abbreviation") or "").upper()
+                                for c in comps}:
+                    continue                     # none of the member's teams plays
             kick = parse_iso_utc(ev.get("date", ""))
             short = ev.get("shortName") or ev.get("id") or "game"
             if state == "in":
@@ -7541,33 +7568,99 @@ def mlb_rounds_decided(board) -> Dict[str, str]:
 # IMM_LEAGUE_AUTO_ENABLE=0 takes every member out; positions ride.
 LEAGUE_AUTO_ENABLE = os.environ.get("IMM_LEAGUE_AUTO_ENABLE", "1") == "1"
 LEAGUE_AUTO_FILE = "league_auto_series.json"              # in STATUS_DIR
-# series prefix -> league (KXNBA does not prefix KXWNBA: the W comes first)
+# series prefix -> league (KXNBA does not prefix KXWNBA: the W comes first).
+# COLLEGE FOOTBALL AND BASKETBALL (Jack 2026-11-18: "add college football and
+# college basketball to the family that has NBA, WNBA, MLB, and NHL"):
+# KXNCAAF -> NCAAF; men's basketball is KXNCAAMB, KXNCAAB (the conference
+# tournaments: KXNCAABACC, KXNCAABBIG10) and KXNCAAM (KXNCAAMSEC) -> NCAAB;
+# women's is KXNCAAWB -> NCAAWB. KXNCAAB also prefixes college BASEBALL
+# (KXNCAABBGAME, KXNCAABASEBALL) and KXNCAAM lacrosse, soccer and wrestling,
+# so the enrollment's Kalshi tag check (LEAGUE_AUTO_TAGS: Football /
+# Basketball) is what keeps them out. The live rule reads ESPN's
+# college-football board (every FBS game, FBS-v-FCS included: 55 on
+# Saturday 11/14 -- and the weeknight MAC games) and the college basketball
+# boards with groups=50 (every D-I game: 68 men's / 46 women's on 11/17,
+# where the default board carries the ranked teams' 11 / 6; espn_board_qs).
 LEAGUE_AUTO_PREFIXES = {"KXNBA": "NBA", "KXWNBA": "WNBA", "KXMLB": "MLB",
-                        "KXNHL": "NHL"}
+                        "KXNHL": "NHL", "KXNCAAF": "NCAAF", "KXNCAAMB": "NCAAB",
+                        "KXNCAAB": "NCAAB", "KXNCAAM": "NCAAB", "KXNCAAWB": "NCAAWB"}
+COLLEGE_LEAGUES = frozenset({"NCAAF", "NCAAB", "NCAAWB"})
 LEAGUE_AUTO_GAME_BUFFER_MIN = _env_int("IMM_LEAGUE_AUTO_GAME_BUFFER_MIN", 90)
 LEAGUE_AUTO_SIZE_MULT = _env_float("IMM_LEAGUE_AUTO_SIZE_MULT", NFL_AUTO_SIZE_MULT)
 LEAGUE_AUTO_DAILY_LOSS_LIMIT = _env_float("IMM_LEAGUE_AUTO_DAILY_LOSS_LIMIT", 100)  # per event
 LEAGUE_LIVE_COOLDOWN_MIN = _env_int("IMM_LEAGUE_LIVE_COOLDOWN_MIN", 15)
 LEAGUE_LIVE_TTL_SECS = _env_int("IMM_LEAGUE_LIVE_TTL_SECS", 60)
-# HAND-ENROLLED LEAGUES (Jack 2026-11-17: "quote KXNCAAFTOPSEED-27T4, but not
-# when college football games are live"). A league here rides the season
-# members' rules -- out while any game of it is live on its ESPN board, plus
-# LEAGUE_LIVE_COOLDOWN_MIN after a final; a board that cannot be read counts
-# as live -- but only for a series named in LEAGUE_AUTO_FILE by hand with
-# that "league" (season members only). series_league never returns it, so
-# the new-series pass (imm_earnings_overrides.enroll_new_series) enrolls no
-# series of it. NCAAF reads ESPN's default college-football board: every FBS
-# game, FBS-v-FCS included (55 on Saturday 11/14), and the weeknight MAC
-# games (three live on Tuesday 11/17). A member's "until" (YYYY-MM-DD) puts
-# it out for good from 00:00 ET that day -- the CFP top-seed event's is
-# Selection Day, 2026-12-06 (the final rankings and bracket, noon ET), which
-# Kalshi's dates (occurrence 2027-01-31, a placeholder) do not carry.
-LEAGUE_HAND_PREFIXES = {"NCAAF": "KXNCAAF"}
+# A member's "until" (YYYY-MM-DD, by hand in LEAGUE_AUTO_FILE) puts it out
+# for good from 00:00 ET that day (Jack 2026-11-17: "quote KXNCAAFTOPSEED-27T4,
+# but not when college football games are live"): the CFP top-seed event's
+# is Selection Day, 2026-12-06, which Kalshi's dates (occurrence 2027-01-31,
+# a placeholder) do not carry.
+# THE CFP RANKINGS SHOWS (Jack 2026-11-18: "Yes, add that hold", to "Also
+# hold the top-seed markets through the Tuesday CFP rankings shows?"): every
+# NCAAF season member stands aside from CFP_SHOW_PRE_MIN before each of the
+# committee's rankings shows to CFP_SHOW_POST_MIN after it -- the reveals
+# that move the playoff, seed and champion markets, with no game live to
+# hold them (the 11/17 9pm show happened to fall inside three MAC games).
+# The 2026 schedule (ET, the CFP's August release); Selection Day's final
+# rankings and bracket are the last. IMM_CFP_SHOWS_ET (same format) replaces
+# it; "" turns the hold off.
+_CFP_SHOWS_DEFAULT = ("2026-11-17 21:00-21:30,2026-11-24 19:30-20:00,"
+                      "2026-12-01 19:00-19:30,2026-12-06 12:00-15:00")
+CFP_SHOW_PRE_MIN = _env_int("IMM_CFP_SHOW_PRE_MIN", 30)
+CFP_SHOW_POST_MIN = _env_int("IMM_CFP_SHOW_POST_MIN", 30)
+# THE EVENT'S OWN TEAMS (Jack 2026-11-18: "KXNCAAFTOPSEED-27T4 shouldnt
+# holdout during any college game, but only games that involve one of the
+# teams listed"). A season member with "teams": true in LEAGUE_AUTO_FILE is
+# held only while a game one of its event's teams plays is live -- the teams
+# being its event's programmed markets' last ticker segments
+# (EVENT_PROGRAMMED_SUFFIXES: OSU, TEX, ND ... the 52 of the top-seed event),
+# read as ESPN abbreviations through LEAGUE_TEAM_ALIASES. It FAILS CLOSED to
+# every game of the league when its event has no programmed markets read, a
+# code is not an abbreviation on ESPN's team list (LEAGUE_TEAMS_TTL_SECS), or
+# that list cannot be read. On 11/18, 45 of the 52 codes were ESPN's own; the
+# other 7 are the aliases below.
+LEAGUE_TEAM_ALIASES: Dict[str, Dict[str, str]] = {
+    "NCAAF": {"IND": "IU", "TXAM": "TA&M", "OKLA": "OU", "MIZZ": "MIZ", "SCAR": "SC",
+              "NCST": "NCSU", "MOH": "M-OH"}}
+LEAGUE_TEAMS_TTL_SECS = _env_int("IMM_LEAGUE_TEAMS_TTL_SECS", 6 * 3600)
+
+
+def _parse_et_windows(spec: str) -> Tuple[Tuple[float, float, str], ...]:
+    """'YYYY-MM-DD HH:MM-HH:MM,...' (ET) -> ((start_ts, end_ts, label), ...);
+    a part that does not parse raises (a bad schedule must not quote)."""
+    out = []
+    for part in (p.strip() for p in spec.split(",") if p.strip()):
+        m = re.fullmatch(r"(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})-(\d{2}):(\d{2})", part)
+        if not m:
+            raise ValueError(f"bad ET window: {part!r}")
+        day = datetime.strptime(m.group(1), "%Y-%m-%d")
+        a = ET.localize(day.replace(hour=int(m.group(2)), minute=int(m.group(3))))
+        b = ET.localize(day.replace(hour=int(m.group(4)), minute=int(m.group(5))))
+        if b <= a:
+            raise ValueError(f"ET window ends before it starts: {part!r}")
+        out.append((a.timestamp(), b.timestamp(), part))
+    return tuple(out)
+
+
+CFP_SHOWS = _parse_et_windows(os.environ.get("IMM_CFP_SHOWS_ET", _CFP_SHOWS_DEFAULT))
+
+
+def cfp_show_hold(now_ts: float) -> str:
+    """Why an NCAAF season member sits out for a CFP rankings show now ('' =
+    it does not): inside a show, padded CFP_SHOW_PRE_MIN / CFP_SHOW_POST_MIN."""
+    for a, b, label in CFP_SHOWS:
+        if a - CFP_SHOW_PRE_MIN * 60 <= now_ts < b + CFP_SHOW_POST_MIN * 60:
+            return (f"CFP rankings show {label} ET (out {CFP_SHOW_PRE_MIN}m before "
+                    f"to {CFP_SHOW_POST_MIN}m after)")
+    return ""
+
+
 # a final that started this long ago is long over (MLB: extra innings)
 LEAGUE_GAME_OVER_AFTER_H = {"NBA": 4.0, "WNBA": 4.0, "MLB": MLB_GAME_OVER_AFTER_H,
-                            "NHL": 4.0, "NCAAF": 5.0}
+                            "NHL": 4.0, "NCAAF": 5.0, "NCAAB": 3.5, "NCAAWB": 3.5}
 LEAGUE_START_WORD = {"NBA": "tip-off", "WNBA": "tip-off", "MLB": "first pitch",
-                     "NHL": "puck drop", "NCAAF": "kickoff"}
+                     "NHL": "puck drop", "NCAAF": "kickoff", "NCAAB": "tip-off",
+                     "NCAAWB": "tip-off"}
 LEAGUE_DECIDED_ROUNDS = frozenset({"NBA Finals", "WNBA Finals", "World Series",
                                    "ALCS", "NLCS", "Stanley Cup Final"})
 LEAGUE_AUTO_BUDGET_PREFIX = "LEAGUEAUTO:"
@@ -7639,8 +7732,10 @@ def league_auto_path() -> str:
 
 
 def series_league(series: str) -> Optional[str]:
-    """'KXWNBAFINALSMVP' -> 'WNBA', 'KXMLBPLAYOFFHRS' -> 'MLB'; None for any
-    series outside the three leagues."""
+    """'KXWNBAFINALSMVP' -> 'WNBA', 'KXMLBPLAYOFFHRS' -> 'MLB',
+    'KXNCAAFTOPSEED' -> 'NCAAF'; None for any series outside the leagues
+    (LEAGUE_AUTO_PREFIXES; a KXNCAAB baseball series reads NCAAB here -- the
+    enrollment's tag check refuses it)."""
     for prefix, league in LEAGUE_AUTO_PREFIXES.items():
         if series.startswith(prefix):
             return league
@@ -7824,9 +7919,6 @@ def load_league_auto_series() -> int:
         if league is None and e.get("league") in ESPORTS_LEAGUES \
                 and s_.startswith("KX") and not s_.startswith("KXNFL"):
             league = e["league"]          # esports: the enrollment read the title
-        if league is None and e.get("league") in LEAGUE_HAND_PREFIXES \
-                and s_.startswith(LEAGUE_HAND_PREFIXES[e["league"]]):
-            league = e["league"]          # a hand-enrolled league (never auto)
         if league is None:
             continue
         if e.get("league") not in (None, league):
@@ -7840,12 +7932,11 @@ def load_league_auto_series() -> int:
             log(f"[IMM] ! refused hand-configured family in league auto: {s_}")
             continue
         kind, size = e.get("kind"), e.get("size") or "pilot"
-        if (league in ESPORTS_LEAGUES or league in LEAGUE_HAND_PREFIXES) \
-                and kind != "season":
+        if league in ESPORTS_LEAGUES and kind != "season":
             log(f"[IMM] ! league auto {s_}: {league} quotes season members only, skipped")
             continue
-        # "until": out for good from 00:00 ET that day (LEAGUE_HAND_PREFIXES);
-        # a date that does not parse skips the member (no end = no quotes)
+        # "until": out for good from 00:00 ET that day; a date that does not
+        # parse skips the member (no end = no quotes)
         until = str(e.get("until") or "").strip() or None
         until_ts = None
         if until is not None:
@@ -7873,6 +7964,8 @@ def load_league_auto_series() -> int:
                      "title": str(e.get("title") or "")}
         if until_ts is not None:
             fresh[s_].update(until=until, until_ts=until_ts)
+        if kind == "season" and e.get("teams") is True:
+            fresh[s_]["teams"] = True     # THE EVENT'S OWN TEAMS
     for s_ in _league_auto_state["installed"] - set(fresh):
         SERIES_OVERRIDES.pop(s_, None)
     for s_, e in fresh.items():
@@ -23339,7 +23432,7 @@ class EventStartResolver:
         for k in range(max(0, int(window_days)) + 1):
             day = et_date + timedelta(days=k)
             data = self._get(f"{ESPN_SITE_API}/{path}/scoreboard"
-                             f"?dates={day.strftime('%Y%m%d')}")
+                             f"?dates={day.strftime('%Y%m%d')}{espn_board_qs(path)}")
             starts = []
             for ev in (data or {}).get("events", []):
                 status = ((ev.get("status") or {}).get("type") or {}).get("name", "")
@@ -29417,6 +29510,7 @@ class IncentiveMarketMaker:
         # share the MLB MVPs' per-URL cache (_mlb_get)
         self._league_decided: Dict[str, Dict[str, str]] = {}
         self._league_final_seen: Dict[str, Dict[str, float]] = {}
+        self._league_teams_noted: Set[str] = set()     # (THE EVENT'S OWN TEAMS fallbacks)
         self._league_stood_series: Set[str] = set()
         # league game members' team-news holds, logged per event (2026-10-22)
         self._league_news_stood: Set[str] = set()
@@ -39801,17 +39895,22 @@ class IncentiveMarketMaker:
 
     def _league_auto_hold(self, series: str, now_ts: float, ticker: str = "") -> str:
         """Why a league auto family SEASON member sits out now ('' =
-        quote): past its "until" day (a hand-enrolled league's end,
-        LEAGUE_HAND_PREFIXES), its deciding round ("decided_by") decided on
-        its league's ESPN boards -- today's and the MLB_DECIDED_LOOKBACK_DAYS
-        before it, sticky for the process -- or any game of its league live
-        (espn_live_verdict). An unreadable board holds it too (fail
-        closed). See LEAGUE_AUTO_ENABLE."""
+        quote): past its "until" day (a hand-set end), an NCAAF member inside
+        a CFP rankings show (cfp_show_hold), its deciding round
+        ("decided_by") decided on its league's ESPN boards -- today's and the
+        MLB_DECIDED_LOOKBACK_DAYS before it, sticky for the process -- or any
+        game of its league live (espn_live_verdict). An unreadable board
+        holds it too (fail closed). See LEAGUE_AUTO_ENABLE."""
         e = league_auto_entry(series) or {}
         league = e.get("league") or series_league(series) or ""
-        # a hand entry's last day (LEAGUE_HAND_PREFIXES): out for good from it
+        # a hand-set last day: out for good from it
         if e.get("until_ts") is not None and now_ts >= float(e["until_ts"]):
             return f"past its last day ({e.get('until')}, 00:00 ET)"
+        # ...and college football's CFP rankings shows (THE CFP RANKINGS SHOWS)
+        if league == "NCAAF":
+            show = cfp_show_hold(now_ts)
+            if show:
+                return show
         if league == "LOL":
             return self._lol_hold(ticker or series, now_ts)
         path = ESPN_LEAGUE_PATHS.get(league)
@@ -39825,7 +39924,8 @@ class IncentiveMarketMaker:
                 if rnd in decided:
                     break
                 d = today - timedelta(days=k)
-                url = f"{ESPN_SITE_API}/{path}/scoreboard?dates={d.strftime('%Y%m%d')}"
+                url = (f"{ESPN_SITE_API}/{path}/scoreboard?dates={d.strftime('%Y%m%d')}"
+                       f"{espn_board_qs(path)}")
                 try:
                     board = self._mlb_get(url, now_ts,
                                           LEAGUE_LIVE_TTL_SECS if k <= 1 else 6 * 3600)
@@ -39838,14 +39938,49 @@ class IncentiveMarketMaker:
                             f"auto members tied to it stay out")
             if rnd in decided:
                 return f"{rnd} decided ({decided[rnd]})"
+        # THE EVENT'S OWN TEAMS: only their games, else (fail closed) every game
+        teams: Optional[Set[str]] = None
+        if e.get("teams"):
+            teams, t_why = self._league_event_teams(league, path, ticker, now_ts)
+            ev_key = ticker.rsplit("-", 1)[0] if ticker else series
+            if teams is None and ev_key not in self._league_teams_noted:
+                self._league_teams_noted.add(ev_key)
+                log(f"{self.tag} league teams {ev_key}: {t_why} -- held on every "
+                    f"{league} game instead")
         live, why = espn_live_verdict(
             league, lambda u: self._mlb_get(u, now_ts, LEAGUE_LIVE_TTL_SECS),
             now_ts, self._league_final_seen.setdefault(league, {}),
             LEAGUE_LIVE_COOLDOWN_MIN, LEAGUE_GAME_OVER_AFTER_H.get(league, 4.0),
-            LEAGUE_START_WORD.get(league, "the start"))
+            LEAGUE_START_WORD.get(league, "the start"), teams=teams)
         if live is not False:
             return why or f"{league} scoreboard unreadable"
         return ""
+
+    def _league_event_teams(self, league: str, path: str, ticker: str,
+                            now_ts: float) -> Tuple[Optional[Set[str]], str]:
+        """(ESPN abbreviations of `ticker`'s event's teams, '') for a "teams"
+        member (THE EVENT'S OWN TEAMS), else (None, why) -- no programmed
+        markets read, ESPN's team list unreadable, or a code ESPN does not
+        carry (the caller holds on every game)."""
+        ev = ticker.rsplit("-", 1)[0] if ticker else ""
+        codes = EVENT_PROGRAMMED_SUFFIXES.get(ev)
+        if not codes:
+            return None, "no programmed markets read for its event"
+        alias = LEAGUE_TEAM_ALIASES.get(league, {})
+        abbrs = {alias.get(c, c).upper() for c in codes}
+        try:
+            data = self._mlb_get(f"{ESPN_SITE_API}/{path}/teams?limit=1000", now_ts,
+                                 LEAGUE_TEAMS_TTL_SECS)
+        except Exception as ex:                          # noqa: BLE001
+            return None, f"ESPN {league} team list unreadable ({type(ex).__name__})"
+        known = {str(((t or {}).get("team") or {}).get("abbreviation") or "").upper()
+                 for sp in (data or {}).get("sports") or []
+                 for lg in sp.get("leagues") or []
+                 for t in lg.get("teams") or []}
+        unknown = sorted(abbrs - known)
+        if unknown:
+            return None, f"codes not on ESPN's team list: {', '.join(unknown)}"
+        return abbrs, ""
 
     def _lol_live(self, now_ts: float) -> List[dict]:
         """getLive's events, cached LEAGUE_LIVE_TTL_SECS; raises when unreadable."""
