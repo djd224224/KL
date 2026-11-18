@@ -180,6 +180,121 @@ class TestRows(unittest.TestCase):
         self.assertEqual(imm.awards_family_default("KXOSCARDIR-28"),
                          datetime(2028, 1, 20, 5, 0, tzinfo=timezone.utc))
 
+    def test_award_rows_take_a_reveal_sequence_and_extend_a_code_row(self):
+        # 2026-11-18 (REVEAL SEQUENCES): an award row may carry its reveals
+        # in order; a code row is extended by LATER reveals only
+        utc = lambda *a: datetime(*a, tzinfo=timezone.utc)
+        self.assertEqual(imm_rows.validate(
+            "award", "KXEMMYX-27", "2026-12-01+2027-01-10", "", ["a", "b"]), "")
+        self.assertIn("earliest first", imm_rows.validate(
+            "award", "KXEMMYX-27", "2027-01-10+2026-12-01", "", ["a", "b"]))
+        self.assertIn("bad date", imm_rows.validate(
+            "award", "KXEMMYX-27", "2026-12-01+Jan 10", "", ["a", "b"]))
+        self.assertIn("bad date", imm_rows.validate(
+            "election", "KXSTATELEG-LAHOUSE27", "2027-10-23+2027-11-02", "", ["a", "b"]))
+        # the 69th Grammy winners' code row ends at the Feb 7 ceremony; the
+        # nominations series' at Nov 16: only a later reveal may extend either
+        self.assertIn("only add LATER reveals", imm_rows.validate(
+            "award", "KXGRAMMY-BAMA69", "2027-01-15", "", ["a", "b"]))
+        self.assertEqual(imm_rows.validate(
+            "award", "KXGRAMMY-BAMA69", "2027-03-01", "", ["a", "b"]), "")
+        self.assertIn("only add LATER reveals", imm_rows.validate(
+            "award", "KXGRAMMYNOMAOTY-69", "2026-11-16", "", ["a", "b"]))
+        ok, msg = imm_rows.add_row("award", "KXEMMYX-27", "2026-12-01+2027-01-10",
+                                   ["src one", "src two"], by="test")
+        self.assertTrue(ok, msg)
+        self.assertGreater(imm.load_awards_dates_extra(), 0)
+        self.assertEqual(imm.awards_reveals("KXEMMYX-27"),
+                         [utc(2026, 12, 1, 5, 0), utc(2027, 1, 10, 5, 0)])
+
+    def test_a_past_last_reveal_is_an_award_gap_until_a_later_reveal_lands(self):
+        ev = "KXEMMYX-27"
+        ok, msg = imm_rows.add_row("award", ev, "2026-01-05", ["src one", "src two"])
+        self.assertTrue(ok, msg)
+        imm.load_awards_dates_extra()
+        gaps = {ev: {"series": "KXEMMYX",
+                     "msg": f"{ev} is past its last reveal on file (2026-01-05) -- "
+                            f"standing it down until a row dates its next narrowing"}}
+        self.assertEqual(fw.gap_kind(gaps[ev]["msg"]), "award")
+        self.assertIn(ev, fw.live_gaps(gaps))
+        self.assertFalse(fw.target_fixed({"kind": "award", "event": ev}))
+        ok, msg = imm_rows.add_row("award", ev, "2026-01-05+2099-01-10",
+                                   ["src one", "src two"], replace=True)
+        self.assertTrue(ok, msg)
+        imm.load_awards_dates_extra()
+        self.assertNotIn(ev, fw.live_gaps(gaps))
+        self.assertTrue(fw.target_fixed({"kind": "award", "event": ev}))
+        # the research run is asked for every reveal still to come
+        p = fw.research_prompt([(f"gap:{ev}", {"kind": "award", "event": ev,
+                                               "series": "KXEMMYX", "msg": "m"}, "")])
+        self.assertIn("python imm_rows.py award add KXEMMYX-27 YYYY-MM-DD[+YYYY-MM-DD]", p)
+        self.assertIn("NOT happened yet", p)
+
+    def test_upcoming_programs_are_dated_before_they_start(self):
+        # Jack 2026-11-18 ("also fix the root errors, so this doesnt happen
+        # again"): KXSPAINABROAD-26NOV29-1's program was listed for 17:01Z
+        # with no voting day on file, and research only saw the bot's gaps,
+        # which come once a program is ACTIVE
+        def prog(ev, series, market, start="2026-11-18T17:01:34Z", reward=1500000):
+            return {"event_ticker": ev, "series_ticker": series, "market_ticker": market,
+                    "start_date": start, "end_date": "2026-11-22T05:00:00Z",
+                    "period_reward": reward}
+        rows = [prog("KXSPAINABROAD-26NOV29-1", "KXSPAINABROAD", "KXSPAINABROAD-26NOV29-1-PP"),
+                prog("KXSPAINABROAD-26NOV29-1", "KXSPAINABROAD", "KXSPAINABROAD-26NOV29-1-PSOE"),
+                # dated by the code table: no target
+                prog("KXSPAIN2ND-26NOV29", "KXSPAIN2ND", "KXSPAIN2ND-26NOV29-PP"),
+                # the 69th winners: the code row's ceremony dates them
+                prog("KXGRAMMY-BAMA69", "KXGRAMMY", "KXGRAMMY-BAMA69-LOS",
+                     "2026-11-18T19:01:20Z", 850000),
+                # a Grammy edition with no row at all: an award target
+                prog("KXGRAMMY-BAMA70", "KXGRAMMY", "KXGRAMMY-BAMA70-X",
+                     "2026-11-18T19:01:20Z", 850000),
+                # no dated family
+                prog("KXUSDJPYEVENT-25NOV261500", "KXUSDJPYEVENT",
+                     "KXUSDJPYEVENT-25NOV261500-T15700", "2026-11-18T19:01:20Z", 600000)]
+        members = {"KXSPAINABROAD", "KXSPAIN2ND"}
+        with mock.patch.object(imm, "ELECTION_EXTRA_SERIES", members), \
+                mock.patch.object(imm, "load_election_extra_series", lambda: 0):
+            gaps = fw.upcoming_dating_gaps(rows)
+            self.assertEqual(sorted(gaps), ["KXGRAMMY-BAMA70", "KXSPAINABROAD-26NOV29-1"])
+            g = gaps["KXSPAINABROAD-26NOV29-1"]
+            self.assertEqual((g["kind"], fw.gap_kind(g["msg"])), ("election", "election"))
+            self.assertIn("program starts 2026-11-18 17:01Z", g["msg"])
+            g = gaps["KXGRAMMY-BAMA70"]
+            self.assertEqual((g["kind"], fw.gap_kind(g["msg"])), ("award", "award"))
+            # research takes them under the bot's own gap keys
+            with mock.patch.object(fw.ieo, "discover_broadcast_mention_events",
+                                   lambda c, now: []):
+                t = fw.research_targets(None, {}, datetime.now(timezone.utc), dry=True,
+                                        upcoming=rows)
+                self.assertEqual(sorted(t), ["gap:KXGRAMMY-BAMA70",
+                                             "gap:KXSPAINABROAD-26NOV29-1"])
+                self.assertTrue(t["gap:KXSPAINABROAD-26NOV29-1"]["upcoming"])
+                self.assertEqual(t["gap:KXSPAINABROAD-26NOV29-1"]["event"],
+                                 "KXSPAINABROAD-26NOV29-1")
+                # the bot's own gap for the same event wins over the copy
+                live = {"KXSPAINABROAD-26NOV29-1": {
+                    "series": "KXSPAINABROAD",
+                    "msg": "KXSPAINABROAD-26NOV29-1 has no verified election day in "
+                           "ELECTION_DATES -- standing it down (fail closed)"}}
+                t = fw.research_targets(None, live, datetime.now(timezone.utc), dry=True,
+                                        upcoming=rows)
+                self.assertNotIn("upcoming", t["gap:KXSPAINABROAD-26NOV29-1"])
+            # once a verified row lands, it is no target
+            ok, msg = imm_rows.add_row("election", "KXSPAINABROAD-26NOV29*", "2026-11-29",
+                                       ["src one", "src two"], zone="Europe/Madrid")
+            self.assertTrue(ok, msg)
+            self.assertNotIn("KXSPAINABROAD-26NOV29-1", fw.upcoming_dating_gaps(rows))
+        # priced by the upcoming pool, so research_due ranks them
+        days = (datetime(2026, 11, 22, 5, tzinfo=timezone.utc)
+                - datetime(2026, 11, 18, 17, 1, 34, tzinfo=timezone.utc)).total_seconds() / 86400
+        pools = fw.upcoming_pools(rows)
+        self.assertAlmostEqual(pools["KXSPAINABROAD-26NOV29-1"], 2 * 150 / days, places=6)
+        self.assertEqual(fw.research_due({}, {"gap:A": {}}, 0.0, {"gap:A": 0.0}), [])
+        self.assertEqual(fw.research_due({}, {"gap:A": {}}, 0.0,
+                                         {"gap:A": pools["KXSPAINABROAD-26NOV29-1"]
+                                          * fw.GAP_CAPTURE}), ["gap:A"])
+
     def test_a_bad_row_in_the_file_is_skipped(self):
         with open(imm.election_dates_extra_path(), "w", encoding="utf-8") as f:
             json.dump({"rows": [{"glob": "bad glob", "date": "2027-01-01"},

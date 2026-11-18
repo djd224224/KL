@@ -11,7 +11,16 @@ each {"rows": [{"glob", "date", "zone", "sources", "by", "at", "note"}]}.
 Writers: hand fixes and imm_family_watch.py's research run (this CLI), and
 the watch's US-general rule (add_row). Every row needs TWO different
 sources -- Jack on election dates: "dont trust that, verify yourself". A row the
-code table already covers is refused (the code row wins at lookup; fix it there).
+code table already covers is refused (the code row wins at lookup; fix it there)
+-- except an award row whose days all come AFTER the code row's last reveal:
+it extends that row (incentive_mm.awards_reveals, 2026-11-18).
+
+REVEAL SEQUENCES (Jack 2026-11-18: "also fix the root errors, so this doesnt
+happen again"): an award row may carry its edition's reveals in order, the
+first narrowing then the ceremony, 'D1+D2'. The bot stands the market down
+around each reveal and quotes between them; past the last it stays out and
+logs a gap the family watch researches:
+  python imm_rows.py award add KXGRAMMY-BAMA69 2026-11-16+2027-02-07 --source ... --source ...
 
   python imm_rows.py election add KXSTATELEG-LAHOUSE27 2027-10-23 --zone America/Chicago \\
       --source "https://www.sos.la.gov/..." --source "https://ballotpedia.org/..." --by hand
@@ -94,21 +103,33 @@ def validate(kind: str, glob: str, day: str, zone: str, sources: List[str],
     if not imm.ROWS_GLOB_RE.fullmatch(glob or ""):
         return (f"bad event glob {glob!r} (a series name of 3+ letters/digits, "
                 f"then letters/digits/-/*?[])")
+    # an award row may be a reveal sequence, 'D1+D2' (earliest first)
     try:
-        datetime.strptime(day, "%Y-%m-%d")
+        for d in (str(day).split("+") if kind == "award" else [day]):
+            datetime.strptime(d, "%Y-%m-%d")
     except (TypeError, ValueError):
-        return f"bad date {day!r} (YYYY-MM-DD)"
+        return (f"bad date {day!r} (YYYY-MM-DD"
+                + ("[+YYYY-MM-DD...]" if kind == "award" else "") + ")")
     if zone and kind != "election":
         return "--zone is for election rows only"
     if len({s.strip() for s in sources if s and s.strip()}) < 2:
         return "two different sources are required"
     spec = f"{glob}={day}" + (f"@{zone}" if zone else "")
     try:
-        (imm._parse_election_dates if kind == "election" else imm._parse_awards_dates)(spec)
+        parsed = (imm._parse_election_dates if kind == "election"
+                  else imm._parse_awards_dates)(spec)
     except ValueError as e:
         return str(e)
     shadow = [g for g in _code_table(kind) if fnmatch.fnmatchcase(glob, g)]
     if shadow:
+        if kind == "award":
+            # the next reveal(s) of a code row whose reveals have run out
+            last = max(w for g, w in imm.AWARDS_EVENT_DATES if g == shadow[0])
+            if min(w for _g, w in parsed) > last:
+                return ""
+            return (f"the code table already dates {glob} (row {shadow[0]}, last "
+                    f"reveal {last.astimezone(imm.ET):%Y-%m-%d}); an extras row may "
+                    f"only add LATER reveals -- fix earlier ones there")
         return f"the code table already dates {glob} (row {shadow[0]}); fix it there"
     return ""
 

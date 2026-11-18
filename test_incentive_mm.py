@@ -2192,9 +2192,15 @@ class TestScreen(unittest.TestCase):
         self.assertEqual(imm.awards_event_start("KXGGNOM-ANI26", gg),
                          utc(2026, 12, 7, 5, 0))
         # Jack 2026-09-26 "stand down at nominations instead of the
-        # ceremony": the table (nominations) beats the API (ceremony)
-        self.assertEqual(imm.awards_event_start("KXGRAMMY-BAMP69", gr),
-                         utc(2026, 11, 16, 5, 0))
+        # ceremony": the table (nominations) beats the API (ceremony); since
+        # 2026-11-18 the winners' row is the nominations THEN the ceremony
+        # (REVEAL SEQUENCES): the ceremony from the end of the nominations' day
+        self.assertEqual(imm.awards_event_start(
+            "KXGRAMMY-BAMP69", gr, now_ts=utc(2026, 11, 16, 12, 0).timestamp()),
+            utc(2026, 11, 16, 5, 0))
+        self.assertEqual(imm.awards_event_start(
+            "KXGRAMMY-BAMP69", gr, now_ts=utc(2026, 11, 17, 5, 0).timestamp()),
+            utc(2027, 2, 7, 5, 0))
         self.assertEqual(imm.awards_event_start("KXNATBOOKAWARDS-FIC26", nba),
                          utc(2026, 10, 6, 4, 0))
         self.assertEqual(imm.awards_event_start(
@@ -2231,8 +2237,10 @@ class TestScreen(unittest.TestCase):
         for s, ev, m, want in (
                 # nominations Dec 7 -> out Dec 6 00:00 ET (the row)
                 ("KXGGNOM", "KXGGNOM-ANI26", gg, utc(2026, 12, 6, 5, 0)),
-                # nominations Nov 16 -> out Nov 15 (Nov 1 at 15 days)
-                ("KXGRAMMY", "KXGRAMMY-BAMP69", gr, utc(2026, 11, 15, 5, 0)),
+                # nominations Nov 16 (out Nov 15, Nov 1 at 15 days), then the
+                # ceremony Feb 7 -> out Feb 6 00:00 ET from the end of the
+                # nominations' day (wall clock: this runs after 2026-11-17)
+                ("KXGRAMMY", "KXGRAMMY-BAMP69", gr, utc(2027, 2, 6, 5, 0)),
                 # finalists Oct 6 -> out Oct 5
                 ("KXNATBOOKAWARDS", "KXNATBOOKAWARDS-FIC26", nba,
                  utc(2026, 10, 5, 4, 0))):
@@ -2258,6 +2266,10 @@ class TestScreen(unittest.TestCase):
         finally:
             imm._release_guard_warned.discard("KXGGNOM-ANI27")
             imm._config_gaps.pop("KXGGNOM-ANI27", None)
+            # the National Book Awards' only row (the Oct 6 finalists) is past
+            # while Kalshi dates the market Nov 19: a "past its last reveal" gap
+            imm._release_guard_warned.discard("KXNATBOOKAWARDS-FIC26")
+            imm._config_gaps.pop("KXNATBOOKAWARDS-FIC26", None)
         # the Oscar family inherits KXOSCAR's guard set (table-only, 3/event,
         # safe-join, 1d); KXOSCARMENTION is the mention family's and gets
         # neither the override nor the prefix cap
@@ -2342,6 +2354,127 @@ class TestScreen(unittest.TestCase):
                          "cutoff")
         self.assertEqual(self.bot._screen(m2, utc(2026, 11, 8, 16, 0),
                                           member=True), "cutoff")
+
+    def test_award_rows_carry_a_reveal_sequence(self):
+        # Jack 2026-11-18 ("Yes, fix both" -> "also fix the root errors, so
+        # this doesnt happen again"): the 69th Grammy winner markets listed on
+        # the nominees 11/17 and 119 programs lit 11/18, all dark on the
+        # passed Nov 16 row. A row now carries its edition's reveals in order;
+        # a market is out around each and quotes between them.
+        ts = lambda *a: utc(*a).timestamp()
+        seq = imm._parse_awards_dates(
+            "KXA-*27=2026-11-16+2027-02-07,KXB-*27=2026-12-01")
+        self.assertEqual(seq, (("KXA-*27", utc(2026, 11, 16, 5, 0)),
+                               ("KXA-*27", utc(2027, 2, 7, 5, 0)),
+                               ("KXB-*27", utc(2026, 12, 1, 5, 0))))
+        for bad in ("KXA-*27=2027-02-07+2026-11-16", "KXA-*27=2026-11-16+2026-11-16",
+                    "KXA-*27=2026-11-16+Feb 7"):
+            with self.assertRaises(ValueError):
+                imm._parse_awards_dates(bad)
+        with mock.patch.object(imm, "AWARDS_EVENT_DATES", seq), \
+                mock.patch.object(imm, "AWARDS_DATES_EXTRA", []):
+            self.assertEqual(imm.awards_reveals("KXA-X27"),
+                             [utc(2026, 11, 16, 5, 0), utc(2027, 2, 7, 5, 0)])
+            self.assertEqual(imm.awards_reveals("KXZ-X27"), [])
+            # the nominations' ET day, then the ceremony from the next ET midnight
+            self.assertEqual(imm.awards_event_start("KXA-X27", None, True,
+                                                    now_ts=ts(2026, 11, 17, 4, 59)),
+                             utc(2026, 11, 16, 5, 0))
+            self.assertEqual(imm.awards_event_start("KXA-X27", None, True,
+                                                    now_ts=ts(2026, 11, 17, 5, 0)),
+                             utc(2027, 2, 7, 5, 0))
+            # past every reveal: the last stands (out), and a row is needed
+            self.assertEqual(imm.awards_current_reveal(imm.awards_reveals("KXA-X27"),
+                                                       ts(2027, 2, 8, 5, 0)),
+                             (utc(2027, 2, 7, 5, 0), True))
+            self.assertEqual(imm.awards_current_reveal([], ts(2027, 1, 1)), (None, False))
+            self.assertIsNone(imm.awards_past_last_reveal("KXA-X27", ts(2027, 2, 8, 4, 59)))
+            self.assertEqual(imm.awards_past_last_reveal("KXA-X27", ts(2027, 2, 8, 5, 0)),
+                             utc(2027, 2, 7, 5, 0))
+            self.assertFalse(imm.awards_needs_row("KXA-X27", ts(2026, 11, 20)))
+            self.assertTrue(imm.awards_needs_row("KXA-X27", ts(2027, 2, 9)))
+            self.assertTrue(imm.awards_needs_row("KXZ-X27", ts(2026, 11, 20)))
+            # an extras row EXTENDS a code row with later days only (the code
+            # table wins on the days it has) ...
+            imm.AWARDS_DATES_EXTRA[:] = imm._parse_awards_dates(
+                "KXB-X27=2026-11-01+2027-01-10")
+            self.assertEqual(imm.awards_reveals("KXB-X27"),
+                             [utc(2026, 12, 1, 5, 0), utc(2027, 1, 10, 5, 0)])
+            # ... and with no code row the first matching extras glob dates it
+            imm.AWARDS_DATES_EXTRA[:] = imm._parse_awards_dates(
+                "KXC-X27=2026-11-01+2027-01-10")
+            self.assertEqual(imm.awards_reveals("KXC-X27"),
+                             [utc(2026, 11, 1, 4, 0), utc(2027, 1, 10, 5, 0)])
+        # an extras file row may carry a sequence (award rows only)
+        row = {"glob": "KXC-X27", "date": "2026-11-01+2027-01-10"}
+        self.assertEqual(imm._row_spec(row, with_zone=False, seq=True),
+                         "KXC-X27=2026-11-01+2027-01-10")
+        self.assertIsNone(imm._row_spec(row, with_zone=False))
+        self.assertIsNone(imm._row_spec(row, with_zone=True))
+        # the live table: the 69th winners quote from Nov 17 to Feb 6, the
+        # nomination series stay on their Nov 16 reveal
+        self.assertEqual(imm.awards_reveals("KXGRAMMY-BAMA69"),
+                         [utc(2026, 11, 16, 5, 0), utc(2027, 2, 7, 5, 0)])
+        self.assertEqual(imm.awards_reveals("KXGRAMAOTY-69"),
+                         [utc(2026, 11, 16, 5, 0), utc(2027, 2, 7, 5, 0)])
+        for ev in ("KXGRAMMYNOMAOTY-69", "KXGRAMMYNOM-69BPDGP"):
+            self.assertEqual(imm.awards_reveals(ev), [utc(2026, 11, 16, 5, 0)], ev)
+        grammy = {"occurrence_datetime": "2027-02-08T04:59:00Z",
+                  "expected_expiration_time": "2027-02-08T04:59:00Z",
+                  "close_time": "2027-12-31T15:00:00Z"}
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXGRAMMY", "KXGRAMMY-BAMA69", utc(2027, 2, 8, 4, 59), close_time=None,
+            market=grammy), utc(2027, 2, 6, 5, 0))
+        # an evaluated market past its last reveal logs a gap the family watch
+        # researches -- unless Kalshi expires it within 2 days of that reveal
+        # (the reveal decided it: the CMA show)
+        ev = "KXGRAMMY-BAMA69"
+        try:
+            for exp, gap in (("2027-02-08T04:59:00Z", True),
+                             ("2026-11-18T15:00:00Z", False),
+                             ("2027-12-31T15:00:00Z", True)):
+                imm._release_guard_warned.discard(ev)
+                imm._config_gaps.pop(ev, None)
+                with mock.patch.object(imm, "awards_past_last_reveal",
+                                       return_value=utc(2026, 11, 16, 5, 0)):
+                    imm.apply_series_cutoff_adjustments(
+                        "KXGRAMMY", ev, None, close_time=None,
+                        market=dict(grammy, expected_expiration_time=exp))
+                if gap:
+                    self.assertIn("past its last reveal on file (2026-11-16)",
+                                  imm._config_gaps[ev]["msg"], exp)
+                else:
+                    self.assertNotIn(ev, imm._config_gaps, exp)
+            # no market object (the family watch's own reads): no gap
+            imm._release_guard_warned.discard(ev)
+            imm._config_gaps.pop(ev, None)
+            with mock.patch.object(imm, "awards_past_last_reveal",
+                                   return_value=utc(2026, 11, 16, 5, 0)):
+                imm.apply_series_cutoff_adjustments("KXGRAMMY", ev, None,
+                                                    close_time=None, market=None)
+            self.assertNotIn(ev, imm._config_gaps)
+            # a nominations series is decided by its nominations: no gap
+            nom = "KXGRAMMYNOM-69BPDGP"
+            imm._release_guard_warned.discard(nom)
+            imm._config_gaps.pop(nom, None)
+            with mock.patch.object(imm, "awards_past_last_reveal",
+                                   return_value=utc(2026, 11, 16, 5, 0)):
+                imm.apply_series_cutoff_adjustments("KXGRAMMYNOM", nom, None,
+                                                    close_time=None, market=grammy)
+                self.assertIsNone(imm.awards_next_reveal_missing(nom, "KXGRAMMYNOM", grammy))
+                self.assertEqual(imm.awards_next_reveal_missing(ev, "KXGRAMMY", grammy),
+                                 utc(2026, 11, 16, 5, 0))
+            self.assertNotIn(nom, imm._config_gaps)
+        finally:
+            imm._release_guard_warned.discard(ev)
+            imm._config_gaps.pop(ev, None)
+            imm._release_guard_warned.discard("KXGRAMMYNOM-69BPDGP")
+            imm._config_gaps.pop("KXGRAMMYNOM-69BPDGP", None)
+        self.assertTrue(imm.awards_reveal_decides(
+            {"expected_expiration_time": "2026-11-18T15:00:00Z"}, utc(2026, 11, 18, 5, 0)))
+        self.assertFalse(imm.awards_reveal_decides(
+            {"expected_expiration_time": "2027-02-08T04:59:00Z"}, utc(2026, 11, 16, 5, 0)))
+        self.assertFalse(imm.awards_reveal_decides(None, utc(2026, 11, 16, 5, 0)))
 
     def test_cutoff_imminent(self):
         self.assertEqual(self.bot._screen(
@@ -32495,10 +32628,12 @@ class TestAwardsByKalshiTag(unittest.TestCase):
                               ov.size_mult), (1.0, True, True, None), s)
             self.assertEqual(imm.event_top_n_for(s), 5, s)
         # KXGRAMAOTY-69 (the 69th's Album of the Year winner): the Nov 16
-        # nominations are its first narrowing -> out Nov 15, not at the show
+        # nominations are its first narrowing (out Nov 15), then the Feb 7
+        # ceremony (2026-11-18, REVEAL SEQUENCES) -> out Feb 6 from the end of
+        # the nominations' day (wall clock: this runs after 2026-11-17)
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXGRAMAOTY", "KXGRAMAOTY-69", None, close_time=None, market=self.AOTY),
-            utc(2026, 11, 15, 5, 0))
+            utc(2027, 2, 6, 5, 0))
         self.assertNotIn("KXGRAMAOTY-69", imm._config_gaps)
         # a show with no row stands down -- Kalshi's dates are not used --
         # and is a gap for the family watch's research

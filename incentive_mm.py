@@ -23859,7 +23859,15 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 # past the reveal, so KXGGNOM is table-only too (row "84th Golden Globes"
 # below). Dates in the default table (verified 9/26):
 #   69th Grammys        nominations Nov 16 2026 (Recording Academy /
-#                       Rolling Stone; ceremony Feb 7 2027)
+#                       Rolling Stone; ceremony Feb 7 2027). Since
+#                       2026-11-18 the WINNER rows carry both reveals,
+#                       2026-11-16+2027-02-07 (see REVEAL SEQUENCES below):
+#                       Kalshi listed the winner markets on the nominees
+#                       11/17 (KXGRAMMY-BAMA69 opened 17:48Z) and lit 119
+#                       programs 11/18, which the passed Nov 16 row alone
+#                       kept dark (Jack 2026-11-18: "Yes, fix both"). The
+#                       nomination rows keep Nov 16 only: the nominations
+#                       decided those markets.
 #   2026 Nat'l Book Aw. finalists Oct 6 2026 (nationalbook.org; ceremony
 #                       Nov 18) -- already inside the month on 9/26
 #   99th Oscars         shortlists Dec 15 2026 for the shortlist categories
@@ -23986,8 +23994,11 @@ _CRITICS_NOM_OTHER_27 = ("PIC", "DIR", "ACTO", "ACTR", "SUPACTO", "SUPACTR",
                          "DRAMASUPACTO", "DRAMASUPACTR", "LIM", "LIMACTO",
                          "LIMACTR", "LIMSUPACTO", "LIMSUPACTR")
 _AWARDS_DATES_DEFAULT = (
-    "KXGRAMMY-*69=2026-11-16,KXGRAMMYNOM*-69=2026-11-16,"
-    "KXGRAMMYNOM-69*=2026-11-16,KXGRAM*-69=2026-11-16,"
+    # the 69th Grammys: the winners' reveals are the nominations, then the
+    # ceremony; the nomination series' only reveal is the nominations (they
+    # stay listed BEFORE KXGRAM*-69, which their tickers match too)
+    "KXGRAMMY-*69=2026-11-16+2027-02-07,KXGRAMMYNOM*-69=2026-11-16,"
+    "KXGRAMMYNOM-69*=2026-11-16,KXGRAM*-69=2026-11-16+2027-02-07,"
     # the 84th Golden Globe nominations (see "84th Golden Globes" above)
     "KXGGNOM-*26=2026-12-07,"
     # the 60th CMA Awards themselves (see "60th CMA Awards" above)
@@ -24004,17 +24015,22 @@ _AWARDS_DATES_DEFAULT = (
 
 
 def _parse_awards_dates(spec: str) -> Tuple[Tuple[str, datetime], ...]:
-    """'<event-ticker glob>=<YYYY-MM-DD>,...' -> ((glob, 00:00 ET of that
-    day as UTC), ...) in the order given: the first matching glob wins, so
-    a nominations glob must be listed before its family-wide ceremony glob."""
+    """'<event-ticker glob>=<YYYY-MM-DD>[+<YYYY-MM-DD>...],...' -> ((glob,
+    00:00 ET of that day as UTC), ...) in the order given, one entry per day
+    of a row's REVEAL SEQUENCE (earliest first; awards_reveals): the first
+    matching glob wins, so a nominations glob must be listed before its
+    family-wide ceremony glob."""
     out = []
     for part in (p.strip() for p in spec.split(",") if p.strip()):
         try:
-            glob_s, day = part.split("=")
-            when = datetime.strptime(day.strip(), "%Y-%m-%d")
+            glob_s, days = part.split("=")
+            whens = [datetime.strptime(d.strip(), "%Y-%m-%d") for d in days.split("+")]
         except ValueError:
             raise ValueError(f"bad IMM_AWARDS_EVENT_DATES part: {part!r}")
-        out.append((glob_s.strip(), ET.localize(when).astimezone(timezone.utc)))
+        if any(b <= a for a, b in zip(whens, whens[1:])):
+            raise ValueError(f"bad IMM_AWARDS_EVENT_DATES part: {part!r} (a reveal "
+                             f"sequence runs earliest first)")
+        out += [(glob_s.strip(), ET.localize(w).astimezone(timezone.utc)) for w in whens]
     return tuple(out)
 
 
@@ -24033,7 +24049,8 @@ AWARDS_EVENT_DATES = _parse_awards_dates(os.environ.get(
 # different sources a row) and by imm_family_watch.py's US-general rule. Re-read
 # by mtime at import and every universe refresh, so a fix lands in one refresh
 # with no deploy. The code tables are checked first and win on an event both
-# match.
+# match -- except that an award row may EXTEND a code row with later reveals
+# (2026-11-18, awards_reveals).
 ELECTION_DATES_EXTRA_FILE = "election_dates_extra.json"     # in STATUS_DIR
 AWARDS_DATES_EXTRA_FILE = "awards_dates_extra.json"         # in STATUS_DIR
 # a series name of 3+ letters/digits, then the glob: Kalshi's legacy
@@ -24079,12 +24096,14 @@ def _rows_file(path: str) -> Optional[list]:
     return [r for r in (data.get("rows") or []) if isinstance(r, dict)]
 
 
-def _row_spec(r: dict, with_zone: bool) -> Optional[str]:
-    """'<glob>=<date>[@<zone>]' for a well-formed row, else None."""
+def _row_spec(r: dict, with_zone: bool, seq: bool = False) -> Optional[str]:
+    """'<glob>=<date>[@<zone>]' for a well-formed row, else None. With `seq`
+    (an award row) the date may be a reveal sequence, 'D1+D2'."""
     g = str(r.get("glob") or "").strip()
     d = str(r.get("date") or "").strip()
     z = str(r.get("zone") or "").strip() if with_zone else ""
-    if not ROWS_GLOB_RE.fullmatch(g) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+    day_re = r"\d{4}-\d{2}-\d{2}" + (r"(?:\+\d{4}-\d{2}-\d{2})*" if seq else "")
+    if not ROWS_GLOB_RE.fullmatch(g) or not re.fullmatch(day_re, d):
         return None
     return f"{g}={d}" + (f"@{z}" if z else "")
 
@@ -24097,7 +24116,7 @@ def load_awards_dates_extra() -> int:
         return 0
     fresh = []
     for r in rows:
-        spec = _row_spec(r, with_zone=False)
+        spec = _row_spec(r, with_zone=False, seq=True)
         try:
             fresh += list(_parse_awards_dates(spec)) if spec else []
         except ValueError as e:
@@ -24112,15 +24131,112 @@ def load_awards_dates_extra() -> int:
 load_awards_dates_extra()
 
 
+# REVEAL SEQUENCES (Jack 2026-11-18: "Yes, fix both", then "also fix the root
+# errors, so this doesnt happen again"). A row used to be ONE day -- the first
+# narrowing -- and its stand-down never lifted: once the 69th Grammy
+# nominations (Nov 16) were out, Kalshi listed the winner markets on the
+# nominees and lit 119 programs (18 events, $10,755 a period from 11/18
+# 19:01Z), and the passed Nov 16 row would have kept every one dark. A row
+# now carries its edition's reveals in order, 'KXGRAMMY-*69=2026-11-16+
+# 2027-02-07' (nominations, then the ceremony). The current reveal is the
+# first whose ET day has not ended: a market is out from AWARDS_PRE_EVENT_DAYS
+# before each reveal through the end of that reveal's ET day, and quotes
+# between reveals. Past its last reveal it stays out (fail closed), and an
+# evaluated market logs a config gap ("past its last reveal") that the
+# family watch researches -- the next narrowing, usually the ceremony -- into
+# an extras row; a market Kalshi itself expires within 2 days of that last
+# reveal was decided by it, so it logs nothing. Lookup: the first code-table
+# glob that matches gives its reveals (every entry with that glob), and an
+# extras row EXTENDS them with LATER days only (the code table wins on the
+# days it has); with no code row, the first matching extras glob gives them.
+AWARDS_DECIDED_WITHIN_DAYS = 2.0
+
+
+def _awards_reveal_day_end(when: datetime) -> datetime:
+    """00:00 ET the day after a reveal's day, as UTC: the end of its stand-down."""
+    day = when.astimezone(ET).date() + timedelta(days=1)
+    return ET.localize(datetime(day.year, day.month, day.day)).astimezone(timezone.utc)
+
+
+def awards_reveals(event_ticker: str) -> List[datetime]:
+    """The reveals on file for an award event, earliest first ([] = none)."""
+    code_glob = next((g for g, _w in AWARDS_EVENT_DATES
+                      if fnmatch.fnmatchcase(event_ticker, g)), None)
+    code = sorted({w for g, w in AWARDS_EVENT_DATES if g == code_glob}) if code_glob else []
+    extra_glob = next((g for g, _w in AWARDS_DATES_EXTRA
+                       if fnmatch.fnmatchcase(event_ticker, g)), None)
+    extra = sorted({w for g, w in AWARDS_DATES_EXTRA if g == extra_glob}) if extra_glob else []
+    if code:
+        extra = [w for w in extra if w > code[-1]]
+    return code + extra
+
+
+def awards_current_reveal(reveals: List[datetime],
+                          now_ts: Optional[float] = None) -> Tuple[Optional[datetime], bool]:
+    """(the reveal a market stands down for, past_all): the first reveal
+    whose ET day has not ended; past them all, the last and True; (None,
+    False) with none."""
+    if not reveals:
+        return None, False
+    now_ts = time.time() if now_ts is None else now_ts
+    for w in reveals:
+        if now_ts < _awards_reveal_day_end(w).timestamp():
+            return w, False
+    return reveals[-1], True
+
+
+def awards_past_last_reveal(event_ticker: str,
+                            now_ts: Optional[float] = None) -> Optional[datetime]:
+    """The last reveal on file once every reveal's ET day has ended, else None."""
+    when, past = awards_current_reveal(awards_reveals(event_ticker), now_ts)
+    return when if past else None
+
+
+def awards_needs_row(event_ticker: str, now_ts: Optional[float] = None) -> bool:
+    """True when a row must still date the event: none on file, or every reveal
+    on file is past (the family watch's gap filter, fixed check and its
+    upcoming-programs targets)."""
+    reveals = awards_reveals(event_ticker)
+    return not reveals or awards_current_reveal(reveals, now_ts)[1]
+
+
+def awards_reveal_decides(market: Optional[dict], last: datetime) -> bool:
+    """True when Kalshi expects the market to expire within
+    AWARDS_DECIDED_WITHIN_DAYS of the end of its last reveal's day (a Dec 31
+    placeholder or no date says nothing): that reveal decided it, so no later
+    narrowing is missing."""
+    exp = parse_iso_utc((market or {}).get("expected_expiration_time", "")) \
+        if isinstance(market, dict) else None
+    if exp is None or (exp.month == 12 and exp.day == 31):
+        return False
+    return exp <= _awards_reveal_day_end(last) + timedelta(days=AWARDS_DECIDED_WITHIN_DAYS)
+
+
+def awards_next_reveal_missing(event_ticker: str, series: str,
+                               market: Optional[dict] = None,
+                               now_ts: Optional[float] = None) -> Optional[datetime]:
+    """The last reveal on file when the event is past it AND a later narrowing
+    should exist, else None. A nominations series (NOM in its name:
+    KXGRAMMYNOM, KXCRITICSCHOICENOM, KXOSCARNOM*, KXGGNOM) is decided by its
+    nominations, and a market Kalshi expires within AWARDS_DECIDED_WITHIN_DAYS
+    of that reveal by the reveal itself (awards_reveal_decides): neither is
+    missing anything."""
+    last = awards_past_last_reveal(event_ticker, now_ts)
+    if last is None or "NOM" in series or awards_reveal_decides(market, last):
+        return None
+    return last
+
+
 def awards_event_start(event_ticker: str, market: Optional[dict],
-                       dates_only: bool = False) -> Optional[datetime]:
-    """When an award event starts (UTC): the hand table first, then Kalshi's
-    occurrence / expected expiration off the market object unless
-    `dates_only`. None when nothing trustworthy says (the caller fails
-    closed)."""
-    for glob_s, when in tuple(AWARDS_EVENT_DATES) + tuple(AWARDS_DATES_EXTRA):
-        if fnmatch.fnmatchcase(event_ticker, glob_s):
-            return when
+                       dates_only: bool = False,
+                       now_ts: Optional[float] = None) -> Optional[datetime]:
+    """When an award event starts (UTC): its current reveal off the hand
+    table (awards_reveals / awards_current_reveal), then Kalshi's occurrence
+    / expected expiration off the market object unless `dates_only`. None
+    when nothing trustworthy says (the caller fails closed)."""
+    reveals = awards_reveals(event_ticker)
+    if reveals:
+        return awards_current_reveal(reveals, now_ts)[0]
     if dates_only or not isinstance(market, dict):
         return None
     occ = parse_iso_utc(market.get("occurrence_datetime", ""))
@@ -25168,6 +25284,17 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
                             f"{start.astimezone(ET):%Y-%m-%d} (out "
                             f"{ov.pre_event_days:g}d before, the safe "
                             f"error) until a row is added")
+        if start is not None and isinstance(market, dict):
+            # past every reveal on file while still listed and evaluated:
+            # the next narrowing is missing (REVEAL SEQUENCES, 2026-11-18)
+            last = awards_next_reveal_missing(event_ticker, series, market)
+            if last is not None:
+                _config_gap(series, event_ticker,
+                            f"{event_ticker} is past its last reveal on file "
+                            f"({last.astimezone(ET):%Y-%m-%d}) -- standing it down "
+                            f"until a row dates its next narrowing (usually the "
+                            f"ceremony): python imm_rows.py award add "
+                            f"{event_ticker} YYYY-MM-DD --source A --source B")
         if start is None:
             pre = RELEASE_GUARD_UNKNOWN
             _config_gap(series, event_ticker,

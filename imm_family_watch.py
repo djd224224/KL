@@ -88,6 +88,7 @@ import incentive_mm as imm
 import imm_earnings_overrides as ieo
 import imm_feed_audit as ifa
 import imm_rows
+import imm_upcoming  # fetch_upcoming_raw: the UPCOMING PROGRAMS research targets
 import imm_dashboard as dash  # family_of: the dashboard's families (stdlib-only)
 from incentive_mm import log
 
@@ -1197,7 +1198,8 @@ def gap_kind(msg: str) -> str:
     m = msg or ""
     if "election day" in m:
         return "election"
-    if "hand-table row" in m or "no usable date" in m:
+    # "past its last reveal": every reveal on file has passed (2026-11-18)
+    if "hand-table row" in m or "no usable date" in m or "last reveal" in m:
         return "award"
     if "no race start on file" in m:
         return "marathon"
@@ -1223,7 +1225,8 @@ def live_gaps(gaps: dict) -> dict:
         if kind == "election" and \
                 (g.get("series") or imm.series_of(ev)) in imm.ELECTION_EXCLUDE:
             continue
-        if kind == "award" and imm.awards_event_start(ev, None, dates_only=True) is not None:
+        # a current reveal on file fixes it; none, or all past, does not
+        if kind == "award" and not imm.awards_needs_row(ev):
             continue
         if kind == "marathon" and ev in imm.EVENT_START_OVERRIDES:
             continue
@@ -1231,10 +1234,78 @@ def live_gaps(gaps: dict) -> dict:
     return out
 
 
-def research_targets(client, gaps: dict, now: datetime, dry: bool) -> Dict[str, dict]:
+# UPCOMING PROGRAMS (Jack 2026-11-18: "also fix the root errors, so this
+# doesnt happen again", after KXSPAINABROAD-26NOV29-1 and three more Spanish
+# election series -- 24 markets, programs from 17:01Z -- were found the
+# morning before their programs began with no verified voting day). Research
+# took its targets from the bot's config gaps alone, and the bot logs a gap
+# only for a market it evaluates, i.e. once its program is ACTIVE: a new
+# election or award event started dark and stayed dark until research
+# caught up. Kalshi lists programs hours to days ahead (status=upcoming,
+# imm_upcoming), so each run also targets the upcoming events the bot would
+# stand down for want of a date -- an election-family event with no voting
+# day, an award-family event with no row or past its last reveal as of its
+# program's start -- under the same key the bot's gap would take
+# ("gap:<event>"), priced by the upcoming pool so research_due ranks them.
+def upcoming_dating_gaps(rows: list) -> Dict[str, dict]:
+    """{event: {kind, series, msg}} for the events of upcoming program rows
+    that would start dark for want of a date row."""
+    imm.load_election_extra_series()
+    imm.load_election_dates_extra()
+    imm.load_awards_dates_extra()
+    first: Dict[str, Tuple[str, datetime]] = {}
+    for p in rows or []:
+        ev = str(p.get("event_ticker") or "")
+        start = imm.parse_iso_utc(p.get("start_date", "") or "")
+        if not ev or start is None:
+            continue
+        series = str(p.get("series_ticker") or "") or imm.series_of(ev)
+        if ev not in first or start < first[ev][1]:
+            first[ev] = (series, start)
+    out: Dict[str, dict] = {}
+    for ev, (series, start) in sorted(first.items()):
+        when = f"{start:%Y-%m-%d %H:%M}Z"
+        if imm.election_series(series):
+            if imm.election_cutoff_utc(ev) is None and imm.election_term_end_row(ev) is None:
+                out[ev] = {"kind": "election", "series": series,
+                           "msg": f"{ev} has no verified election day in ELECTION_DATES "
+                                  f"-- its program starts {when}, so it would start dark"}
+            continue
+        imm.ensure_family_override(series)
+        ov = imm.series_override(series)
+        if ov is None or ov.pre_event_days is None or not ov.pre_event_dates_only:
+            continue
+        if imm.awards_reveals(ev):
+            # past its last reveal as of the start, and not a nominations
+            # series (those are decided by their nominations)
+            last = imm.awards_next_reveal_missing(ev, series, None, start.timestamp())
+            if last is None:
+                continue
+            msg = (f"{ev} is past its last reveal on file "
+                   f"({last.astimezone(imm.ET):%Y-%m-%d}) at its program's start {when}")
+        else:
+            msg = f"no hand-table row for {ev} -- its program starts {when}"
+        out[ev] = {"kind": "award", "series": series, "msg": msg + ", so it would start dark"}
+    return out
+
+
+def upcoming_pools(rows: list) -> Dict[str, float]:
+    """event -> $/day of its upcoming programs."""
+    pools: Dict[str, float] = defaultdict(float)
+    for p in rows or []:
+        ev = str(p.get("event_ticker") or "")
+        if ev:
+            pools[ev] += ifa._dollars_per_day(p)
+    return pools
+
+
+def research_targets(client, gaps: dict, now: datetime, dry: bool,
+                     upcoming: Optional[list] = None) -> Dict[str, dict]:
     """{key: {kind, event, series, msg}} for what only research can fix.
     Broadcast mention events the automatic resolvers CAN place are written
-    here and now (as the overrides task's Phase 4 would), not researched."""
+    here and now (as the overrides task's Phase 4 would), not researched.
+    `upcoming`: Kalshi's upcoming program rows, whose undated election / award
+    events are targets before their programs start (UPCOMING PROGRAMS)."""
     targets: Dict[str, dict] = {}
     imm.load_file_event_overrides()       # a --set since import is not a target
     for ev, g in sorted(live_gaps(gaps).items()):   # nor a fixed / excluded gap
@@ -1245,6 +1316,8 @@ def research_targets(client, gaps: dict, now: datetime, dry: bool) -> Dict[str, 
             targets[f"gap:{ev}"] = {"kind": kind, "event": ev,
                                     "series": g.get("series") or imm.series_of(ev),
                                     "msg": g.get("msg") or ""}
+    for ev, g in upcoming_dating_gaps(upcoming or []).items():
+        targets.setdefault(f"gap:{ev}", dict(g, event=ev, upcoming=True))
     # the term-end rows due a re-check (live_gaps has just re-read the rows);
     # a not-a-vote row's sooner, for its news coming near (2026-11-10), and
     # from a day before its own day, to move it on to its event's next
@@ -1368,10 +1441,19 @@ _HOW = {
                 "vote\"   |   not called yet: python imm_rows.py election add {ev} "
                 "{day}{zone} --term-end --source \"...\" --source \"...\" --by "
                 "family-watch-research --note \"no vote called as of <today>\""),
-    "award": ("the FIRST narrowing of the field for that edition (nominations, "
-              "shortlist or finalists announcement -- not the ceremony)",
-              "python imm_rows.py award add {ev} YYYY-MM-DD --source \"...\" "
-              "--source \"...\" --by family-watch-research"),
+    # 2026-11-18 (REVEAL SEQUENCES): not just the FIRST narrowing -- a row
+    # dated to a reveal that has already happened stands the market down for
+    # good, the way the passed Nov 16 Grammy nominations would have kept the
+    # 69th's winner markets dark
+    "award": ("the edition's NEXT narrowing of the field that has NOT happened "
+              "yet: the nominations, shortlist or finalists announcement -- or, "
+              "once those are past (check whether a date on file really "
+              "happened), the ceremony or winner announcement itself. Give every "
+              "reveal still to come, earliest first, joined by '+' (the "
+              "nominations and then the ceremony: 2026-12-07+2027-01-10). If the "
+              "event already has its own row (its reveals are past), add --replace",
+              "python imm_rows.py award add {ev} YYYY-MM-DD[+YYYY-MM-DD] "
+              "--source \"...\" --source \"...\" --by family-watch-research"),
     "start": ("when the SPEAKER the market is about starts speaking -- for a rally or "
               "speech the scheduled remarks time ('7:00 PM: Remarks Begin'), NOT doors "
               "or program start; for a show, its air time (if sources give the speaker "
@@ -1781,7 +1863,7 @@ def target_fixed(t: dict) -> bool:
             return imm.election_cutoff_utc(ev) is not None
         return row[4] > float(t.get("checked") or 0.0)
     if t["kind"] == "award":
-        return imm.awards_event_start(ev, None, dates_only=True) is not None
+        return not imm.awards_needs_row(ev)
     if t["kind"] in ("start", "powerslap", "marathon"):
         return ev in imm.EVENT_START_OVERRIDES
     return False
@@ -1828,10 +1910,19 @@ def research_pass(client, gaps: dict, state: dict, dry: bool) -> Tuple[Dict[str,
     """Collect targets, research the due ones, update state["research"].
     Returns (targets, summary lines)."""
     now_ts = time.time()
-    targets = research_targets(client, gaps, datetime.now(timezone.utc), dry)
+    upcoming: list = []
+    if client is not None:
+        try:
+            upcoming = imm_upcoming.fetch_upcoming_raw(client)
+        except Exception as e:                       # noqa: BLE001 - next run retries
+            log(f"[WATCH] ! upcoming programs read failed: {e!r}")
+    targets = research_targets(client, gaps, datetime.now(timezone.utc), dry,
+                               upcoming=upcoming)
     rstate = prune_research(state.get("research") or {}, targets, now_ts)
     notes = requeue_old_rules(rstate, targets)
     pools = event_pools(ifa.fetch_active_programs(client)) if targets else {}
+    for ev, v in upcoming_pools(upcoming).items():   # an upcoming target pays soon
+        pools[ev] = pools.get(ev, 0.0) + v
     est = {k: pools.get(t["event"], 0.0) * GAP_CAPTURE for k, t in targets.items()}
     due = research_due(rstate, targets, now_ts, est)
     if due and RESEARCH_ENABLE and not dry:
