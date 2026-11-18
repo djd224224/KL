@@ -252,6 +252,10 @@ def setUpModule():
     imm.HOME_FAR_SIZE_MULT = 1.0
     # ...and the far months' follow-the-book rule likewise (2026-11-18)
     imm.HOME_FAR_FOLLOW_BOOK = False
+    # ...and the pre-release window (2026-11-18): the fixtures' last release
+    # is 30 days old, so from the 12th to the 24th every Zillow test would
+    # run at x1 -- off here; TestHomeFarSize turns it on
+    imm.HOME_PRE_RELEASE_DAYS = 0
     # the Pokemon gate's status file and in-memory snapshot (2026-10-03):
     # the same -- only its refresher thread writes them
     imm.POKE_STATUS_FILE = os.path.join(tmp, "pokemon_fair.json")
@@ -26782,6 +26786,56 @@ class TestHomeFarSize(unittest.TestCase):
         # several months: the tightest of each; a one-sided month binds one side
         oct_ = ("Y", [[60.0, 100.0]], [])
         self.assertEqual(imm.home_xmonth_caps((99, 1), [aug, oct_])[0], (67, 45))
+
+    # THE PRE-RELEASE WINDOW (Jack 2026-11-18: "is Zillow markets protected
+    # from another Hoboken pickoff?" -> a stand-aside, then "but instead of
+    # stand aside, 1x everything during that time")
+
+    @staticmethod
+    def _et(y, mo, d, h=0, mi=0):
+        return imm.ET.localize(datetime(y, mo, d, h, mi)).timestamp()
+
+    def test_the_pre_release_window(self):
+        et, pre = self._et, imm.home_pre_release
+        nov16 = et(2067, 11, 16, 11, 47)                    # last month's file
+        with mock.patch.object(imm, "HOME_PRE_RELEASE_DAYS", 4):
+            self.assertEqual(pre(et(2067, 12, 11, 23, 59), nov16), "")        # before the 12th
+            self.assertIn("pre-release window", pre(et(2067, 12, 12, 0, 30), nov16))
+            self.assertIn("pre-release window", pre(et(2067, 12, 15, 9), nov16))
+            self.assertIn("pre-release window", pre(et(2067, 12, 13), None))  # no read: in
+            # this month's file landed: over (the 60-min hold takes it from there)
+            self.assertEqual(pre(et(2067, 12, 16, 13), et(2067, 12, 16, 11, 47)), "")
+            self.assertEqual(pre(et(2067, 12, 13), et(2067, 12, 8, 10)), "")  # an early one
+            self.assertEqual(pre(et(2067, 12, 24, 0, 30), nov16), "")          # the cap
+            self.assertEqual(pre(et(2068, 1, 5), nov16), "")
+        self.assertEqual(pre(et(2067, 12, 13), nov16), "")                     # off (0 days)
+
+    def test_the_window_is_x1(self):
+        now = time.time()
+        _clean_persist()
+        self._snap(p=0.70)
+        with mock.patch.object(imm, "HOME_FAR_SIZE_MULT", 5.0):
+            five = self._bot()
+            five.run_cycle()
+            s5 = self._sizes(five)
+            with mock.patch.object(imm, "home_pre_release", lambda *a, **k: "window"):
+                self.assertEqual(imm.home_far_mult(self.T, now), 1.0)
+                self.assertEqual(imm.market_max_position(self.T),
+                                 imm.series_max_position("KXSEAHOME"))
+                self.assertEqual(imm.event_cap_contracts(self.EV),
+                                 imm.MAX_EVENT_CONTRACTS * imm.applied_mention_mult("KXSEAHOME"))
+                with mock.patch.object(imm, "_hour_window_mult", lambda s, n: 3.0):
+                    self.assertEqual(imm.hour_size_mult("KXSEAHOME", datetime.now(timezone.utc)), 1.0)
+                    self.assertEqual(imm.hour_size_mult("KXRT", datetime.now(timezone.utc)), 3.0)
+                _clean_persist()
+                one = self._bot()
+                self.assertEqual(one._market_size_mult(self.T), 1.0)
+                one.run_cycle()
+                s1 = self._sizes(one)
+        for side in ("bid", "ask"):
+            self.assertGreater(s1[side], 0)
+            self.assertAlmostEqual(s5[side], 5 * s1[side], delta=0.02 * 5 * s1[side] + 2,
+                                   msg=(side, s1, s5))
 
     def test_the_quote_loop_holds_a_far_month_inside_its_city(self):
         self._snap(p=0.99)
