@@ -59,6 +59,9 @@ PACE_BAR = float(os.environ.get("PVD_WATCH_PACE_BAR") or 1.30)
 PRICE_BANDS = [(2, "2c or under"), (5, "2-5c"), (15, "5-15c"), (30, "15-30c"),
                (50, "30-50c"), (70, "50-70c"), (90, "70-90c"), (100, "over 90c")]
 PACE_SPARE_H = float(os.environ.get("PVD_WATCH_PACE_SPARE_H") or 6.0)
+# the latest relight's pacing target (Jack 2026-11-18: "check again that 336 are pacing
+# above $1.2 target" -- the $1-floor protocol's aim)
+LATEST_TARGET = float(os.environ.get("PVD_WATCH_LATEST_TARGET") or 1.20)
 # importing incentive_mm reads and writes its STATUS_DIR; keep this
 # read-only watcher off the live bot's files
 os.environ.setdefault("IMM_STATUS_DIR", os.path.join(tempfile.gettempdir(), "imm_pvd_watch_status"))
@@ -478,6 +481,49 @@ def poll(client, hist: dict) -> dict:
             b["q_usd"] += sum(q * (p if side == "bid" else 100 - p) for p, q in lv) / 100.0
             b["rew"] += r.get("est", 0.0) * w
             b["rate"] += r.get("rate", 0.0) * w
+    # LATEST RELIGHT (Jack 2026-11-18, the w1113-fxmetals relight: "clearly show this data for
+    # the latest relit wave"): the header's numbers over the markets on the NEWEST program
+    # period only. The page's own totals run since go-live and mix in every earlier period's
+    # rewards, fills and positions (11/18: $2,774 "so far" since 11/13, and its 2 fills and
+    # -$10.80 were on 11/15 and 11/17 events). Rewards = banked this period; fills, trading
+    # P&L and cash held = this period's fills only; pacing vs $1 and LATEST_TARGET.
+    latest = None
+    lp = max((r["period"] for r in rows.values() if r["period"] != "wave-1104"), default=None)
+    if lp:
+        lts = [t for t, r in rows.items() if r["period"] == lp]
+        lp_ts = _ts(lp)
+        lfills: dict = {t: [] for t in lts}
+        for f in fills:
+            if f["ticker"] in lfills and (lp_ts is None or _f(f.get("ts")) >= lp_ts.timestamp()):
+                n = _f(f.get("count"))
+                lfills[f["ticker"]].append((n if f.get("our_book_side") == "bid" else -n,
+                                            _f(f.get("yes_price_cents"))))
+        la = [rows[t] for t in lts if rows[t]["active"]]
+        latest = {"period": lp, "n": len(lts), "listed": len(la), "quoted": sum(1 for r in la if r["rest_ct"]),
+                  "two_sided": sum(1 for r in la if r["sides"] == 2),
+                  "rest_ct": sum(rows[t]["rest_ct"] for t in lts),
+                  "rest_coll": sum((px if sd == "bid" else 100 - px) * q for t in lts for sd, px, q in own[t]) / 100.0,
+                  "est": sum(rows[t]["period_est"] for t in lts),
+                  "proj_est": sum(rows[t]["proj_period"] for t in lts),
+                  "rate": sum(rows[t]["rate"] for t in lts),
+                  "target": LATEST_TARGET,
+                  "ok_target": sum(1 for r in la if r["proj_period"] >= LATEST_TARGET),
+                  "ok_1": sum(1 for r in la if r["proj_period"] >= 1.0),
+                  "short_1": sum(1 for r in la if r["proj_period"] < 1.0),
+                  "fills": sum(len(v) for v in lfills.values()),
+                  "fill_ct": sum(abs(q) for v in lfills.values() for q, _p in v),
+                  "real": 0.0, "open": 0.0, "cost": 0.0}
+        for t in lts:
+            r = rows[t]
+            mark = r["last"] if r["last"] is not None else (
+                (r["bid"] + r["ask"]) / 2 if r["bid"] and r["ask"] else None)
+            fx = fifo(lfills[t], mark)
+            latest["real"] += fx["real"]
+            latest["open"] += fx["open"]
+            latest["cost"] += fx["cost"]
+        latest["trade"] = latest["real"] + latest["open"]
+        latest["net"] = latest["trade"] + latest["est"]
+        latest = {k: (round(v, 2) if isinstance(v, float) else v) for k, v in latest.items()}
     tot["trade"] = tot["real"] + tot["open"]
     tot["est"] = sum(cum.get(t, 0.0) for t in tickers)
     tot["net"] = tot["trade"] + tot["est"]
@@ -584,6 +630,7 @@ def poll(client, hist: dict) -> dict:
             "by_price": [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in b.items()} for b in bands],
             "end": end.isoformat() if end else None, "hrs_left": round(hrs_left, 2),
             "totals": {k: (round(v, 2) if isinstance(v, float) else v) for k, v in tot.items()},
+            "latest": latest,
             "rows": sorted(rows.values(), key=lambda r: r["trade"]),
             "by_series": sorted(by.values(), key=lambda b: b["net"]),
             "by_kind": sorted(kinds.values(), key=lambda k: k["kind"]),
@@ -634,6 +681,9 @@ tr.pos td{background:var(--hi)}tr.off td{opacity:.5}
 <h1>Post-vote dead books</h1><div class="mut" id="sub">loading...</div>
 <div class="mut" id="scan" style="font-size:12px;margin-top:2px"></div>
 <div class="err" id="err"></div>
+<h2 id="lhead" style="display:none"></h2>
+<div class="tiles" id="ltiles"></div>
+<h2 id="thead" style="display:none">Whole wave, every period since go-live</h2>
 <div class="tiles" id="tiles"></div>
 <h2>Pacing this period <span class="mut" id="pacesub" style="font-weight:400;font-size:12px"></span></h2>
 <div class="wrap" style="margin-bottom:8px"><table><thead><tr><th>Pacing to</th><th>Markets</th><th>Share</th><th>Est $/day now</th><th>Proj. this period</th><th>Earning $0 now</th></tr></thead><tbody id="pace"></tbody></table></div>
@@ -722,6 +772,22 @@ function render(){
     ['big','Cash held in positions',money(t.cost),`this page's fills since go-live, at cost &middot; free cash ${t.cash0!=null?money(t.cash0):'-'} (shard 0)${t.cash_all!=null?` / ${money(t.cash_all)} all shards`:''}`],
     ['','If every resting order filled',money(t.rest_coll||0),`what this page's resting orders would tie up (Kalshi reserves nothing for them until a fill)`]
   ].map(([c,k,v,s])=>`<div class="tile ${c}"><span class="mut">${k}</span><b>${v}</b><small>${s}</small></div>`).join('');
+  const L=d.latest;
+  if(L){
+    $('lhead').style.display='';$('thead').style.display='';
+    $('lhead').innerHTML=`Latest relight <span class="mut" style="font-weight:400;font-size:12px">(the ${L.n.toLocaleString()} markets on the program period from ${etS(L.period)} ET: rewards banked this period, this period's fills only)</span>`;
+    $('ltiles').innerHTML=[
+      ['big','Net this period',`<span class="${cls(L.net)}">${money(L.net)}</span>`,'est rewards this period + trading on this period\'s fills'],
+      ['big','Est rewards this period',`<span style="color:var(--est)">${money(L.est)}</span>`,`projected ${money(L.proj_est)} by the stop at today's rate`],
+      ['big','Trading P&L',`<span class="${cls(L.trade)}">${money(L.trade)}</span>`,`realized ${money(L.real)} &middot; open ${money(L.open)} (at last trade)`],
+      ['','Est reward rate now',money(L.rate)+'/day',`raw model; Kalshi has paid ~1.15x`],
+      ['','Markets quoting',`${L.quoted} / ${L.listed}`,`${L.two_sided} scoring both sides &middot; ${L.rest_ct.toLocaleString()} contracts resting`],
+      ['',`Pacing vs $${L.target.toFixed(2)}`,`<span class="up">${L.ok_target}</span> / ${L.listed}`,`active markets projected $${L.target.toFixed(2)}+ by their stop &middot; $1+: ${L.ok_1} &middot; under $1: <span class="dn">${L.short_1}</span>`],
+      ['','Fills this period',`${L.fills}`,`${Math.round(L.fill_ct).toLocaleString()} contracts &middot; open cost ${money(L.cost)}`],
+      ['big','Cash held in positions',money(L.cost),`this period's fills, at cost`],
+      ['','If every resting order filled',money(L.rest_coll||0),`what these markets' resting orders would tie up (Kalshi reserves nothing until a fill)`]
+    ].map(([c,k,v,s])=>`<div class="tile ${c}"><span class="mut">${k}</span><b>${v}</b><small>${s}</small></div>`).join('');
+  }
   $('kinds').innerHTML=(d.by_kind||[]).map(k=>`<tr><td><span class="tag ${k.kind}">${k.kind} books</span></td><td>${k.n}</td><td>${k.quoted}</td>
     <td style="color:var(--est)">${money(k.est)}</td><td class="${cls(k.trade)}"><b>${money(k.trade)}</b></td><td class="mut">${money(k.real)} / ${money(k.open)}</td>
     <td class="${cls(k.net)}"><b>${money(k.net)}</b></td><td>${money(k.rate)}</td><td>${k.fills}</td><td>${k.pos_mkts}</td></tr>`).join('');
