@@ -25412,6 +25412,80 @@ class TestLeagueAutoFamilies(_LeagueAutoFixture):
         self.assertEqual(bot.state.halted_until, 0.0)                 # whole book untouched
 
 
+class TestLeagueHandNcaaf(_LeagueAutoFixture):
+    """College football by hand (Jack 2026-11-17: "quote KXNCAAFTOPSEED-27T4,
+    but not when college football games are live"): a hand entry in the
+    league auto file with "league": "NCAAF" is a season member held while any
+    game on ESPN's college-football board is live, out for good from its
+    "until" day; the new-series pass never enrolls a KXNCAAF series."""
+
+    T = "KXNCAAFTOPSEED-67T4-OSU"
+    ENTRY = {"league": "NCAAF", "kind": "season", "size": "pilot",
+             "title": "College Football Playoff: Top 4 Seeds"}
+
+    def test_the_loader_takes_hand_season_members_only(self):
+        self.assertIsNone(imm.series_league("KXNCAAFTOPSEED"))       # never auto
+        self.assertEqual(self._write({
+            "KXNCAAFTOPSEED": dict(self.ENTRY, until="2067-12-06"),
+            "KXNCAAFGAME": {"league": "NCAAF", "kind": "game"},        # season only
+            "KXNCAAFNOLEAGUE": {"kind": "season"},                    # no league named
+            "KXNFLTOPSEED": {"league": "NCAAF", "kind": "season"},     # not KXNCAAF
+            "KXNCAAFBADDAY": dict(self.ENTRY, until="Dec 6")}), 1)     # no usable end
+        self.assertEqual(set(imm.LEAGUE_AUTO_SERIES), {"KXNCAAFTOPSEED"})
+        e = imm.LEAGUE_AUTO_SERIES["KXNCAAFTOPSEED"]
+        self.assertEqual((e["league"], e["kind"], e["until"]), ("NCAAF", "season", "2067-12-06"))
+        self.assertEqual(datetime.fromtimestamp(e["until_ts"], timezone.utc),
+                         datetime(2067, 12, 6, 5, 0, tzinfo=timezone.utc))   # 00:00 EST
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(IncentiveMarketMaker._allowed(self.T))
+        ov = imm.series_override("KXNCAAFTOPSEED")
+        self.assertTrue(ov.safe_join)
+        self.assertEqual(ov.size_mult, imm.LEAGUE_AUTO_SIZE_MULT)
+        self.assertIsNone(ov.start_buffer_min)                           # no cutoff
+        import imm_earnings_overrides as ieo
+        entry, why = ieo.league_auto_entry_for(
+            None, "KXNCAAFTOPSEED", self.T,
+            {"category": "Sports", "tags": ["Football"], "title": "CFP top 4"})
+        self.assertIsNone(entry)
+        self.assertIn("not an NBA", why)
+
+    def test_out_while_any_college_game_is_live_and_from_its_last_day(self):
+        self._write({"KXNCAAFTOPSEED": dict(self.ENTRY, until="2067-12-06")})
+        bot = self._bot([self.T], close="2068-01-10T00:00:00Z")
+        now = datetime.now(timezone.utc)
+        self.boards["/college-football/"] = {"events": []}
+
+        def cycle():
+            bot._mlb_get_cache.clear()
+            bot.run_cycle()
+            return self._sides(bot, self.T)
+        self.assertEqual(cycle(), {"bid", "ask"})                     # no game on
+        self.assertIn(self.T, bot.state.selected)
+        self.boards["/nba/"] = {"events": [self._ev("in", now - timedelta(hours=1))]}
+        self.assertEqual(cycle(), {"bid", "ask"})                     # another league
+        self.boards["/college-football/"] = {"events": [
+            self._ev("in", now - timedelta(hours=1), gid="7", short="BALL @ OHIO")]}
+        self.assertEqual(cycle(), set())                              # a MAC game is on
+        self.assertTrue(any("/football/college-football/scoreboard" in u for u in self.urls))
+        self.boards["/college-football/"] = {"events": [
+            self._ev("post", now - timedelta(hours=3), gid="7", short="BALL @ OHIO")]}
+        self.assertEqual(cycle(), set())                              # the cooldown
+        self.boards["/college-football/"] = {"events": [
+            self._ev("pre", now - timedelta(minutes=5), gid="8", short="AKR @ MASS")]}
+        self.assertEqual(cycle(), set())                              # past kickoff
+        self.boards["/college-football/"] = RuntimeError("espn down")
+        self.assertEqual(cycle(), set())                              # fails closed
+        self.boards["/college-football/"] = {"events": [
+            self._ev("pre", now + timedelta(hours=20), gid="9", short="OSU @ NEB")]}
+        self.assertEqual(cycle(), {"bid", "ask"})                     # tomorrow's slate
+        # its last day: out for good, games or not
+        yday = (now.astimezone(imm.ET) - timedelta(days=1)).strftime("%Y-%m-%d")
+        self._write({"KXNCAAFTOPSEED": dict(self.ENTRY, until=yday)})
+        self.assertEqual(cycle(), set())
+        self.assertIn("past its last day",
+                      bot._league_auto_hold("KXNCAAFTOPSEED", time.time(), self.T))
+
+
 class TestLeagueAutoNhlAndLol(_LeagueAutoFixture):
     """NHL rides the ESPN rules (Jack 2026-10-15: "same with NHL e.g.
     KXNHLSEASONGOALS, KXNHLSEASONPPTS"); League of Legends rides lolesports'

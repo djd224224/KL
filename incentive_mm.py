@@ -7539,11 +7539,25 @@ LEAGUE_AUTO_SIZE_MULT = _env_float("IMM_LEAGUE_AUTO_SIZE_MULT", NFL_AUTO_SIZE_MU
 LEAGUE_AUTO_DAILY_LOSS_LIMIT = _env_float("IMM_LEAGUE_AUTO_DAILY_LOSS_LIMIT", 100)  # per event
 LEAGUE_LIVE_COOLDOWN_MIN = _env_int("IMM_LEAGUE_LIVE_COOLDOWN_MIN", 15)
 LEAGUE_LIVE_TTL_SECS = _env_int("IMM_LEAGUE_LIVE_TTL_SECS", 60)
+# HAND-ENROLLED LEAGUES (Jack 2026-11-17: "quote KXNCAAFTOPSEED-27T4, but not
+# when college football games are live"). A league here rides the season
+# members' rules -- out while any game of it is live on its ESPN board, plus
+# LEAGUE_LIVE_COOLDOWN_MIN after a final; a board that cannot be read counts
+# as live -- but only for a series named in LEAGUE_AUTO_FILE by hand with
+# that "league" (season members only). series_league never returns it, so
+# the new-series pass (imm_earnings_overrides.enroll_new_series) enrolls no
+# series of it. NCAAF reads ESPN's default college-football board: every FBS
+# game, FBS-v-FCS included (55 on Saturday 11/14), and the weeknight MAC
+# games (three live on Tuesday 11/17). A member's "until" (YYYY-MM-DD) puts
+# it out for good from 00:00 ET that day -- the CFP top-seed event's is
+# Selection Day, 2026-12-06 (the final rankings and bracket, noon ET), which
+# Kalshi's dates (occurrence 2027-01-31, a placeholder) do not carry.
+LEAGUE_HAND_PREFIXES = {"NCAAF": "KXNCAAF"}
 # a final that started this long ago is long over (MLB: extra innings)
 LEAGUE_GAME_OVER_AFTER_H = {"NBA": 4.0, "WNBA": 4.0, "MLB": MLB_GAME_OVER_AFTER_H,
-                            "NHL": 4.0}
+                            "NHL": 4.0, "NCAAF": 5.0}
 LEAGUE_START_WORD = {"NBA": "tip-off", "WNBA": "tip-off", "MLB": "first pitch",
-                     "NHL": "puck drop"}
+                     "NHL": "puck drop", "NCAAF": "kickoff"}
 LEAGUE_DECIDED_ROUNDS = frozenset({"NBA Finals", "WNBA Finals", "World Series",
                                    "ALCS", "NLCS", "Stanley Cup Final"})
 LEAGUE_AUTO_BUDGET_PREFIX = "LEAGUEAUTO:"
@@ -7800,6 +7814,9 @@ def load_league_auto_series() -> int:
         if league is None and e.get("league") in ESPORTS_LEAGUES \
                 and s_.startswith("KX") and not s_.startswith("KXNFL"):
             league = e["league"]          # esports: the enrollment read the title
+        if league is None and e.get("league") in LEAGUE_HAND_PREFIXES \
+                and s_.startswith(LEAGUE_HAND_PREFIXES[e["league"]]):
+            league = e["league"]          # a hand-enrolled league (never auto)
         if league is None:
             continue
         if e.get("league") not in (None, league):
@@ -7813,9 +7830,20 @@ def load_league_auto_series() -> int:
             log(f"[IMM] ! refused hand-configured family in league auto: {s_}")
             continue
         kind, size = e.get("kind"), e.get("size") or "pilot"
-        if league in ESPORTS_LEAGUES and kind != "season":
+        if (league in ESPORTS_LEAGUES or league in LEAGUE_HAND_PREFIXES) \
+                and kind != "season":
             log(f"[IMM] ! league auto {s_}: {league} quotes season members only, skipped")
             continue
+        # "until": out for good from 00:00 ET that day (LEAGUE_HAND_PREFIXES);
+        # a date that does not parse skips the member (no end = no quotes)
+        until = str(e.get("until") or "").strip() or None
+        until_ts = None
+        if until is not None:
+            try:
+                until_ts = ET.localize(datetime.strptime(until, "%Y-%m-%d")).timestamp()
+            except ValueError:
+                log(f"[IMM] ! league auto {s_}: until {until!r} is not YYYY-MM-DD, skipped")
+                continue
         if kind not in ("game", "season") or size != "pilot":
             log(f"[IMM] ! league auto {s_}: kind/size {kind!r}/{size!r} not "
                 f"understood, skipped")
@@ -7833,6 +7861,8 @@ def load_league_auto_series() -> int:
         fresh[s_] = {"league": league, "kind": kind, "size": size,
                      "buffer_min": max(0, buf), "decided_by": rnd,
                      "title": str(e.get("title") or "")}
+        if until_ts is not None:
+            fresh[s_].update(until=until, until_ts=until_ts)
     for s_ in _league_auto_state["installed"] - set(fresh):
         SERIES_OVERRIDES.pop(s_, None)
     for s_, e in fresh.items():
@@ -39719,13 +39749,17 @@ class IncentiveMarketMaker:
 
     def _league_auto_hold(self, series: str, now_ts: float, ticker: str = "") -> str:
         """Why a league auto family SEASON member sits out now ('' =
-        quote): its deciding round ("decided_by") decided on its league's
-        ESPN boards -- today's and the MLB_DECIDED_LOOKBACK_DAYS before it,
-        sticky for the process -- or any game of its league live
+        quote): past its "until" day (a hand-enrolled league's end,
+        LEAGUE_HAND_PREFIXES), its deciding round ("decided_by") decided on
+        its league's ESPN boards -- today's and the MLB_DECIDED_LOOKBACK_DAYS
+        before it, sticky for the process -- or any game of its league live
         (espn_live_verdict). An unreadable board holds it too (fail
         closed). See LEAGUE_AUTO_ENABLE."""
         e = league_auto_entry(series) or {}
         league = e.get("league") or series_league(series) or ""
+        # a hand entry's last day (LEAGUE_HAND_PREFIXES): out for good from it
+        if e.get("until_ts") is not None and now_ts >= float(e["until_ts"]):
+            return f"past its last day ({e.get('until')}, 00:00 ET)"
         if league == "LOL":
             return self._lol_hold(ticker or series, now_ts)
         path = ESPN_LEAGUE_PATHS.get(league)
