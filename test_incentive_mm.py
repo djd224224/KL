@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import time
+import types
 import dataclasses
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -47749,6 +47750,72 @@ class TestCryptoEventFair(unittest.TestCase):
             self.assertEqual(self._resting(bot, t), [], kw)
             self.assertIn(t, bot._cev_stood)
 
+
+
+class TestFarFromFair1118(unittest.TestCase):
+    """Jack 2026-11-18, the w1113-fxmetals relight: "Yes, build it" -- a wave side 20c+ on the
+    safe side of its LIVE fair (a bid that far under, an ask that far over) can't be baited, so
+    it skips the join wait and the off-usual size cut. KXUSDMXNEVENT-16DEC261015-T176000 sat
+    dark: a 12c bid on a 95.5c fair, waiting 102 s to join each new wall, pulled meanwhile."""
+    T = "KXUSDMXNEVENT-16DEC261015-T176000"
+
+    def setUp(self):
+        now = time.time()
+        imm._fx_event_state["snap"] = {
+            "checked_ts": now, "mode": "weekday", "close_at": "2026-11-13T22:00Z",
+            "series": {"KXUSDMXNEVENT": {"spot": 18.85, "hold_until": None, "err": None}},
+            "markets": {self.T: {"series": "KXUSDMXNEVENT", "strike": 17.6, "p": 0.955, "margin": 1.0,
+                                 "bid_max": 94, "ask_min": 97, "spot": 18.85, "spot_ts": now - 5,
+                                 "t_days": 19.0, "hold_until": None}}}
+        self.addCleanup(imm._fx_event_state.update, snap=None)
+        p = mock.patch.object(imm, "pvd_entry", lambda t: {"size": 675} if t == self.T else None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_default_and_the_live_fair(self):
+        self.assertEqual(imm.FAR_FROM_FAIR_C, 20.0)
+        self.assertEqual(imm.live_wave_fair_c(self.T, time.time()), 95.5)
+        self.assertIsNone(imm.live_wave_fair_c("KXHIGHNY-26NOV19-T50", time.time()))   # no live fair
+
+    def test_far_means_the_safe_side_by_20c(self):
+        now = time.time()
+        self.assertTrue(imm.side_far_from_fair(self.T, "bid", 12, now))       # 83.5c under the fair
+        self.assertFalse(imm.side_far_from_fair(self.T, "bid", 80, now))      # 15.5c: the guards stand
+        self.assertFalse(imm.side_far_from_fair(self.T, "ask", 97, now))      # an ask over by 1.5c
+        self.assertFalse(imm.side_far_from_fair("KXUSDMXNEVENT-16DEC261015-T190000", "bid", 12, now))  # off the list
+        with mock.patch.object(imm, "FAR_FROM_FAIR_C", 0.0):
+            self.assertFalse(imm.side_far_from_fair(self.T, "bid", 12, now))   # IMM_FAR_FROM_FAIR_C=0
+        imm._fx_event_state["snap"]["markets"][self.T]["spot_ts"] = now - imm.FX_EVENT_TTL_SECS - 5
+        self.assertFalse(imm.side_far_from_fair(self.T, "bid", 12, now))       # a stale fair: no exemption
+
+    def test_far_sides_reads_the_best_rung_and_skips_pads(self):
+        q = [Quote(self.T, "bid", 12, 3375), Quote(self.T, "bid", 1, 1000, is_pad=True),
+             Quote(self.T, "ask", 97, 3375)]
+        self.assertEqual(imm.far_sides(self.T, q, time.time()), {"bid"})
+        self.assertEqual(imm.far_sides(self.T, [Quote(self.T, "ask", 97, 3375)], time.time()), set())
+
+    def test_a_side_with_no_usual_price_and_not_cold_keeps_its_size(self):
+        # how the off-usual call site exempts a far side: usual None, out of cold_sides
+        q = [Quote(self.T, "bid", 12, 3375), Quote(self.T, "ask", 90, 3375)]   # the ask 9c under its usual
+        out, cuts = imm.pvd_off_usual_cut(q, None, 99.0, 675, cold_sides=())
+        self.assertEqual(sorted((x.book_side, x.count) for x in out), [("ask", 675), ("bid", 3375)])
+        self.assertEqual(set(cuts), {"ask"})
+
+    def test_the_join_wait_lets_a_far_side_join_at_once(self):
+        bot = types.SimpleNamespace(
+            tag="[IMM]", state=types.SimpleNamespace(join_wait={}, join_wait_last={}),
+            _toxic_key=imm.IncentiveMarketMaker._toxic_key, _join_wait_note=lambda *a, **k: None)
+        own = [("bid", 9, 3375)]                     # resting 9c; the wall moved to 13c: $135 at risk
+        now = time.time()
+        b, _a = imm.IncentiveMarketMaker._join_wait(bot, self.T, 13, None, 3375, 0, own, now)
+        self.assertEqual(b, 13)                      # joins the wall now
+        key = imm.IncentiveMarketMaker._toxic_key(self.T, "bid")
+        self.assertNotIn(key, bot.state.join_wait)
+        self.assertEqual(bot.state.join_wait_last[key][0], 13)
+        with mock.patch.object(imm, "FAR_FROM_FAIR_C", 0.0):   # the guard as built: it waits
+            bot.state.join_wait.clear(); bot.state.join_wait_last.clear()
+            b, _a = imm.IncentiveMarketMaker._join_wait(bot, self.T, 13, None, 3375, 0, own, now)
+            self.assertLess(b, 13)
 
 
 class TestFxEventFair(unittest.TestCase):

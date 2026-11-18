@@ -20893,6 +20893,64 @@ def fx_event_wave_limits(ticker: str, now_ts: float) -> Optional[Tuple[int, int]
     return (caps[0] if caps[0] is not None else 0, caps[1] if caps[1] is not None else 100)
 
 
+# FAR FROM A LIVE FAIR (Jack 2026-11-18, on the w1113-fxmetals relight: "Yes, build it").
+# The join wait and the off-usual size cut are bait defenses: a price that moved toward the
+# taker might be a trap. A wave side resting FAR_FROM_FAIR_C or more on the SAFE side of a
+# LIVE model fair -- a bid that far under it, an ask that far over it -- can't be baited: a
+# fill there buys well under, or sells well over, what the strike is worth. On that relight
+# other makers stepped their 30-80k walls up four times in four hours (3-5c -> 12-15c bids);
+# each step the join wait (100-270 s) left our bid behind the new wall, the earn-only rule
+# pulled it (1,000+ contracts in front, past the walk), and the off-usual cut held it at
+# base when it rejoined -- 23:05-23:19Z, 465 of the 499 relight sides those guards held sat
+# 20c+ from their fair (KXUSDMXNEVENT-16DEC261015-T176000: a 12c bid on a 95.5c fair, dark).
+# Such a side skips both guards and follows its wall at full size; the fair limits, the jump
+# hold and every breaker stand. Live fairs: the FX event fair (fx_event_gate) and the crypto
+# event fair (crypto_event_gate), passing their gates; none = the guards stand.
+# IMM_FAR_FROM_FAIR_C=0 turns it off.
+FAR_FROM_FAIR_C = _env_float("IMM_FAR_FROM_FAIR_C", 20.0)
+
+
+def live_wave_fair_c(ticker: str, now_ts: float) -> Optional[float]:
+    """A strike's live model fair (YES cents) while its gate passes -- the FX event fair or
+    the crypto event fair -- else None."""
+    s = series_of(ticker)
+    try:
+        if fx_event_series(s):
+            why, inputs, _caps = fx_event_gate(ticker, now_ts)
+            return None if why else float(inputs["fair"])
+        if crypto_event_series(s):
+            why, inputs, _caps = crypto_event_gate(ticker, now_ts, None, None)
+            return None if why else float(inputs["fair"])
+    except Exception:  # noqa: BLE001 -- no fair: the guards stand
+        return None
+    return None
+
+
+def side_far_from_fair(ticker: str, side: str, yes_px: float, now_ts: float) -> bool:
+    """Does a WAVE side priced `yes_px` (YES cents) rest FAR_FROM_FAIR_C+ on the safe side of
+    its live fair -- a bid that far under it, an ask that far over it?"""
+    if FAR_FROM_FAIR_C <= 0 or pvd_entry(ticker) is None:
+        return False
+    f = live_wave_fair_c(ticker, now_ts)
+    if f is None:
+        return False
+    return (f - float(yes_px) >= FAR_FROM_FAIR_C) if side == "bid" else (float(yes_px) - f >= FAR_FROM_FAIR_C)
+
+
+def far_sides(ticker: str, quotes, now_ts: float) -> set:
+    """The sides of `quotes` whose best rung rests FAR_FROM_FAIR_C+ on the safe side of the
+    strike's live fair (side_far_from_fair). Pads are not rungs."""
+    out: set = set()
+    if FAR_FROM_FAIR_C <= 0:
+        return out
+    for side in ("bid", "ask"):
+        pxs = [float(q.price_exact if q.price_exact is not None else q.price_cents)
+               for q in quotes if q.book_side == side and not q.is_pad and q.count > 0]
+        if pxs and side_far_from_fair(ticker, side, max(pxs) if side == "bid" else min(pxs), now_ts):
+            out.add(side)
+    return out
+
+
 # LISTED COMBO FAIR (Jack 2026-11-17: "build the fair, expect combos as a line of business").
 # Kalshi's LISTED combo grids (KX...COMBO events; not the RFQ multivariate KXMVE* combos) cross
 # one yes/no leg another Kalshi market prices -- the 2028 party, Le Pen, the US-Iran deal --
@@ -38599,6 +38657,13 @@ class IncentiveMarketMaker:
                     mine = [100 - int(p) for bs, p, _n in own
                             if bs == "ask" and p < PAD_ASK_CENTS]
                 key = self._toxic_key(t, side)
+                if side_far_from_fair(t, side, float(px), now_ts):
+                    # FAR FROM A LIVE FAIR (Jack 2026-11-18): no bait to wait out -- it
+                    # joins where it wants; the next wait starts fresh from here
+                    self.state.join_wait.pop(key, None)
+                    self.state.join_wait_last[key] = [want, round(now_ts)]
+                    out.append(px)
+                    continue
                 resting = max(mine) if mine else None
                 if resting is None and JOIN_WAIT_REST_MEMORY_H > 0:
                     # REST MEMORY: no rung (a halt / pull / restart cancelled
@@ -45039,10 +45104,13 @@ class IncentiveMarketMaker:
                 try:
                     _ub, _ua = pvd_usual_px(self.state.pvd_usual.get(t), now_ts)
                     if mq:
+                        # FAR FROM A LIVE FAIR (Jack 2026-11-18): such a side keeps its size
+                        _far = far_sides(t, mq, now_ts)
                         _ou_q, _ou = pvd_off_usual_cut(
-                            mq, _ub, _ua, int(pvd.get("size") or 0),
+                            mq, None if "bid" in _far else _ub, None if "ask" in _far else _ua,
+                            int(pvd.get("size") or 0),
                             cold_sides=tuple(s for s, u in (("bid", _ub), ("ask", _ua))
-                                             if u is None) if PVD_OFF_USUAL_COLD else (),
+                                             if u is None and s not in _far) if PVD_OFF_USUAL_COLD else (),
                             pos=cap_pos,
                             cold_cap=(CRYPTO_WAVE_COLD_SIZE if crypto_event_series(meta.series)
                                       else None))
@@ -49677,6 +49745,10 @@ class IncentiveMarketMaker:
                                              if PVD_OFF_USUAL_COLD else "")
                + ("" if PVD_OFF_USUAL_MODE == "on" else " (dry: logged, nothing cut)")
                if PVD_OFF_USUAL_MODE in ("on", "dry") else ""))
+        log(f"far from a live fair (2026-11-18): "
+            + (f"a wave side {FAR_FROM_FAIR_C:g}c+ on the safe side of its live FX / crypto "
+               f"event fair skips the join wait and the off-usual size cut"
+               if FAR_FROM_FAIR_C > 0 else "off (IMM_FAR_FROM_FAIR_C=0)"))
         log(f"off-usual size for big sides off the list (2026-11-08): {OFF_USUAL_BIG_MODE}"
             + (f" -- a market off the wave list whose side plans {OFF_USUAL_BIG_MIN:,}+ "
                f"contracts and rests more than {PVD_OFF_USUAL_C:g}c nearer the taker than "

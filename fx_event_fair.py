@@ -76,6 +76,14 @@ META_REFRESH_SECS = 600          # Kalshi market lists
 VOL_ERR = 0.25                   # pvd_wave_tune --fair-vol-err
 REQUOTE_MIN = 3.0                # how long a quote may rest before the bot requotes it
 REQUOTE_SD = 2.0                 # weekday margin: this many sd of the source's move over REQUOTE_MIN
+# EDGE (Jack 2026-11-18, on the 11/18 relight: "also 1c of edge is enough"): with EDGE_C > 0 a
+# strike's margin is EDGE_C alone -- a wave book bids at most fair - EDGE_C and asks at least
+# fair + EDGE_C -- in place of the 2c base + the 25% vol-error term + the weekday requote term
+# (3-9c on that relight). A wave book never leads its book (it joins the walls inside its
+# limits), so this lets in the side whose wall sits 1-9c from a strike's fair: the 97c ask on a
+# 95.5c-fair strike (KXUSDMXNEVENT-16DEC261015-T176000) the old margin kept out. The jump hold,
+# the stale stand-aside and the 12 h cutoff stand. IMM_FX_EVENT_EDGE_C=0 restores the old margin.
+EDGE_C = float(os.environ.get("IMM_FX_EVENT_EDGE_C", "1") or 0)
 JUMP_SD = 0.35                   # a move > this x the daily sigma inside the window = a jump (BTC 1% ~ 0.36)
 # A WIDE BOOK'S MID IS NOT A PRICE (2026-11-14, first live hour): Bitso's weekend USD/MXN book
 # flickers -- its spread 0.005% <-> 0.29% as the ask side thins, the mid 0.23% in 3 min -- and
@@ -211,10 +219,13 @@ def strike_fair(series: str, spot: float, strike: float, t_days: float, weekday:
     sig = VOL_D[series] * math.sqrt(t_days)
     z = math.log(spot / strike) / sig
     p = _N(z)
-    m = MARGIN[series] + 100 * VOL_ERR * _phi(z) * abs(z)
-    if weekday:
-        sig_rq = VOL_D[series] * math.sqrt(REQUOTE_MIN / 1440 * 7 / 5)
-        m += 100 * _phi(z) * REQUOTE_SD * sig_rq / sig
+    if EDGE_C > 0:
+        m = EDGE_C                   # EDGE: 1c of edge is enough (Jack 2026-11-18)
+    else:
+        m = MARGIN[series] + 100 * VOL_ERR * _phi(z) * abs(z)
+        if weekday:
+            sig_rq = VOL_D[series] * math.sqrt(REQUOTE_MIN / 1440 * 7 / 5)
+            m += 100 * _phi(z) * REQUOTE_SD * sig_rq / sig
     floor = WEEKDAY_FLOOR if weekday else WEEKEND_FLOOR
     bid_max = max(floor, int(math.floor(100 * p - m + 1e-9)))
     ask_min = min(100 - floor, int(math.ceil(100 * p + m - 1e-9)))
@@ -371,7 +382,7 @@ class FxEventWatch:
             "checked_ts": now_ts, "mode": "weekday" if weekday else "weekend",
             "close_at": t0.strftime("%Y-%m-%dT%H:%MZ"), "reopen": reopen.strftime("%Y-%m-%dT%H:%MZ"),
             "series": ser, "markets": mk, "errors": errors,
-            "model": {"vol_err": VOL_ERR, "requote_min": REQUOTE_MIN, "requote_sd": REQUOTE_SD,
+            "model": {"edge_c": EDGE_C, "vol_err": VOL_ERR, "requote_min": REQUOTE_MIN, "requote_sd": REQUOTE_SD,
                       "max_spread": MAX_SPREAD,
                       "jump_sd": JUMP_SD, "jump_window_s": JUMP_WINDOW_SECS, "jump_hold_s": JUMP_HOLD_SECS,
                       "cutoff_h": CUTOFF_H, "floor": WEEKDAY_FLOOR if weekday else WEEKEND_FLOOR},
