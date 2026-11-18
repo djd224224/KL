@@ -43115,13 +43115,16 @@ class TestHomeLead(unittest.TestCase):
     because there's a fair you can extend range 1-99c"): the Zillow cities
     lead off the home gate's fair (FAIR LEAD) at the gate's own 15c margin.
     Fixture: NYC $875k's 11/12 book -- 40,139 YES and 39,924 NO at 1c,
-    nothing between -- against a 30.6c fair."""
+    nothing between -- against a 30.6c fair. Off since 2026-11-16 (Jack: "have
+    Zillow not lead"): these run with IMM_HOME_LEADS=1, the way back; the
+    default is TestHomeLeadOff's."""
 
     T = "KXNYCHOME-30NOV67-GT875000"
     EV = "KXNYCHOME-30NOV67"
     CLOSE = datetime(2067, 12, 17, 15, 0, tzinfo=timezone.utc)
     WALLS = ([[1, 40139.0]], [[1, 39924.0]])
     _snap = TestZillowHomeGate._snap
+    HOME_LEADS = True
 
     def setUp(self):
         _clean_persist()
@@ -43130,7 +43133,8 @@ class TestHomeLead(unittest.TestCase):
         imm.SERIES_HOUR_MULTS = []
         for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
                   mock.patch.object(imm, "LADDER_MODE", "atref"),
-                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on")):
+                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                  mock.patch.object(imm, "HOME_LEADS", self.HOME_LEADS)):
             p.start()
             self.addCleanup(p.stop)
 
@@ -43263,6 +43267,58 @@ class TestHomeLead(unittest.TestCase):
             bot, rungs, _ = self._cycle(p=0.094)
         self.assertEqual(rungs.get("ask"), (87, 200))
         self.assertEqual({px for s, px in self._orders(bot) if s == "bid"}, set())
+
+
+class TestHomeLeadOff(unittest.TestCase):
+    """ZILLOW DOES NOT LEAD (Jack 2026-11-16: "have Zillow not lead", after a
+    taker bought five Zillow markets' YES in one second at 15:34:19Z, 73 min
+    before October's file, off asks the lead had rested at 26-31c): no lead of
+    any kind on a Zillow series by default, while its FAIR CLOSE still reads
+    the model. Same fixture as TestHomeLead."""
+
+    T, EV, CLOSE, WALLS = TestHomeLead.T, TestHomeLead.EV, TestHomeLead.CLOSE, TestHomeLead.WALLS
+    _snap = TestZillowHomeGate._snap
+    HOME_LEADS = False
+    setUp = TestHomeLead.setUp
+    tearDown = TestHomeLead.tearDown
+    _cycle = TestHomeLead._cycle
+    _orders = TestHomeLead._orders
+
+    def test_no_zillow_series_leads(self):
+        for s in imm.HOME_SERIES:
+            self.assertTrue(imm.home_lead_off(s), s)
+            self.assertFalse(imm.fair_lead_series(s), s)
+            self.assertTrue(imm.in_fair_lead_series(s), s)      # the kit's other parts stay
+            self.assertTrue(imm.fair_close_series(s), s)
+        # every other family still leads
+        self.assertTrue(imm.fair_lead_series("KXRAINWKND"))
+        self.assertFalse(imm.home_lead_off("KXRAINWKND"))
+
+    def test_the_fair_still_closes_but_never_leads(self):
+        now = time.time()
+        self._snap(p=0.306)
+        self.assertAlmostEqual(imm.fair_close_fair_c(self.T, "KXNYCHOME", now), 30.6)
+        # no model lead, and no book lead in its place
+        self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXNYCHOME", now))
+
+    def test_the_event_room_is_the_series_own(self):
+        imm.EVENT_PROGRAMMED_N[self.EV] = 5
+        self.addCleanup(imm.EVENT_PROGRAMMED_N.pop, self.EV, None)
+        own = imm.MAX_EVENT_CONTRACTS * imm.applied_mention_mult("KXNYCHOME")
+        self.assertEqual(imm.event_cap_contracts(self.EV), own)
+        with mock.patch.object(imm, "HOME_LEADS", True):
+            self.assertEqual(imm.event_cap_contracts(self.EV),
+                             max(imm.FAIR_LEAD_EVENT_CAP,
+                                 imm.FAIR_LEAD_EVENT_PER_MARKET * 5, own))
+
+    def test_the_quote_loop_rests_no_lead_on_the_empty_book(self):
+        bot, rungs, lines = self._cycle()
+        self.assertNotEqual(rungs.get("bid"), (13, 200), lines[-40:])
+        self.assertNotEqual(rungs.get("ask"), (87, 200))
+        self.assertFalse(any(f"fair lead {self.T}" in s for s in lines),
+                         [s for s in lines if "fair lead" in s])
+        # nothing rests between the 1c walls: the gate's caps on the book's reference
+        self.assertEqual({px for s, px in self._orders(bot) if 1 < px < 99}, set())
 
 
 if __name__ == "__main__":

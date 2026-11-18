@@ -3491,9 +3491,11 @@ def event_cap_contracts(event_ticker: str) -> float:
     # a family that leads off its fair (2026-10-29, FAIR LEAD): room for the
     # leads, which take first call on it, beside the other markets' rungs --
     # FAIR_LEAD_EVENT_PER_MARKET for each of the event's programmed markets
-    # (2026-10-31), never under FAIR_LEAD_EVENT_CAP
+    # (2026-10-31), never under FAIR_LEAD_EVENT_CAP; not a Zillow series that
+    # leads nothing (home_lead_off, 2026-11-16)
     if globals().get("FAIR_LEAD_MODE") == "on" \
-            and globals().get("in_fair_lead_series", lambda s: False)(series):
+            and globals().get("in_fair_lead_series", lambda s: False)(series) \
+            and not globals().get("home_lead_off", lambda s: False)(series):
         return max(globals()["FAIR_LEAD_EVENT_CAP"],
                    globals()["FAIR_LEAD_EVENT_PER_MARKET"]
                    * EVENT_PROGRAMMED_N.get(event_ticker, 0),
@@ -15041,6 +15043,7 @@ _CONFIG_CODE_KNOBS = (
     "COMP_HEDGE_MODE", "COMP_HEDGE_EDGE_C", "COMP_HEDGE_MAX_AGE_SECS",
     "COMP_LEAD_MAX_POSITION",
     "LEAD_OFF_SERIES",            # no leads on OpenRouter (2026-11-01)
+    "HOME_LEADS",                 # no leads on Zillow (2026-11-16)
     "LEAD_STOP_BEFORE_H",         # no lead in the 24h before a decision (2026-11-01)
     # RT settled strikes (2026-11-01)
     "RT_SETTLED_MODE", "RT_SETTLED_MIN_REVIEWS", "RT_SETTLED_P", "RT_SETTLED_MIN_GAP",
@@ -27411,6 +27414,8 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
 # cancel judged against the model. A stale read, a new Zillow release (the
 # hold) or a decided strike leads nothing (home_fair_c returns None).
 # IMM_FAIR_LEAD_SERIES without them takes the family out.
+# PULLED 2026-11-16 (Jack: "have Zillow not lead"): see ZILLOW DOES NOT LEAD
+# (home_lead_off); the family keeps its FAIR CLOSE.
 FAIR_LEAD_MODE = os.environ.get("IMM_FAIR_LEAD", "on").strip().lower()
 FAIR_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
     {s.strip() for s in os.environ.get(
@@ -27522,6 +27527,31 @@ def past_band_ahead(side: str, px: int, best: Optional[int]) -> bool:
 # HOME LEADS for the auto-enrolled Zillow series (HOME_AUTO): while any
 # hand-named home series is in FAIR_LEAD_SERIES, the family's kit is theirs too
 HOME_AUTO_LEAD = any(s_ in FAIR_LEAD_SERIES for s_ in HOME_SERIES)
+# ZILLOW DOES NOT LEAD (Jack 2026-11-16: "have Zillow not lead"). At 15:34:19Z
+# on 11/16 one taker bought YES in five Zillow markets across four cities in
+# the same second, 73 minutes before Zillow's October file landed: our
+# Hoboken asks rested at 26-31c off a 3-12c fair still built on September's
+# print, and October came in 7.7% over the model (those strikes ~100%). The
+# lead had got there over three days: 86c over a 97c wall on 11/13, re-led
+# down after makers that stepped ahead of it (76c, 34c, then 26c on 11/14),
+# then held at 26c by the makers that joined its price (300-2,800 contracts
+# sat there beside it) while the rest of the book went back to 81-86c. The
+# family lost $438 on its fills that day. So a Zillow side leads nothing --
+# no model lead (FAIR LEAD), no lead off its strikes' books (the ladder
+# lead), no book lead -- and quotes at the book's reference under the home
+# gate's caps (bids <= fair - 15c, asks >= fair + 15c, the 1c / 99c edges),
+# as it did before 11/13. FAIR CLOSE stays: a held position still rests its
+# reducing side at the model's price where that earns, and stays selected.
+# What existed only for the leads goes with them: LEAD INVENTORY (the side a
+# position adds to is judged by the series' own cap and skew on all of it)
+# and the leads' event room (the series' own event cap). IMM_HOME_LEADS=1
+# restores the leads.
+HOME_LEADS = os.environ.get("IMM_HOME_LEADS", "0") == "1"
+
+
+def home_lead_off(series: str) -> bool:
+    """A Zillow home-value series that leads nothing (HOME_LEADS off)."""
+    return not HOME_LEADS and home_series(series)
 
 
 def in_fair_lead_series(series: str) -> bool:
@@ -27551,9 +27581,10 @@ def fair_close_series(series: str) -> bool:
 
 
 def fair_lead_series(series: str) -> bool:
-    """May this series' markets lead off a model fair (FAIR LEAD)?"""
+    """May this series' markets lead off a model fair (FAIR LEAD)? Never a
+    Zillow series while it leads nothing (home_lead_off)."""
     return (FAIR_LEAD_MODE in ("on", "dry") and LADDER_MODE == "atref"
-            and in_fair_lead_series(series))
+            and in_fair_lead_series(series) and not home_lead_off(series))
 
 
 def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
@@ -38164,7 +38195,7 @@ class IncentiveMarketMaker:
         decision (LEAD STOP; the quote loop asks with stop=False so that it
         logs the leads it stands down). Each mode's own switch applies
         (lead_mode)."""
-        if meta.series.startswith(LEAD_OFF_SERIES):
+        if meta.series.startswith(LEAD_OFF_SERIES) or home_lead_off(meta.series):
             return None
         if stop and lead_stop_due(meta, time.time()):
             return None
@@ -43851,7 +43882,8 @@ class IncentiveMarketMaker:
             # rung as if the first FAIR_LEAD_MAX_POSITION of the position were
             # not there -- the series' own cap and skew judge the excess only
             skew_b = skew_a = cap_pos
-            if FAIR_LEAD_INV_QUOTE and in_fair_lead_series(meta.series):
+            if FAIR_LEAD_INV_QUOTE and in_fair_lead_series(meta.series) \
+                    and not home_lead_off(meta.series):
                 _xs = cap_pos - max(-FAIR_LEAD_MAX_POSITION,
                                     min(FAIR_LEAD_MAX_POSITION, cap_pos))
                 _base = series_max_position(meta.series, now_utc)
@@ -48453,7 +48485,10 @@ class IncentiveMarketMaker:
                 f"{HOME_FAIR_TOL_CENTS}c, a touch fighting the fair by more "
                 f"stands aside, {HOME_RELEASE_HOLD_MIN}m out after a Zillow "
                 f"release, size x{HOME_SIZE_MULT:g}, 1-99c, out 00:00 ET on the "
-                f"ticker day, ttl {HOME_FAIR_TTL_MIN}m, status {HOME_STATUS_FILE}")
+                f"ticker day, ttl {HOME_FAIR_TTL_MIN}m, leads "
+                + ("on" if HOME_LEADS else "OFF (fair closes only; IMM_HOME_LEADS=1 "
+                   "restores them)")
+                + f", status {HOME_STATUS_FILE}")
         else:
             log("mortgage gate: OFF -- KXFM30YMTG/KXMORTGAGERATE not enrolled")
         if POKE_ENABLE:
