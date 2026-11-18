@@ -248,16 +248,23 @@ def read_book(t: str):
 # of 1,848 paced under $0.75, against 37 scored the bot's way. A market with a
 # bot row from the last BOT_EST_MAX_AGE_S takes it, and needs no book read;
 # one without falls back to the dashboard's own estimate.
-BOT_EST_TAIL_BYTES = 8_000_000          # ~6 cycles of rows at ~3,000 markets a cycle
+# ...as the MEAN of its rows in that window, not the latest one (Jack 2026-11-18, of the
+# pacing table's "25/93 under $1": "is this accurate"): one cycle's share swings 0 <->
+# 9% while the bot re-places and the books move, and 40 of the 112 strikes the
+# w1113-fxmetals page paced under $1 at 22:42Z were one-cycle dips whose 15-min mean
+# paced $1+. The other fields come from the latest row.
+BOT_EST_TAIL_BYTES = 30_000_000         # ~20 cycles of rows at ~3,000 markets a cycle
 BOT_EST_MAX_AGE_S = 900
 
 
 def bot_est_fracs(tickers: set, now: datetime) -> dict:
-    """{ticker: (est_frac, qual_sides, pool_per_day)} from the latest row per
-    market in the tail of today's (and, near midnight, yesterday's) cycle log."""
+    """{ticker: (est_frac, qual_sides, pool_per_day, {...})}: est_frac the mean over a
+    market's rows from the last BOT_EST_MAX_AGE_S, the rest from its latest row, in the
+    tail of today's (and, near midnight, yesterday's) cycle log."""
     import csv
     import io as _io
     out: dict = {}
+    acc: dict = {}                              # ticker -> [sum of est_frac, rows]
     days = [now.strftime("%Y-%m-%d")]
     if now.hour == 0:
         days.insert(0, datetime.fromtimestamp(now.timestamp() - 3600, timezone.utc).strftime("%Y-%m-%d"))
@@ -285,10 +292,15 @@ def bot_est_fracs(tickers: set, now: datetime) -> dict:
             try:
                 def _g(k):
                     return float(row[col[k]] or 0) if k in col else 0.0
-                out[row[col["ticker"]]] = (float(row[col["est_frac"]] or 0), int(float(row[col["qual_sides"]] or 0)),
-                                           float(row[col["pool_per_day"]] or 0),
-                                           {"ob": _g("own_bid_ct"), "oa": _g("own_ask_ct"),
-                                            "yd": _g("yes_depth"), "nd": _g("no_depth")})
+                t_ = row[col["ticker"]]
+                ef = float(row[col["est_frac"]] or 0)
+                a_ = acc.setdefault(t_, [0.0, 0])
+                a_[0] += ef
+                a_[1] += 1
+                out[t_] = (a_[0] / a_[1], int(float(row[col["qual_sides"]] or 0)),
+                           float(row[col["pool_per_day"]] or 0),
+                           {"ob": _g("own_bid_ct"), "oa": _g("own_ask_ct"),
+                            "yd": _g("yes_depth"), "nd": _g("no_depth")})
             except ValueError:
                 continue
     return out
