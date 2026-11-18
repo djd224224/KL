@@ -323,6 +323,73 @@ class TestUnpaidEstimate(unittest.TestCase):
         self.assertAlmostEqual(est["raw"], 14.70)
 
 
+class TestUnpaidPaidFlags(unittest.TestCase):
+    """2026-11-18: the 7am digest counted $4.1k Kalshi had paid that morning
+    (the Nov 11-18 weekly periods) as still to come. Their paid flag came from
+    the Nov 15 cache, because the fresh read stopped ~4 days back and the
+    lists page newest START first. The read now reaches the start of every
+    cached period that ended inside the window."""
+
+    def setUp(self):
+        self.now = datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)  # since 9/27 04:00Z
+        self.cache = {
+            # ended inside the window; the statement-time cache says unpaid
+            "KXWEEK-26SEP27-T1": {"periods": [["2026-09-08T04:00:00Z", "2026-09-27T08:00:00Z", False]]},
+            "KXRUN-26SEP30-T1": {"periods": [["2026-09-27T05:00:00Z", "2026-09-30T00:00:00Z", False]]},
+        }
+        self.hourly = {
+            "KXWEEK-26SEP27-T1": {_h("2026-09-27T06:00:00Z"): 3.0},
+            "KXRUN-26SEP30-T1": {_h("2026-09-27T12:00:00Z"): 2.0},
+        }
+        self.calib = {"post_amendment": {"realization_factor": 1.0, "by_family": {}}}
+
+    def _client(self, week_paid):
+        # newest start first; page 1 already reaches back past the old horizon
+        # (cache age 10d -> 9/17 11:00Z), so the old read never saw page 2
+        return _FakePrograms({
+            "active": [[_prog("KXRUN-26SEP30-T1", "2026-09-27T05:00:00Z", "2026-09-30T00:00:00Z")]],
+            "closed": [[]],
+            "settled": [
+                [_prog("KXOTHER-26SEP27-T1", "2026-09-26T00:00:00Z", "2026-09-27T00:00:00Z")],
+                [_prog("KXOTHER-26SEP17-T1", "2026-09-16T00:00:00Z", "2026-09-17T00:00:00Z")],
+                [_prog("KXWEEK-26SEP27-T1", "2026-09-08T04:00:00Z", "2026-09-27T08:00:00Z",
+                       paid=week_paid)],
+                [_prog("KXOLD-26SEP01-T1", "2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z")],
+                [_prog("KXNEVER-26AUG20-T1", "2026-08-20T00:00:00Z", "2026-08-21T00:00:00Z")],
+            ]})
+
+    def _run(self, client):
+        with mock.patch.object(rec, "load_programs", return_value=self.cache), \
+                mock.patch.object(rec, "PROGRAM_CACHE", os.path.join(
+                    tempfile.gettempdir(), "no_such_program_cache.json")):
+            return rec.unpaid_estimate(client, now_utc=self.now,
+                                       calib=self.calib, hourly=self.hourly)
+
+    def _settled_pages(self, client):
+        return len([c for c in client.calls if c[1].get("status") == "settled"])
+
+    def test_a_period_paid_since_the_cache_was_written_is_skipped(self):
+        client = self._client(week_paid=True)
+        est = self._run(client)
+        self.assertAlmostEqual(est["raw"], 2.0)          # KXRUN only
+        self.assertEqual(est["market_periods"], 1)
+        # reads back to KXWEEK's start less a day (9/7 04:00Z): stops on page 4
+        self.assertEqual(self._settled_pages(client), 4)
+
+    def test_a_period_kalshi_has_not_paid_still_counts(self):
+        est = self._run(self._client(week_paid=False))
+        self.assertAlmostEqual(est["raw"], 5.0)          # KXWEEK 3 + KXRUN 2
+
+    def test_the_lookback_is_capped(self):
+        client = self._client(week_paid=True)
+        with mock.patch.object(rec, "UNPAID_LOOKBACK_MAX_DAYS", 5):
+            est = self._run(client)
+        # 5 days before since (9/22) is inside the old horizon: no extra pages,
+        # so KXWEEK keeps the cache's stale flag
+        self.assertEqual(self._settled_pages(client), 2)
+        self.assertAlmostEqual(est["raw"], 5.0)
+
+
 class TestEventRollup(unittest.TestCase):
     def test_market_ticker_rolls_to_its_event(self):
         self.assertEqual(rec.event_of("KXTEMPDCH-26AUG0213-T75.99"),

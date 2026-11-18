@@ -672,17 +672,26 @@ def _ts(iso_str):
 # ----------------------------------------------------------------------------
 # Kalshi credits a market's period 0-3 days after the period ENDS (credit date
 # vs end date, ET days, 704 credit-days on single-period events Aug 5 - Sep 27:
-# +0 10%, +1 75%, +2 14%, +3 1%). There is no credits endpoint, and the
-# programs' paid_out flag almost never flips (all 10,393 `closed` programs
-# read false on 9/28, back to March), so "unpaid" is decided by the clock: a
-# period still running, or one that ended since 00:00 ET UNPAID_SINCE_DAYS
-# days ago. At the 7am digest that counts some of yesterday's periods Kalshi
-# has already paid and misses the ~14% of the day before's still in flight;
-# the two roughly cancel.
+# +0 10%, +1 75%, +2 14%, +3 1%). There is no credits endpoint. On 9/28 the
+# programs' paid_out flag almost never flipped (all 10,393 `closed` programs
+# read false, back to March), so "unpaid" is decided by the clock: a period
+# still running, or one that ended since 00:00 ET UNPAID_SINCE_DAYS days ago.
+# At the 7am digest that counts some of yesterday's periods Kalshi has
+# already paid and misses the ~14% of the day before's still in flight; the
+# two roughly cancel.
+# The flag does flip now (2026-11-18: 95-99% of the periods that ended each
+# day Nov 1-18 read paid_out), so a period in that window that Kalshi has
+# paid is skipped -- provided its flag is read fresh, see unpaid_estimate.
 UNPAID_SINCE_DAYS = int(os.environ.get("IMM_UNPAID_SINCE_DAYS", "1"))
 # a family's realization factor is used only on this much settled evidence;
 # thinner families take the post-amendment overall factor
 UNPAID_FAMILY_MIN_EVENTS = 30
+# How far before `since` the fresh program read may reach to re-read a cached
+# period's paid flag (periods ending since Oct 1 run up to 31 days), and the
+# page cap that read gets per status (35 days was ~92k closed/settled records
+# on 11/18, ~92 pages of 1,000).
+UNPAID_LOOKBACK_MAX_DAYS = float(os.environ.get("IMM_UNPAID_LOOKBACK_MAX_DAYS", "35"))
+UNPAID_MAX_PAGES = int(os.environ.get("IMM_UNPAID_MAX_PAGES", "200"))
 
 
 def fetch_recent_program_records(client, since_ts, max_pages=60):
@@ -741,8 +750,11 @@ def unpaid_estimate(client, now_utc=None, calib=None, hourly=None):
     family with fewer than UNPAID_FAMILY_MIN_EVENTS settled events).
 
     Periods: the program cache (refresh_programs, written at statement time)
-    merged with a fresh read of the active programs and of those started
-    since the cache was written. A period flagged paid_out is skipped, and
+    merged with a fresh read of the active programs and of the closed /
+    settled ones started since the cache was written -- or earlier, back to
+    the start of every cached period this estimate could count, so each one's
+    paid flag is current (capped UNPAID_LOOKBACK_MAX_DAYS before `since`).
+    A period flagged paid_out is skipped, and
     accrual in no known period is not counted. A running period under $1 so
     far counts nothing yet (the floor as it stands now). Covers the IMM's own
     accrual only (the cycle logs), ~97% of the account's credits.
@@ -759,8 +771,30 @@ def unpaid_estimate(client, now_utc=None, calib=None, hourly=None):
         cache_ts = os.path.getmtime(PROGRAM_CACHE)
     except OSError:
         cache_ts = now.timestamp() - 10 * 86400
-    fresh = fetch_recent_program_records(
-        client, min(cache_ts, since_ts, now.timestamp() - 3 * 86400) - 86400)
+    if hourly is None:
+        hourly = rebuild_hourly()
+
+    # The cache's paid flags are as old as the last statement. The closed /
+    # settled lists page newest START first, so to re-read the flag of a
+    # cached period that has ended inside the window the read must reach back
+    # to that period's start. 2026-11-18: the read stopped ~4 days back, the
+    # Nov 11-18 weekly periods (2028 primaries, presidential-by-state) kept
+    # the Nov 15 cache's "unpaid" after Kalshi paid them that morning, and the
+    # digest counted $4.1k already in cash as still to come.
+    now_ts = now.timestamp()
+    horizon = min(cache_ts, since_ts, now_ts - 3 * 86400)
+    lookback_floor = since_ts - UNPAID_LOOKBACK_MAX_DAYS * 86400
+    for t, prog in progs.items():
+        if t not in hourly:
+            continue                       # never accrued: nothing to count
+        for a, b, paid in _cache_periods(prog):
+            sa, sb = _ts(a), _ts(b)
+            # a running period is in the full `active` read already
+            if paid or sa is None or sb is None or not since_ts <= sb <= now_ts:
+                continue
+            horizon = min(horizon, max(sa, lookback_floor))
+    fresh = fetch_recent_program_records(client, horizon - 86400,
+                                         max_pages=UNPAID_MAX_PAGES)
 
     periods = {}
     for t in set(progs) | set(fresh):
@@ -770,8 +804,6 @@ def unpaid_estimate(client, now_utc=None, calib=None, hourly=None):
         if any((_ts(b) or 0.0) >= since_ts for (_a, b) in recs):
             periods[t] = merge_periods((a, b, p) for (a, b), p in recs.items())
 
-    if hourly is None:
-        hourly = rebuild_hourly()
     if calib is None:
         try:
             with open(CALIB_PATH, encoding="utf-8") as f:
