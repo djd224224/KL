@@ -451,11 +451,15 @@ python pvd_waves.py resize NAME [--aim 1.20] [--max-mult 5] [--keep-within 0.05]
 python pvd_waves.py resize NAME ... --apply                                      # Jack's word
 python pvd_waves.py set NAME floor_auto on|off                                    # the same, every 15-min pass (Jack's word per wave; adds --size-mult-file)
 python pvd_waves.py set NAME floor_max_mult 1                                     # the check only turns markets off (a wave already at 5x)
+python pvd_waves.py set NAME scan_max_mult 2                                      # size-up to the bar at LISTING (Jack's word per wave; needs --size-mult-file)
 ```
+
+**Size-up to the bar at listing (`scan_max_mult`, Jack 2026-11-18 on w1113-fxmetals: "1.5-3x the size"):** the scan judges a market still under the $1.10 bar after the cheap tiers again at the wave's bank size (`--bank-max`, where the tune's bank step rests every market that can't bank at the flat size), then quarter steps up to `scan_max_mult` x that; the first that clears lists it and goes into `size_mult_NAME.json` (never lowering one, never lifting an off). The relight alert says how many listed only sized up, and what the denied ones were judged at. Set on w1113-fxmetals at 2 (11/18): 1,500-3,000 a side at 3-5c, 3,000-6,000 at 1-2c. 1 = off; at most 5.
 
 **How `pace` measures** (`pvd_wave_pace.py`):
 - Projection = banked this period (the dashboard's `period_est`) + the AVERAGE rate since the market's size landed x the hours left. Not one cycle: the bot's per-cycle share swings ~2% <-> 9% on wide books and reads 0 for a cycle after a stand-down (FX 13:45Z 11/14). A cycle resting nothing counts 0, so the rate is uptime-weighted.
 - Rows from 10 min after the bot's last start; a market resting under 90% of what the bot wants is "landing" and not judged. Within 15 min of a restart reads run low (crypto 11/14: 160 at $1+ seven minutes after one, 230-286 before): `pace` warns, `resize --apply` refuses without `--force`.
+- **Held = not judged (c30a81f):** a market where the bot WANTS under 90% of the list's size on a side it quotes -- its first hour on a market (the off-usual cold start, under 4 touch samples 15 min apart, rests the entry's base: not the cheap tiers, not the multiple) or its off-usual cut -- is "held"; only rows after the latest held row count. 11/18: the 19:33Z and 19:48Z reads judged 99 new FX strikes at the 300 a side the bot rested in its first hour, against 1,500 listed (the floor check's "5x" there is 7,500), and turned them all off; one it sized up instead went 0.48% -> 2.35% at 1,500. A live book's sides rest the base itself, so its first-hour reads are fair.
 - Under-$1 tables: by the multiple each needs for the aim (the model above: an upper bound), with one-sided counts and the cash added if every added contract filled; by side cost (1-2c, 3-5c, 6-10c, 11-20c, 21-35c, 36-50c, 51c+: what Jack asked for 11/14); by series.
 
 **The protocol:**

@@ -161,6 +161,13 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
 - **The ladders' check (Jack: "does it have the recent protections just added on the mark kelly fills across events"):** none reached crypto or FX. `risk_group` had no group for a coin or a pair; the gates' stand-asides cancelled one order at a time as the quote loop reached each strike (BTC's 02:05:48Z hold: 128 orders over 95 s); `floor_auto` skipped crypto (no fair file). Jack: "build these to generalize into the market-wave skill" -> 2063782 (the fair hold pull; every wave series with no group its own group: replayed 11/06-11/15, 0 trips) and the wave tools (the floor check reads the bot's own fair; `set NAME floor_max_mult`; w1114-cryptoev on it at max 1, offs only; whydark names FX stand-asides).
 - **The same day, another session:** 1fd880b "earn only" (Jack: "unless purposefully unwinding, no IMM should quote without earning").
 
+## 11/18 FX relight: walls, the size-up to the bar, the first-hour offs
+
+- **The relight (19:01Z programs, 19:18Z pass):** w1113-fxmetals relit 16 events (GBP/USD, USD/JPY, USD/MXN; 336 strikes, $17.57/day each, to 11/22 05:00Z). 125 listed, 211 "under bar". Jack: "why denied". Other makers walled every touch at 3-5c with ~80k contracts a side (16k-230k); at the wave's 1,000 a side (200 x the 5x tier) a strike earned ~1.2% of the pool, ~$0.70 by the period end. Near-dated events (11/25 Beige Book, GBP's 12/11 UK GDP) listed all 21; Dec 8/16/17/30 mostly 2-5 of 21. The alert read "211 mkts denied (~$84/day)": the $84 was the LISTED markets'.
+- **Jack: "1.5-3x the size" -> 4c69bb8 + `set w1113-fxmetals scan_max_mult 2`:** the 20:02Z pass listed 201 of the 202 still denied (189 only sized up: x1 87, x1.25 56, x1.5 43, x1.75 2, x2 1); 194 two-sided within 4 min.
+- **The first-hour offs (c30a81f):** the floor check's 19:33Z/19:48Z reads judged 99 listed strikes at the 300 a side the bot rests in its first hour, against 1,500 listed, and turned them off (5x of 1,500 is 7,500, not the 1,500 it modelled). Held markets are no longer judged; a one-off repair re-judged the 108 cheap-tier strikes those reads touched with the scan's model (99 offs back on at x1-1.75, 9 cheap-tier 5x ups back to x1-1.5); 17 UK GDP live-book strikes (fair reads) kept their ups; 2 of them went off at 20:02Z on fair reads.
+- **Jack: "reword the alert" -> beb9966:** "RELIGHT: ... listed (~$X/day), N mkts denied"; the bar is $1.10 by the period end (not "/day"); each denial reason in words, the size-up included.
+
 ## Open questions closed since 11/08
 
 - 11/15 ("Yes, commit"): the 11/14-11/15 wave tools and this runbook committed from KL (09225c9).
