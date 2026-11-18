@@ -15163,6 +15163,7 @@ _CONFIG_CODE_KNOBS = (
     "HOME_FAR_SIZE_MULT", "HOME_FAR_DAYS", "HOME_ONE_SIDE_BREACH",     # (2026-11-18)
     "HOME_FAR_FOLLOW_BOOK", "HOME_XMONTH_TOL_CENTS", "HOME_XMONTH_MIN_QTY",
     "HOME_EXPECTED_RELEASE_DAY", "HOME_PRE_RELEASE_DAYS", "HOME_PRE_RELEASE_MAX_DAY",
+    "HOME_PRE_RELEASE_MODE",
     "HOME_AUTO", "HOME_AUTO_PATTERN",
     # placement queue priority (2026-11-14)
     "PLACE_PRIORITY", "RENEW_URGENT_SECS",
@@ -22292,23 +22293,31 @@ HOME_FAIR_REFRESH_SECS = _env_int("IMM_HOME_FAIR_REFRESH_SECS", 60)
 HOME_RELEASE_HOLD_MIN = _env_int("IMM_HOME_RELEASE_HOLD_MIN", 60)
 # THE PRE-RELEASE WINDOW (Jack 2026-11-18: "is Zillow markets protected from
 # another Hoboken pickoff?" -> "Yes, build it", to a pre-release stand-aside;
-# then "but instead of stand aside, 1x everything during that time"). The
-# 11/16 takers knew the October print days before Zillow's file (100%
-# right-way on 11/13, three days out; Zillow's national report came 11/5),
-# and the hold above starts only when the file lands. So from 00:00 ET on day
-# HOME_EXPECTED_RELEASE_DAY - HOME_PRE_RELEASE_DAYS of each month (the 12th:
-# the files landed 10/15 21:50 ET and 11/16 11:47 ET) until that month's
-# release is in (the snapshot's release_ts on or after the 1st of the month),
-# every Zillow market quotes at 1x -- the ENS rule: no far-month x5, no hour
-# or Saturday step (hour_size_mult), no per-market boost (_market_size_mult),
-# the base position and event caps. Quotes, gates and leads (none) are
-# unchanged. A release that came early ends it before it starts; one that has
-# not come by 00:00 ET on day HOME_PRE_RELEASE_MAX_DAY ends it anyway (sizes
-# return; no detection gap keeps the family small all month).
-# IMM_HOME_PRE_RELEASE_DAYS=0 turns it off.
+# then "but instead of stand aside, 1x everything during that time"; then,
+# once the taker tape was checked, "Off from 15th only"). The hold above
+# starts only when Zillow's file lands, and the files land on the 16th UTC
+# every month (Apr, Jul, Aug, Nov in daytime ET; 9/15 22:07 and 10/15 21:52
+# ET the evening before). The November tape, every public trade on the 16
+# KX*HOME-30NOV26 events marked against the mid 3h after the 11/16 file
+# (they opened 11/10 00:00 ET): 11/13 a coin flip (8,432 ct, 54% right-way,
+# +0.2c), 11/15 99% (1,210 ct, +9.4c), 11/16 01:00-03:59 ET ~33k ct at
+# 84-100% (+15-21c), 10:00 ET 94% -- and the $438 pick-off at 10:34 ET.
+# So from 00:00 ET on day HOME_EXPECTED_RELEASE_DAY - HOME_PRE_RELEASE_DAYS
+# (the 15th) until that month's release is in (the snapshot's release_ts on
+# or after the 1st of the month), every Zillow market STANDS ASIDE (the gate
+# fails closed: orders cancelled, positions ride), then the hold above.
+# A release that came early ends the window before it starts; one that has
+# not come by 00:00 ET on day HOME_PRE_RELEASE_MAX_DAY ends it anyway (no
+# detection gap darkens the family all month).
+# IMM_HOME_PRE_RELEASE_MODE=x1 quotes at 1x in the window instead (the ENS
+# rule: no far-month x5, no hour or Saturday step, no per-market boost, base
+# caps). IMM_HOME_PRE_RELEASE_DAYS=0 turns the window off.
 HOME_EXPECTED_RELEASE_DAY = _env_int("IMM_HOME_EXPECTED_RELEASE_DAY", 16)
-HOME_PRE_RELEASE_DAYS = _env_int("IMM_HOME_PRE_RELEASE_DAYS", 4)
+HOME_PRE_RELEASE_DAYS = _env_int("IMM_HOME_PRE_RELEASE_DAYS", 1)
 HOME_PRE_RELEASE_MAX_DAY = _env_int("IMM_HOME_PRE_RELEASE_MAX_DAY", 24)
+HOME_PRE_RELEASE_MODE = os.environ.get("IMM_HOME_PRE_RELEASE_MODE", "off").strip().lower()
+if HOME_PRE_RELEASE_MODE not in ("off", "x1"):
+    HOME_PRE_RELEASE_MODE = "off"
 HOME_SIZE_MULT = _env_float("IMM_HOME_SIZE_MULT", 1.0)
 # THE FAR MONTHS, x5 (Jack 2026-11-18: "you can go heavier on markets 3M out,
 # 5x the size"). A Zillow market whose cutoff (00:00 ET on its ticker day) is
@@ -22500,13 +22509,15 @@ def home_pre_release(now_ts: Optional[float] = None, release_ts=_UNREAD) -> str:
     if release_ts is not None and float(release_ts) >= day(1):
         return ""                        # this month's release is in
     return (f"pre-release window: {et:%b} {start_day} 00:00 ET until this month's "
-            f"Zillow release (to the {cap_day}th at most) -- every Zillow market x1")
+            f"Zillow release (to the {cap_day}th at most) -- every Zillow market "
+            + ("x1" if HOME_PRE_RELEASE_MODE == "x1" else "stands aside"))
 
 
 def home_x1(series: str, now_ts: Optional[float] = None) -> bool:
     """Does this series quote at 1x now (a Zillow series inside THE
-    PRE-RELEASE WINDOW)?"""
-    return home_series(series) and bool(home_pre_release(now_ts))
+    PRE-RELEASE WINDOW, IMM_HOME_PRE_RELEASE_MODE=x1)?"""
+    return (HOME_PRE_RELEASE_MODE == "x1" and home_series(series)
+            and bool(home_pre_release(now_ts)))
 
 
 def home_far_month(ticker: str, now_ts: Optional[float] = None) -> bool:
@@ -22526,7 +22537,8 @@ def home_far_mult(ticker: str, now_ts: Optional[float] = None) -> float:
     (THE FAR MONTHS, x5); 1.0 inside THE PRE-RELEASE WINDOW."""
     if HOME_FAR_SIZE_MULT == 1.0 or HOME_FAR_SIZE_MULT <= 0:
         return 1.0
-    if not home_far_month(ticker, now_ts) or home_pre_release(now_ts):
+    if not home_far_month(ticker, now_ts) or \
+            (HOME_PRE_RELEASE_MODE == "x1" and home_pre_release(now_ts)):
         return 1.0
     return HOME_FAR_SIZE_MULT
 
@@ -22601,6 +22613,11 @@ def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
         return (f"zillow check is {age / 60:.0f}m old",
                 {"reason": "stale", "age_s": round(age)}, None)
     rel = snap.get("release_ts")
+    # THE PRE-RELEASE WINDOW: out from the 15th until this month's file is in
+    if HOME_PRE_RELEASE_MODE == "off":
+        pre = home_pre_release(now_ts, rel)
+        if pre:
+            return pre, {"reason": "pre_release"}, None
     if rel is not None and 0 <= now_ts - float(rel) < HOME_RELEASE_HOLD_MIN * 60:
         return (f"new zillow release {(now_ts - float(rel)) / 60:.0f}m ago "
                 f"(hold {HOME_RELEASE_HOLD_MIN}m)",
@@ -49080,7 +49097,8 @@ class IncentiveMarketMaker:
                 + ("sends that side to its 1c / 99c edge (the other keeps its cap)"
                    if HOME_ONE_SIDE_BREACH else "rests the 1c / 99c edges alone")
                 + f", {HOME_RELEASE_HOLD_MIN}m out after a Zillow release"
-                + (f", x1 from the {max(1, HOME_EXPECTED_RELEASE_DAY - HOME_PRE_RELEASE_DAYS)}th "
+                + (f", {'x1' if HOME_PRE_RELEASE_MODE == 'x1' else 'out'} from the "
+                   f"{max(1, HOME_EXPECTED_RELEASE_DAY - HOME_PRE_RELEASE_DAYS)}th "
                    f"00:00 ET of each month until that month's release (to the "
                    f"{HOME_PRE_RELEASE_MAX_DAY}th at most)" if HOME_PRE_RELEASE_DAYS > 0 else "")
                 + f", size x{HOME_SIZE_MULT:g} (x{HOME_FAR_SIZE_MULT:g} with "

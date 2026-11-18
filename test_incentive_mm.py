@@ -26796,25 +26796,51 @@ class TestHomeFarSize(unittest.TestCase):
         return imm.ET.localize(datetime(y, mo, d, h, mi)).timestamp()
 
     def test_the_pre_release_window(self):
+        # (Jack 2026-11-18: "Off from 15th only") -- the default: 16 - 1
         et, pre = self._et, imm.home_pre_release
         nov16 = et(2067, 11, 16, 11, 47)                    # last month's file
-        with mock.patch.object(imm, "HOME_PRE_RELEASE_DAYS", 4):
-            self.assertEqual(pre(et(2067, 12, 11, 23, 59), nov16), "")        # before the 12th
-            self.assertIn("pre-release window", pre(et(2067, 12, 12, 0, 30), nov16))
-            self.assertIn("pre-release window", pre(et(2067, 12, 15, 9), nov16))
-            self.assertIn("pre-release window", pre(et(2067, 12, 13), None))  # no read: in
+        with mock.patch.object(imm, "HOME_PRE_RELEASE_DAYS", 1):
+            self.assertEqual(pre(et(2067, 12, 14, 23, 59), nov16), "")        # before the 15th
+            w = pre(et(2067, 12, 15, 0, 30), nov16)
+            self.assertIn("pre-release window: Dec 15 00:00 ET", w)
+            self.assertIn("stands aside", w)                                    # mode "off"
+            self.assertIn("pre-release window", pre(et(2067, 12, 16, 9), nov16))
+            self.assertIn("pre-release window", pre(et(2067, 12, 15, 9), None))  # no read: in
             # this month's file landed: over (the 60-min hold takes it from there)
             self.assertEqual(pre(et(2067, 12, 16, 13), et(2067, 12, 16, 11, 47)), "")
-            self.assertEqual(pre(et(2067, 12, 13), et(2067, 12, 8, 10)), "")  # an early one
+            self.assertEqual(pre(et(2067, 12, 15, 9), et(2067, 12, 8, 10)), "")  # an early one
             self.assertEqual(pre(et(2067, 12, 24, 0, 30), nov16), "")          # the cap
             self.assertEqual(pre(et(2068, 1, 5), nov16), "")
-        self.assertEqual(pre(et(2067, 12, 13), nov16), "")                     # off (0 days)
+        with mock.patch.object(imm, "HOME_PRE_RELEASE_DAYS", 4):              # the 12th
+            self.assertIn("Dec 12 00:00 ET", pre(et(2067, 12, 12, 0, 30), nov16))
+        self.assertEqual(pre(et(2067, 12, 15, 9), nov16), "")                  # off (0 days)
+
+    def test_the_window_stands_aside(self):
+        now = time.time()
+        self._snap(p=0.70)
+        with mock.patch.object(imm, "HOME_FAR_SIZE_MULT", 5.0), \
+                mock.patch.object(imm, "HOME_PRE_RELEASE_MODE", "off"), \
+                mock.patch.object(imm, "home_pre_release", lambda *a, **k: "pre-release window: x"):
+            why, inputs, caps = imm.home_gate(self.T, now, 50, 90)
+            self.assertEqual((why, inputs["reason"], caps), ("pre-release window: x", "pre_release", None))
+            self.assertFalse(imm.home_x1("KXSEAHOME", now))          # no x1 in this mode
+            self.assertEqual(imm.home_far_mult(self.T, now), 5.0)    # sizes as set
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertEqual(self._sizes(bot), {"bid": 0.0, "ask": 0.0})
+            self.assertNotIn(self.T, bot.state.selected)     # the estimate is zero too
+        # out of the window: quotes again
+        bot._mlb_get_cache.clear()
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertGreater(self._sizes(bot)["bid"], 0)
 
     def test_the_window_is_x1(self):
         now = time.time()
         _clean_persist()
         self._snap(p=0.70)
-        with mock.patch.object(imm, "HOME_FAR_SIZE_MULT", 5.0):
+        with mock.patch.object(imm, "HOME_FAR_SIZE_MULT", 5.0), \
+                mock.patch.object(imm, "HOME_PRE_RELEASE_MODE", "x1"):
             five = self._bot()
             five.run_cycle()
             s5 = self._sizes(five)
