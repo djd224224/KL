@@ -25559,7 +25559,7 @@ class TestLeagueCollege(_LeagueAutoFixture):
         ind = "KXNCAAFTOPSEED-67T4-IND"                      # ESPN's IU (an alias)
         bot = self._bot([self.T, ind], close="2068-01-10T00:00:00Z")
         now = datetime.now(timezone.utc)
-        boards = {"/college-football/teams": self._teams("OSU", "IU", "NEB", "BALL", "OHIO", "PUR"),
+        boards = {"/college-football/standings": self._teams("OSU", "IU", "NEB", "BALL", "OHIO", "PUR"),
                   "/college-football/": {"events": []}}
         boards.update(self.boards)
         self.boards = boards
@@ -25581,15 +25581,38 @@ class TestLeagueCollege(_LeagueAutoFixture):
         self.assertEqual(cycle(self._game("in", hour_ago, "2", "PUR", "IU")), (set(), set()))
         self.assertEqual(cycle(self._game("in", hour_ago, "3", "OSU", "NEB")), (set(), set()))
         # a code ESPN does not carry: every game holds it (fail closed), logged
-        self.boards["/college-football/teams"] = self._teams("OSU", "NEB", "BALL", "OHIO")
+        self.boards["/college-football/standings"] = self._teams("OSU", "NEB", "BALL", "OHIO")
         lines = []
         with mock.patch.object(imm, "log", lines.append):
             got = cycle(self._game("in", hour_ago, "1", "BALL", "OHIO"))
         self.assertEqual(got, (set(), set()))
-        self.assertTrue(any("codes not on ESPN's team list: IU" in s for s in lines), lines)
+        self.assertTrue(any("codes not among ESPN's NCAAF teams: IU" in s for s in lines), lines)
         # ...and an unreadable team list too
-        self.boards["/college-football/teams"] = RuntimeError("espn down")
+        self.boards["/college-football/standings"] = RuntimeError("espn down")
         self.assertEqual(cycle(self._game("in", hour_ago, "1", "BALL", "OHIO")), (set(), set()))
+
+    def test_a_lower_division_namesake_does_not_pass(self):
+        # (Jack 2026-11-18: "give KXNCAAFPAC12 the teams flag too"): Kalshi's
+        # BSU is Boise State, ESPN's BOIS; ESPN's BSU is Buffalo State (D-III),
+        # which the all-divisions team list carried -- the FBS standings do not
+        bot = self._bot([self.T])
+        self.boards = dict({"/college-football/standings": self._teams("BOIS", "WSU")},
+                           **self.boards)
+        tk = "KXNCAAFPAC12-67-BSU"
+        with mock.patch.dict(imm.EVENT_PROGRAMMED_SUFFIXES,
+                             {"KXNCAAFPAC12-67": frozenset({"BSU", "WSU"})}):
+            self.assertEqual(bot._league_event_teams("NCAAF", "football/college-football",
+                                                     tk, time.time()), ({"BOIS", "WSU"}, ""))
+            with mock.patch.dict(imm.LEAGUE_TEAM_ALIASES["NCAAF"], {}, clear=True):
+                bot._mlb_get_cache.clear()
+                teams, why = bot._league_event_teams("NCAAF", "football/college-football",
+                                                     tk, time.time())
+        self.assertIsNone(teams)
+        self.assertIn("codes not among ESPN's NCAAF teams: BSU", why)
+        self.assertTrue(any("/college-football/standings?group=80" in u for u in self.urls))
+        self.assertEqual(imm.espn_team_abbrs(
+            {"children": [{"standings": {"entries": [{"team": {"abbreviation": "bois"}}]}}]}),
+            {"BOIS"})
 
     def test_out_while_any_college_game_is_live_and_from_its_last_day(self):
         self._write({"KXNCAAFTOPSEED": dict(self.ENTRY, until="2067-12-06")})

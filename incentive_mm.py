@@ -7616,13 +7616,42 @@ CFP_SHOW_POST_MIN = _env_int("IMM_CFP_SHOW_POST_MIN", 30)
 # (EVENT_PROGRAMMED_SUFFIXES: OSU, TEX, ND ... the 52 of the top-seed event),
 # read as ESPN abbreviations through LEAGUE_TEAM_ALIASES. It FAILS CLOSED to
 # every game of the league when its event has no programmed markets read, a
-# code is not an abbreviation on ESPN's team list (LEAGUE_TEAMS_TTL_SECS), or
-# that list cannot be read. On 11/18, 45 of the 52 codes were ESPN's own; the
-# other 7 are the aliases below.
+# code is not an abbreviation of the league's own division (LEAGUE_TEAMS_URL,
+# read every LEAGUE_TEAMS_TTL_SECS), or that list cannot be read. On 11/18, 45
+# of the top-seed event's 52 codes were ESPN's own; the other 7 are the
+# aliases below. KXNCAAFPAC12's BSU is Boise State, ESPN's BOIS -- and ESPN's
+# BSU is Buffalo State, Division III, so the all-divisions team list passed
+# it (Jack 2026-11-18: "give KXNCAAFPAC12 the teams flag too"): a college
+# code is checked against its division's standings (FBS: 138 teams, D-I
+# basketball: 365), where a lower-division namesake is not.
 LEAGUE_TEAM_ALIASES: Dict[str, Dict[str, str]] = {
     "NCAAF": {"IND": "IU", "TXAM": "TA&M", "OKLA": "OU", "MIZZ": "MIZ", "SCAR": "SC",
-              "NCST": "NCSU", "MOH": "M-OH"}}
+              "NCST": "NCSU", "MOH": "M-OH", "BSU": "BOIS"}}
 LEAGUE_TEAMS_TTL_SECS = _env_int("IMM_LEAGUE_TEAMS_TTL_SECS", 6 * 3600)
+# a league's own teams (any JSON whose {"team": {"abbreviation"}} entries are
+# them); a league not named here reads ESPN's team list for its path
+_ESPN_STANDINGS = "https://site.web.api.espn.com/apis/v2/sports"
+LEAGUE_TEAMS_URL: Dict[str, str] = {
+    "NCAAF": f"{_ESPN_STANDINGS}/football/college-football/standings?group=80",
+    "NCAAB": f"{_ESPN_STANDINGS}/basketball/mens-college-basketball/standings?group=50",
+    "NCAAWB": f"{_ESPN_STANDINGS}/basketball/womens-college-basketball/standings?group=50"}
+
+
+def espn_team_abbrs(node) -> Set[str]:
+    """Every {"team": {"abbreviation"}} in an ESPN payload, upper case (a
+    standings tree or a team list alike)."""
+    out: Set[str] = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, dict):
+            t = n.get("team")
+            if isinstance(t, dict) and t.get("abbreviation"):
+                out.add(str(t["abbreviation"]).upper())
+            stack.extend(n.values())
+        elif isinstance(n, list):
+            stack.extend(n)
+    return out
 
 
 def _parse_et_windows(spec: str) -> Tuple[Tuple[float, float, str], ...]:
@@ -40073,18 +40102,15 @@ class IncentiveMarketMaker:
             return None, "no programmed markets read for its event"
         alias = LEAGUE_TEAM_ALIASES.get(league, {})
         abbrs = {alias.get(c, c).upper() for c in codes}
+        url = LEAGUE_TEAMS_URL.get(league) or f"{ESPN_SITE_API}/{path}/teams?limit=1000"
         try:
-            data = self._mlb_get(f"{ESPN_SITE_API}/{path}/teams?limit=1000", now_ts,
-                                 LEAGUE_TEAMS_TTL_SECS)
+            data = self._mlb_get(url, now_ts, LEAGUE_TEAMS_TTL_SECS)
         except Exception as ex:                          # noqa: BLE001
             return None, f"ESPN {league} team list unreadable ({type(ex).__name__})"
-        known = {str(((t or {}).get("team") or {}).get("abbreviation") or "").upper()
-                 for sp in (data or {}).get("sports") or []
-                 for lg in sp.get("leagues") or []
-                 for t in lg.get("teams") or []}
+        known = espn_team_abbrs(data)
         unknown = sorted(abbrs - known)
         if unknown:
-            return None, f"codes not on ESPN's team list: {', '.join(unknown)}"
+            return None, f"codes not among ESPN's {league} teams: {', '.join(unknown)}"
         return abbrs, ""
 
     def _lol_live(self, now_ts: float) -> List[dict]:
