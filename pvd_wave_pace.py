@@ -48,7 +48,9 @@ read by its tune's --size-mult-file; 0 = off, the sizes kept in "pre_off"):
     that needs less size for its target comes DOWN to that size. The target: a projection
     of TRIM_TO x the aim ($1.50 on $1.20) and TRIM_MIN_SHARE of the pool (2.25%; Jack
     11/18: "at least 2% share of each book"), modelled with the WHOLE share loss counted
-    (others standing still), so a cut lands at or over it. Only on two reads at the same
+    (others standing still) -- which still OVER-CUT on wall books: on FX 11/19 a 4x cut lost
+    ~10x the share (7.7% -> 0.7%), 74 of 186 strikes fell under 2%, and it went off (Jack:
+    "Leave it off"). Rebuild it as step-and-measure before turning it on again. Only on two reads at the same
     multiple, only a cut of 1 - TRIM_TRIGGER (20%) or more, never under TRIM_MIN_MULT, and
     never under TRIM_MAX_CUT of the multiple in one step (the next reads measure the new
     size before cutting again). Each trimmed market's earlier multiple waits in

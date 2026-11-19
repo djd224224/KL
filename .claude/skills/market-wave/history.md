@@ -193,6 +193,11 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
   - Before it went live, the 00:41Z "19 under" had mostly released on their own: 328 at 2%+ over 01:41-01:56Z. After it, 333 over 02:04-02:18Z (median 4.2%). Only 2 of the 73 sides 10-20c from their fair got bigger, and the 3 under were the UK GDP 12/11 strikes turned off. So the 10c guards the next step-up.
   - 2d23c19 (another session, 02:18Z restart) put KXINXEVENT on the FX event gate, so the exemption covers listed S&P 500 strikes too.
 - **Jack: "dont overquote if unneeded to hit the target threshold" -> ae46e39** (`floor_trim`, on for w1113-fxmetals at 02:50Z): the floor check trims a market over its target ($1.50 and 2.25% share) down to it, on two reads. The first read flagged 199 of 319 judged strikes; the model put the first step at $266 -> $140/day, resting collateral $205k -> $116k. Many strikes held 12-18% share because walls had thinned in front of sizes made for bigger ones, and the floor check never lowered a multiple.
+- **03:16Z the first cuts (186 strikes); off at 03:26Z.**
+  - Measured: wave rewards $241 -> $151/day, resting collateral $162k -> $79k.
+  - Share fell ~10x for a 4x cut on the 50-70k wall books (the model expected ~4x). 74 strikes fell under 2% and 21 projected under $1.
+  - The 03:31Z pass gave 169 trims back; the other 17 had already been sized up past their old size.
+  - Jack, shown that the 112 that held gave up $59/day to free $35k (~60%/yr on it): "Leave it off".
 
 ## Open questions closed since 11/08
 
@@ -202,6 +207,7 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
   - Cheap tiers to 15c ("yes, extend to 10c", "Yes, extend to 15c").
   - Near-fair quoting: "No, stay at walls".
   - Far-from-fair guard exemption: "Yes, build it". Its threshold 20c -> 10c: "Yes, 10c" (32bd17c).
+  - The floor trim (ae46e39): "Leave it off" (11/19), after it over-cut and cost $90/day.
   - FX margin 0c ("also 1c of edge is enough", then "0c edge is ok"). This supersedes the 11/15 "Yes, keep it" on the vol cushion.
 
 - 11/14: the $1-floor protocol runs on its own, in manual mode, on type B waves with a live fair ("Yes, pre-approve"); `floor_auto` on w1113-fxmetals ("Yes, every 15 min"), on w1114-cryptoev since 11/15 (offs only).
