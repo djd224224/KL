@@ -1298,7 +1298,10 @@ def cmd_remove(a) -> int:
 # ---------------------------------------------------------------------------
 PASS, WARN, FAIL, INFO = "PASS", "WARN", "FAIL", "INFO"
 MIN_EVENTS = 5                      # Jack 11/08: a wave = 5+ events in one family
-MIN_CASH0 = float(os.environ.get("PVD_MIN_CASH0", "5000"))
+# shard-0 free cash a new wave needs (Jack 2026-11-19: "Waves stop auto-listing under $1,000
+# free", was $5,000): resting orders tie up no cash, only fills draw it, and the bot's shard
+# cash pause holds a shard's dearer new orders 5 min when Kalshi refuses one for cash
+MIN_CASH0 = float(os.environ.get("PVD_MIN_CASH0", "1000"))
 AUTO_BUDGET_MAX = 50000.0
 AUTO_FORBIDDEN = ("--no-halts", "--size-mult", "--series-tier")
 PROBE_LOT = 10              # a 90c+ side capped at 1-9 contracts is a probe (11/07)

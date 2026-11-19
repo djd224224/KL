@@ -123,9 +123,12 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(statuses(pw.guard_checks(), "off-usual size"), [pw.FAIL])
 
     def test_low_shard0_cash_fails(self):
-        BAL["balance_breakdown"][0]["balance"] = 1500.0
+        # the floor is $1,000 since 2026-11-19 (Jack: "Waves stop auto-listing under $1,000 free")
+        BAL["balance_breakdown"][0]["balance"] = 900.0
         try:
             self.assertEqual(statuses(pw.guard_checks(), "shard-0 cash"), [pw.FAIL])
+            BAL["balance_breakdown"][0]["balance"] = 1500.0
+            self.assertEqual(statuses(pw.guard_checks(), "shard-0 cash"), [pw.PASS])
         finally:
             BAL["balance_breakdown"][0]["balance"] = 9000.0
 

@@ -251,7 +251,7 @@ PASS / WARN / FAIL for every guard a wave relies on; exit 1 on any FAIL:
 | Switch files | HALT exists; UNWIND_ONLY without UNWIND_ONLY_EXCEPT_WAVES; UNWIND_ONLY_WAVES on a bot without the scoped startup line (else INFO: held wave markets unwind, flat stamped ones quote) |
 | Bot state | `halted_until` in the future; no "mkts quoted" line in the last 10 min |
 | Bot guards, from its latest startup lines | Join wait (penny + 0.1c books, rest memory), off-usual size, sweep breaker, tape trigger, bait stop, company KPIs OFF, close clamp, lone-ref guard on the wave list; a line older than the latest start = WARN |
-| Shard-0 cash | Under $5,000 (`PVD_MIN_CASH0`) |
+| Shard-0 cash | Under $1,000 (`PVD_MIN_CASH0`; $5,000 until Jack 2026-11-19: "Waves stop auto-listing under $1,000 free") |
 | **Cash on the wave's other shards** (2026-11-14) | The shard its markets trade on (one market a series read for `exchange_index`; metals and crypto are shard 2) under $1,000 (`PVD_MIN_CASH_OTHER`): FAIL in auto, WARN manual. Only Jack moves money; give him `python kalshi_subaccount.py shard N --from 0 --to 2` |
 | **Resting-order room** | Under 500 orders left under `IMM_MAX_TOTAL_RESTING` (12,000): FAIL auto / WARN; under 2,000 WARN. At the cap the bot defers EVERY new placement |
 | **Resting-order read** | `RESTING_READ_TRUNCATED` since the bot's start (it can't see all its orders and re-places them): FAIL |
