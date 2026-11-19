@@ -168,10 +168,37 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
 - **The first-hour offs (c30a81f):** the floor check's 19:33Z/19:48Z reads judged 99 listed strikes at the 300 a side the bot rests in its first hour, against 1,500 listed, and turned them off (5x of 1,500 is 7,500, not the 1,500 it modelled). Held markets are no longer judged; a one-off repair re-judged the 108 cheap-tier strikes those reads touched with the scan's model (99 offs back on at x1-1.75, 9 cheap-tier 5x ups back to x1-1.5); 17 UK GDP live-book strikes (fair reads) kept their ups; 2 of them went off at 20:02Z on fair reads.
 - **Walls moved to 6-8c (20:15-20:50Z):** on 43 strikes the external touch went 3-5c -> 6-8c bids / 93-94c asks; past the <=5c tier they fell to the 300-450 base (~0.5% share), and the floor check turned 4 off at 20:46Z (21 more flagged). Jack asked "check again that 336 are pacing above $1.2 target" (135 were; 152 landing), then "yes, extend to 10c" (cheap tiers 2:10,5:5,10:5 at 21:00Z) and "confirming i have a fair value on this wave?" (yes: all 336 strikes in wave_fair_w1113-fxmetals.json, weekday mode, refreshed each pass, floor 0).
 - **Jack: "reword the alert" -> beb9966:** "RELIGHT: ... listed (~$X/day), N mkts denied"; the bar is $1.10 by the period end (not "/day"); each denial reason in words, the size-up included.
+- **Dash views:**
+  - Jack: "give me a dash for this wave" -> :8782.
+  - "why does it show nothing over 50c": the band is the COST per contract, and every resting side was the cheap side of its strike (max 43c).
+  - "clearly show this data for the latest relit wave" -> the Latest relight tile row (4d59e4a).
+  - "is this accurate -- 25/93 under $1": the pacing read one cycle, and 40 of 112 were dips -> the 15-min mean (5265a34).
+  - "build into the dash how many markets are one sided vs two sided" -> the One side or both table (06421a0).
+- **Third step-up (~22:40Z, 10-13c / 87-89c):** the rate fell from $260 to $155/day; 75 strikes were under $1 on the 15-min mean. Jack: "Yes, extend to 15c" (22:54Z), after being told each extension had drawn the next step.
+- **Near-fair quoting modelled** (Jack: "model the near-fair quoting on this wave"):
+  - $4,819/day alone at 300 a side vs $208 at the walls; $156-475/day once the walls match. The strikes had traded 2 contracts ever.
+  - Jack: "No, stay at walls."
+- **Fourth step-up (~23:10Z, 12-15c / 84-91c):** "why do i not quote both sides? arent they very wide gaps" and "a bunch of these markets arent even quoting" (MXN 12/16 T176000).
+  - The one-sided loop: the join wait left the side behind the new wall, earn-only pulled it, and the off-usual cut held it at base. 465 of 499 guarded sides were 20c+ from their fair.
+  - The fair clamp kept out sides within the old 3-9c margin.
+  - Jack: "Yes, build it" + "also 1c of edge is enough" -> 8281473 (live 23:27:45Z; 2,180 tests OK). Then "let's try to get at least 2% share of each book and hit that $1 threshold".
+  - 23:35Z: 306 of 336 at 2%+ (median 3.8%); 296 two-sided vs 264 before; guard lines on far sides 449 -> 1.
+- **11/19 00:04Z, "Make sure bait guards are up":** every guard was confirmed on from the startup lines. All 38 one-sided strikes were fair-clamped:
+  - 19 UK GDP 12/11 bids 9-13c OVER the fair; 13 MXN/GBP tail asks 4-9c UNDER it (both would trade through the fair);
+  - 5 tail asks 0.4-0.7c past it; 1 ask at -0.1c.
+- **Jack: "0c edge is ok" -> 13ffefe** (live 00:21Z, `=off` restores the old margin). T176000's limits went 89/100 -> 94/97 at 1c, then 95/96 at 0c.
+- **00:41Z ("check again that all 336 are above 2% share"):** 313 at 2%+ (median 4.2%). The 23 under: 2 off, 2 one-sided UK GDP, and 19 with a side within 20c of its fair (off-usual still applies) or past the 15c tier.
+  - Offered: `IMM_FAR_FROM_FAIR_C` 10c or a 20c tier.
 
 ## Open questions closed since 11/08
 
 - 11/15 ("Yes, commit"): the 11/14-11/15 wave tools and this runbook committed from KL (09225c9).
+- 11/18-19 on w1113-fxmetals:
+  - "1.5-3x the size": `scan_max_mult 2`.
+  - Cheap tiers to 15c ("yes, extend to 10c", "Yes, extend to 15c").
+  - Near-fair quoting: "No, stay at walls".
+  - Far-from-fair guard exemption: "Yes, build it".
+  - FX margin 0c ("also 1c of edge is enough", then "0c edge is ok"). This supersedes the 11/15 "Yes, keep it" on the vol cushion.
 
 - 11/14: the $1-floor protocol runs on its own, in manual mode, on type B waves with a live fair ("Yes, pre-approve"); `floor_auto` on w1113-fxmetals ("Yes, every 15 min"), on w1114-cryptoev since 11/15 (offs only).
 - 11/14: KXSENATENOM-TNR-28's 12 markets pinned at 0 until Blackburn names her appointee (lifting them -- `setarg w1111-statenom pin KXSENATENOM-TNR-28-<X>:0 --unset` each -- is Jack's word); the KXSENATENOM series pin lifted (436 markets back on the tiers: 175,600 -> 1,148,900 contracts listed), KSR-JMOR, ARR-JBOO and COD-MBEN keep their 200 pins.
