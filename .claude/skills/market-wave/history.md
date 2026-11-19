@@ -212,7 +212,7 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
   - The Latest relight row read $0.02: at 17:01Z 439 new strikes (January FX events) listed on a period of their own, and the row took only the newest period, dropping the 336 still running since the 11/18 relight ($239 banked, T16150). It now covers every running period: 780 markets, $243 banked, net $136.
   - Two settled markets sat "open" at their last trade with realized $0.00: T15600 (180 sold at 93c, settled YES 11/16) -$10.80 vs -$12.60 paid; T13550 (10 at 2c, settled NO 11/17) $0.00 vs -$0.20. Both were still in cash held.
   - The chart's +$249 spike at 11:53Z: that read caught T16150 just before its first trade and marked our 825 at 48.5c, the mid of a 17 x 80 book (+$259.87).
-  - Whole wave after the fix: -$120.05 = -$12.80 realized + -$107.25 open. T16150 stays at its 4c last trade (Kalshi's valuation) on a 7 x 15 book: at the bot's 11c mark it would be -$49.50. The :8782 history was restated to match (891 rows; backup `history.json.bak-20261119-pl`). :8774 also booked 2 settled markets (KXGOPFAVSEN AL13 -$8.00, KXTHUNEELECT +$16.66).
+  - Whole wave after the fix: -$120.05 = -$12.80 realized + -$107.25 open. T16150 stays at its 4c last trade (Kalshi's valuation) on a 7 x 15 book: at the bot's 11c mark it would be -$49.50. Asked last trade or the bot's mid, Jack: "Keep last trade". The :8782 history was restated to match (891 rows; backup `history.json.bak-20261119-pl`). :8774 also booked 2 settled markets (KXGOPFAVSEN AL13 -$8.00, KXTHUNEELECT +$16.66).
 
 ## Open questions closed since 11/08
 
@@ -225,6 +225,7 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
   - The floor trim (ae46e39): "Leave it off" (11/19), after it over-cut and cost $90/day.
   - The cheap tier past 15c: "Up to 25c on cheap tier multiplier if needed" (11/19). Done as the per-market reach (`floor_tier 25`, 5e2f061). Shown the wave-wide option (~$415k more resting), Jack chose "Per strike".
   - FX margin 0c ("also 1c of edge is enough", then "0c edge is ok"). This supersedes the 11/15 "Yes, keep it" on the vol cushion.
+  - The wave dashboards value open positions at the last trade, not the bot's mid: "Keep last trade" (11/19, shown T16150 at -$107.25 vs -$49.50).
 
 - 11/14: the $1-floor protocol runs on its own, in manual mode, on type B waves with a live fair ("Yes, pre-approve"); `floor_auto` on w1113-fxmetals ("Yes, every 15 min"), on w1114-cryptoev since 11/15 (offs only).
 - 11/14: KXSENATENOM-TNR-28's 12 markets pinned at 0 until Blackburn names her appointee (lifting them -- `setarg w1111-statenom pin KXSENATENOM-TNR-28-<X>:0 --unset` each -- is Jack's word); the KXSENATENOM series pin lifted (436 markets back on the tiers: 175,600 -> 1,148,900 contracts listed), KSR-JMOR, ARR-JBOO and COD-MBEN keep their 200 pins.
