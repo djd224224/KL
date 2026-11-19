@@ -46700,7 +46700,7 @@ class TestNationalNomineeFloor(unittest.TestCase):
         out, _m = imm.twin_check_quotes([q(self.T, "ask", 2, 200)], None, 2.2)
         self.assertEqual((out[0].price_cents, out[0].price_exact), (3, None))
 
-    def _cycle(self, mode, nat_bid="0.1500", fail=False):
+    def _cycle(self, mode, nat_bid="0.1500", fail=False, ceil="off", nat_ask=None):
         _clean_persist()
         test = self
         reads = []
@@ -46736,13 +46736,17 @@ class TestNationalNomineeFloor(unittest.TestCase):
                     reads.append(path)
                     if fail:
                         raise RuntimeError("read failed")
-                    return {"event": {"markets": [
-                        {"ticker": f"{test.NAT}-RDS", "yes_sub_title": "Ron DeSantis",
-                         "status": "active", "yes_bid_dollars": nat_bid}]}}
+                    nm = {"ticker": f"{test.NAT}-RDS", "yes_sub_title": "Ron DeSantis",
+                          "status": "active", "yes_bid_dollars": nat_bid}
+                    if nat_ask is not None:
+                        nm["yes_ask_dollars"] = nat_ask
+                    return {"event": {"markets": [nm]}}
                 return super().get(path, params)
 
         with mock.patch.object(imm, "LADDER_MODE", "atref"), \
                 mock.patch.object(imm, "NATNOM_FLOOR_MODE", mode), \
+                mock.patch.object(imm, "NATNOM_BID_CEIL_MODE", ceil), \
+                mock.patch.object(imm, "NATNOM_BID_CEIL_C", 6.0), \
                 mock.patch.object(imm, "NATNOM_EVENTS", {self.SER: self.NAT}), \
                 mock.patch.object(imm, "NATNOM_FLOOR_ADJ_C", 0.0), \
                 mock.patch.object(imm, "LONE_REF_GUARD_MODE", "off"), \
@@ -46794,6 +46798,122 @@ class TestNationalNomineeFloor(unittest.TestCase):
         bot, rungs, lines, reads = self._cycle("on", fail=True)
         self.assertEqual(rungs.get((self.T, "ask")), 13, rungs)
         self.assertEqual(sum("! national nominee floor: read" in s for s in lines), 1, lines[-20:])
+
+
+class TestNationalNomineeBidCeiling(TestNationalNomineeFloor):
+    """Jack 2026-11-19: "build it, with a 6c buffer", to "Build the national
+    price ceiling for state-primary bids?", after Mark Kelly's Arizona book
+    (KXDPRESPRIMARY-28AZ-MKEL) flipped between ~5c and ~12c and our 12c bid
+    was swept twice while his national market (KXPRESNOMD-28-MK) sat at
+    3.4/3.5c. A state primary's adding YES bid rests at most the national
+    market's YES ask + 6c (its YES bid when it has no ask); a short-YES
+    market's bids are left alone. The floor's own tests run again here with
+    the ceiling off."""
+
+    def test_the_defaults(self):
+        if "IMM_NATNOM_BID_CEIL" in os.environ or "IMM_NATNOM_BID_CEIL_C" in os.environ:
+            self.skipTest("the bid ceiling's knobs are set in this environment")
+        self.assertEqual(imm.NATNOM_BID_CEIL_MODE, "on")
+        self.assertEqual(imm.NATNOM_BID_CEIL_C, 6.0)
+
+    def test_national_asks_and_the_ceiling(self):
+        names = {"MKEL": "markkelly", "RDES": "rondesantis", "ABES": "andybeshear"}
+        asks = imm.natnom_asks_from_event({"event": {"markets": [
+            {"ticker": "KXPRESNOMD-28-MK", "yes_sub_title": "Mark Kelly",
+             "status": "active", "yes_bid_dollars": "0.0340", "yes_ask_dollars": "0.0350"},
+            # the legacy integer-cent field when the dollars one is absent
+            {"ticker": "KXPRESNOMR-28-RDS", "yes_sub_title": "Ron DeSantis",
+             "status": "active", "yes_ask": 16},
+            # no ask (Kalshi shows 1.00), or a closed market: no ask
+            {"ticker": "KXPRESNOMD-28-AB", "yes_sub_title": "Andy Beshear",
+             "status": "active", "yes_bid_dollars": "0.0370", "yes_ask_dollars": "1.0000"},
+            {"ticker": "KXPRESNOMD-28-CLO", "yes_sub_title": "Closed Name",
+             "status": "closed", "yes_ask_dollars": "0.3000"}]}})
+        self.assertEqual(asks, {"markkelly": ("KXPRESNOMD-28-MK", 3.5),
+                                "rondesantis": ("KXPRESNOMR-28-RDS", 16.0)})
+        bids = {"andybeshear": ("KXPRESNOMD-28-AB", 3.7), "markkelly": ("KXPRESNOMD-28-MK", 3.4)}
+        # Kelly: the national ask 3.5c + 6c
+        self.assertEqual(imm.natnom_bid_ceiling("KXDPRESPRIMARY-28AZ-MKEL", names, asks, bids, buf=6),
+                         (9.5, "KXPRESNOMD-28-MK", 3.5, "ask"))
+        # Beshear has no national ask: his national bid + 6c
+        self.assertEqual(imm.natnom_bid_ceiling("KXDPRESPRIMARY-28KY-ABES", names, asks, bids, buf=6),
+                         (9.7, "KXPRESNOMD-28-AB", 3.7, "bid"))
+        # a code without a name, or a name with neither: no ceiling
+        self.assertIsNone(imm.natnom_bid_ceiling("KXDPRESPRIMARY-28AZ-ZZZZ", names, asks, bids))
+        self.assertIsNone(imm.natnom_bid_ceiling("KXRPRESPRIMARY-28FL-RDES", names, {}, {}))
+
+    def test_the_kelly_rung_is_repriced_under_the_ceiling(self):
+        # 05:02Z 11/19 in miniature: our 750 at 12c in Arizona, Kelly's national ask
+        # 3.5c -> 9.5c: a whole-cent rung rests 9c, a sub-penny one 9.5c; asks stand
+        q = imm.Quote
+        t = "KXDPRESPRIMARY-28AZ-MKEL"
+        out, moved = imm.twin_check_quotes(
+            [q(t, "bid", 12, 750), q(t, "bid", 1, 5000, is_pad=True), q(t, "ask", 13, 750)], 9.5, None)
+        self.assertEqual(sorted((x.book_side, x.price_cents, x.count) for x in out),
+                         [("ask", 13, 750), ("bid", 1, 5000), ("bid", 9, 750)])
+        self.assertEqual(moved, {"bid": (12.0, 9.0)})
+        out, _m = imm.twin_check_quotes([q(t, "bid", 12, 750, price_exact=12.0)], 9.5, None)
+        self.assertEqual((out[0].price_cents, out[0].price_exact), (9, 9.5))
+
+    def test_on_the_bid_rests_under_the_national_ask_plus_6(self):
+        # the state book 12/13 (our bid joins 12); DeSantis's national 3.4/3.5c -> 9.5c
+        bot, rungs, lines, reads = self._cycle("on", nat_bid="0.0340", ceil="on", nat_ask="0.0350")
+        bid = rungs.get((self.T, "bid"))
+        self.assertTrue(bid is None or bid <= 9, (rungs, [s for s in lines if "nominee" in s]))
+        self.assertTrue(any(
+            "national nominee bid ceiling KXFOOPRIM-28AL-RDES bid: 12c -> 9c -- KXFOONOM-28-RDS "
+            "(the same name as the nominee) is ask 3.5c, +6c = 9.5c" in s for s in lines),
+            [s for s in lines if "nominee" in s])
+        # the floor (national bid 3.4c) leaves the 13c ask alone
+        self.assertEqual(rungs.get((self.T, "ask")), 13, rungs)
+
+    def test_a_national_ask_within_6c_moves_nothing(self):
+        # national 7/8c -> 14c: the 12c bid stands
+        bot, rungs, lines, reads = self._cycle("on", nat_bid="0.0700", ceil="on", nat_ask="0.0800")
+        self.assertEqual(rungs.get((self.T, "bid")), 12, rungs)
+        self.assertFalse(any("bid ceiling KXFOOPRIM" in s for s in lines))
+
+    def test_dry_logs_and_the_bid_rests_as_built(self):
+        bot, rungs, lines, reads = self._cycle("on", nat_bid="0.0340", ceil="dry", nat_ask="0.0350")
+        self.assertEqual(rungs.get((self.T, "bid")), 12, rungs)
+        self.assertTrue(any("national nominee bid ceiling (dry) KXFOOPRIM-28AL-RDES bid: 12c -> 9c"
+                            in s for s in lines), [s for s in lines if "nominee" in s])
+
+    def test_the_ceiling_alone_still_reads_the_national_prices(self):
+        # the floor off, the ceiling on: the reads still run and the bid is capped
+        bot, rungs, lines, reads = self._cycle("off", nat_bid="0.0340", ceil="on", nat_ask="0.0350")
+        self.assertIn(f"/events/{self.NAT}", reads)
+        bid = rungs.get((self.T, "bid"))
+        self.assertTrue(bid is None or bid <= 9, rungs)
+        self.assertEqual(rungs.get((self.T, "ask")), 13, rungs)
+
+    def test_a_short_market_keeps_its_bids(self):
+        # short YES: the bid buys the position back, so the ceiling leaves it be
+        _clean_persist()
+        q = imm.Quote
+        meta = types.SimpleNamespace(series=self.SER)
+        with mock.patch.object(imm, "NATNOM_FLOOR_MODE", "on"), \
+                mock.patch.object(imm, "NATNOM_BID_CEIL_MODE", "on"), \
+                mock.patch.object(imm, "NATNOM_BID_CEIL_C", 6.0), \
+                mock.patch.object(imm, "NATNOM_EVENTS", {self.SER: self.NAT}):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            now = time.time()
+            bot._natnom_px_at[self.SER] = now
+            bot._natnom_try_at = now
+            bot._natnom_names[self.SER] = {"RDES": "rondesantis"}
+            bot._natnom_px[self.SER] = {"rondesantis": (f"{self.NAT}-RDS", 3.4)}
+            bot._natnom_ask[self.SER] = {"rondesantis": (f"{self.NAT}-RDS", 3.5)}
+            mq = [q(self.T, "bid", 12, 300), q(self.T, "ask", 13, 300)]
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                short = bot._natnom_floor(self.T, meta, mq, now, own_pos=-300.0)
+                flat = bot._natnom_floor(self.T, meta, mq, now, own_pos=0.0)
+                long_ = bot._natnom_floor(self.T, meta, mq, now, own_pos=200.0)
+        px = lambda qs, s: [x.price_cents for x in qs if x.book_side == s]
+        self.assertEqual(px(short, "bid"), [12])
+        self.assertEqual(px(flat, "bid"), [9])
+        self.assertEqual(px(long_, "bid"), [9])
+        self.assertEqual(px(short, "ask") + px(flat, "ask") + px(long_, "ask"), [13, 13, 13])
 
 
 class TestNameBidCap(unittest.TestCase):
