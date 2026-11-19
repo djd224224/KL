@@ -217,7 +217,7 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
   - Near-fair quoting: "No, stay at walls".
   - Far-from-fair guard exemption: "Yes, build it". Its threshold 20c -> 10c: "Yes, 10c" (32bd17c).
   - The floor trim (ae46e39): "Leave it off" (11/19), after it over-cut and cost $90/day.
-  - The cheap tier past 15c: "Up to 25c on cheap tier multiplier if needed" (11/19). Done as the per-market reach (`floor_tier 25`, 5e2f061), not a blanket tier.
+  - The cheap tier past 15c: "Up to 25c on cheap tier multiplier if needed" (11/19). Done as the per-market reach (`floor_tier 25`, 5e2f061). Shown the wave-wide option (~$415k more resting), Jack chose "Per strike".
   - FX margin 0c ("also 1c of edge is enough", then "0c edge is ok"). This supersedes the 11/15 "Yes, keep it" on the vol cushion.
 
 - 11/14: the $1-floor protocol runs on its own, in manual mode, on type B waves with a live fair ("Yes, pre-approve"); `floor_auto` on w1113-fxmetals ("Yes, every 15 min"), on w1114-cryptoev since 11/15 (offs only).
