@@ -20908,8 +20908,11 @@ def fx_event_wave_limits(ticker: str, now_ts: float) -> Optional[Tuple[int, int]
 # Such a side skips both guards and follows its wall at full size; the fair limits, the jump
 # hold and every breaker stand. Live fairs: the FX event fair (fx_event_gate) and the crypto
 # event fair (crypto_event_gate), passing their gates; none = the guards stand.
-# IMM_FAR_FROM_FAIR_C=0 turns it off.
-FAR_FROM_FAIR_C = _env_float("IMM_FAR_FROM_FAIR_C", 20.0)
+# Built at 20c; 10c since Jack 2026-11-18 ("Yes, 10c"): the relight's strikes still under 2%
+# share had a side 10-20c from its fair that the off-usual cut held at base (MXN 11/25
+# T186000: a 300-lot 92c ask on a 73.5c fair). A fill on such a side still sells 10c+ over,
+# or buys 10c+ under, the fair. IMM_FAR_FROM_FAIR_C=0 turns it off.
+FAR_FROM_FAIR_C = _env_float("IMM_FAR_FROM_FAIR_C", 10.0)
 
 
 def live_wave_fair_c(ticker: str, now_ts: float) -> Optional[float]:

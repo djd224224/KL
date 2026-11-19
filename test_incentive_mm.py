@@ -47853,10 +47853,12 @@ class TestCryptoEventFair(unittest.TestCase):
 
 
 class TestFarFromFair1118(unittest.TestCase):
-    """Jack 2026-11-18, the w1113-fxmetals relight: "Yes, build it" -- a wave side 20c+ on the
+    """Jack 2026-11-18, the w1113-fxmetals relight: "Yes, build it" -- a wave side 10c+ on the
     safe side of its LIVE fair (a bid that far under, an ask that far over) can't be baited, so
     it skips the join wait and the off-usual size cut. KXUSDMXNEVENT-16DEC261015-T176000 sat
-    dark: a 12c bid on a 95.5c fair, waiting 102 s to join each new wall, pulled meanwhile."""
+    dark: a 12c bid on a 95.5c fair, waiting 102 s to join each new wall, pulled meanwhile.
+    Built at 20c; 10c since Jack 2026-11-18 ("Yes, 10c"), for the strikes still under 2% share
+    with a side 10-20c from its fair held at base (MXN 11/25 T186000: a 92c ask, 73.5c fair)."""
     T = "KXUSDMXNEVENT-16DEC261015-T176000"
 
     def setUp(self):
@@ -47873,15 +47875,19 @@ class TestFarFromFair1118(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def test_the_default_and_the_live_fair(self):
-        self.assertEqual(imm.FAR_FROM_FAIR_C, 20.0)
+        self.assertEqual(imm.FAR_FROM_FAIR_C, 10.0)       # 20c as built; Jack 2026-11-18 "Yes, 10c"
         self.assertEqual(imm.live_wave_fair_c(self.T, time.time()), 95.5)
         self.assertIsNone(imm.live_wave_fair_c("KXHIGHNY-26NOV19-T50", time.time()))   # no live fair
 
-    def test_far_means_the_safe_side_by_20c(self):
+    def test_far_means_the_safe_side_by_10c(self):
         now = time.time()
         self.assertTrue(imm.side_far_from_fair(self.T, "bid", 12, now))       # 83.5c under the fair
-        self.assertFalse(imm.side_far_from_fair(self.T, "bid", 80, now))      # 15.5c: the guards stand
+        self.assertTrue(imm.side_far_from_fair(self.T, "bid", 80, now))       # 15.5c: exempt at 10c
+        self.assertTrue(imm.side_far_from_fair(self.T, "bid", 85, now))       # 10.5c
+        self.assertFalse(imm.side_far_from_fair(self.T, "bid", 86, now))      # 9.5c: the guards stand
         self.assertFalse(imm.side_far_from_fair(self.T, "ask", 97, now))      # an ask over by 1.5c
+        with mock.patch.object(imm, "FAR_FROM_FAIR_C", 20.0):                 # the 20c build
+            self.assertFalse(imm.side_far_from_fair(self.T, "bid", 80, now))  # 15.5c: held
         self.assertFalse(imm.side_far_from_fair("KXUSDMXNEVENT-16DEC261015-T190000", "bid", 12, now))  # off the list
         with mock.patch.object(imm, "FAR_FROM_FAIR_C", 0.0):
             self.assertFalse(imm.side_far_from_fair(self.T, "bid", 12, now))   # IMM_FAR_FROM_FAIR_C=0
