@@ -28029,14 +28029,23 @@ def natnom_ask_floor(ticker: str, names: Dict[str, str],
 # 326 paced to $1+ against 511 of the 566 markets quoting normally. $13k fits
 # every name's wanted bids (TMAS $12,925 the most).
 #
+# RAISED TO $20,000 (Jack 2026-11-19: "Raise to $20k", to "Raise the name bid cap
+# to $17.5k so Warnock and Vance bid in every state?"). On 11/19 12:36Z the wave's
+# $0.75-1 markets went up to 1.5x (77 markets). The cap at $13k then bound 7 names:
+#   * Warnock (KXDPRESPRIMARY RWAR) wanted $16,927, so 8 states rested no bid.
+#   * Vance (KXRPRESPRIMARY JVAN) wanted $17,065, so 6 states rested no bid.
+#   * Buttigieg left 1 state with no bid. Harris, Massie, Moore and Beshear each
+#     had 1-2 states trimmed.
+# $20k fits every name's wanted bids then.
+#
 # Knobs:
 #   * IMM_NAME_BID_CAP: "on" (default), "dry" (logged, nothing cut), "off".
-#   * IMM_NAME_BID_CAP_USD: the cap, default 13000 (1500 from 11/16 to 11/17,
-#     5000 from 11/17 to 11/18).
+#   * IMM_NAME_BID_CAP_USD: the cap, default 20000 (1500 from 11/16 to 11/17,
+#     5000 from 11/17 to 11/18, 13000 from 11/18 to 11/19).
 NAME_BID_CAP_MODE = os.environ.get("IMM_NAME_BID_CAP", "on").strip().lower()
 if NAME_BID_CAP_MODE not in ("on", "dry", "off"):
     NAME_BID_CAP_MODE = "on"
-NAME_BID_CAP_USD = max(0.0, _env_float("IMM_NAME_BID_CAP_USD", 13000.0))
+NAME_BID_CAP_USD = max(0.0, _env_float("IMM_NAME_BID_CAP_USD", 20000.0))
 
 
 def name_bid_cap(quotes: List["Quote"], value_per_day: Dict[str, float],
