@@ -14270,6 +14270,18 @@ UNWIND_WAVES_AT_COST = os.environ.get("IMM_UNWIND_WAVES_AT_COST", "0") == "1"
 # IMM_UNWIND_NO_LEAD=0 turns it off.
 UNWIND_NO_LEAD = os.environ.get("IMM_UNWIND_NO_LEAD", "1") != "0"
 UNWIND_NO_LEAD_MIN = max(1.0, _env_float("IMM_UNWIND_NO_LEAD_MIN", 20.0))
+# UNWIND AT MARKET (Jack 2026-11-19 on KXUSDJPYEVENT-25NOV261500-T16150 -- 825 YES
+# bought at 17c, its unwind held at the 25c live FX fair against a 2x12 book: "ok
+# to unwind at worse than breakeven"): a market named in this file that the bot is
+# unwinding closes its position AT THE MARKET -- one order of the whole position at
+# the best external price on its side with UNWIND_NO_LEAD_MIN+ contracts (it joins
+# that price: never leads, never crosses) -- past the bot's average cost, past the
+# close clamp's usual-price bound and past a live event fair's cap. A market's
+# optional "limit_c" (YES cents) is the worst price it takes: an ask at or over it,
+# a bid at or under it. With no such external price it unwinds as before. Read every
+# cycle: {ticker: {"by": "...", "limit_c": null}}; take a market out (or the file)
+# to stop. Jack's word per market.
+UNWIND_AT_MARKET_FILE = os.path.join(STATUS_DIR, "UNWIND_AT_MARKET.json")
 
 
 def breakeven_whole_cent(be: float, side: str) -> int:
@@ -14330,6 +14342,50 @@ def unwind_only_quotes(quotes: List["Quote"], pos: float,
         bucket = math.ceil(new) if side == "ask" else math.floor(new)
         q = replace(near, count=int(abs(pos)), price_cents=int(bucket), price_exact=new)
     return [q]
+
+
+def load_unwind_at_market(path: str) -> Dict[str, dict]:
+    """UNWIND AT MARKET: {ticker: spec} from `path`; a spec's "limit_c" a float or
+    None. {} when the file is missing or unreadable (the unwind as before)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+    out: Dict[str, dict] = {}
+    for k, v in (d.items() if isinstance(d, dict) else []):
+        spec = dict(v) if isinstance(v, dict) else {}
+        try:
+            spec["limit_c"] = None if spec.get("limit_c") is None else float(spec["limit_c"])
+        except (TypeError, ValueError):
+            spec["limit_c"] = None
+        out[str(k)] = spec
+    return out
+
+
+def unwind_at_market_quotes(quotes: List["Quote"], pos: float, join: Optional[float],
+                            limit: Optional[float] = None) -> List["Quote"]:
+    """UNWIND AT MARKET: one order of |pos| on the side that reduces it, at `join`
+    (the best external price on that side with UNWIND_NO_LEAD_MIN+ contracts, YES
+    cents) -- no cost, usual-price or fair floor -- but never worse than `limit`
+    (an ask at or over it, a bid at or under it). Nothing while flat, with no price
+    to join, or with no rung on that side to carry the order."""
+    if abs(pos) < 1 or join is None or not 0 < float(join) < 100:
+        return []
+    side = "ask" if pos > 0 else "bid"
+    rungs = [q for q in quotes if q.book_side == side and not q.is_pad]
+    if not rungs:
+        return []
+    new = float(join)
+    if limit is not None:
+        new = max(new, float(limit)) if side == "ask" else min(new, float(limit))
+    new = round(new, 2)
+    if not 0 < new < 100:
+        return []
+    if abs(new - round(new)) < 0.005:
+        return [replace(rungs[0], count=int(abs(pos)), price_cents=int(round(new)), price_exact=None)]
+    bucket = math.ceil(new) if side == "ask" else math.floor(new)
+    return [replace(rungs[0], count=int(abs(pos)), price_cents=int(bucket), price_exact=new)]
 
 
 def external_touch_exact(yes_exact: List[List[float]], no_exact: List[List[float]],
@@ -30129,6 +30185,9 @@ class IncentiveMarketMaker:
         self._unwind_nolead_noted: Dict[str, Any] = {}   # NO LEAD: last logged move per market
         self._unwind_past_cost_noted: Dict[str, Any] = {}  # a wave unwind resting past cost (2026-11-12)
         self._wave_unwind: Dict[str, "MarketMeta"] = {}   # ...held wave markets outside the selection
+        self._unwind_at_market: Dict[str, dict] = {}      # UNWIND AT MARKET: UNWIND_AT_MARKET_FILE's markets
+        self._unwind_at_market_mtime = 0.0                # ...its mtime when last read
+        self._unwind_at_market_noted: Dict[str, Any] = {}  # ...last logged order per market
         self._wave_unwind_noted: Optional[int] = None
         self._ca_family_unwind: Dict[str, "MarketMeta"] = {}   # held markets of a Carbon Arc family turned off
         self._ca_family_unwind_noted: Optional[int] = None
@@ -42709,6 +42768,20 @@ class IncentiveMarketMaker:
                    f"better; flat ones rest nothing; every other market as usual" if _uwo
                    else "OFF: the listed wave markets quote both sides again"))
         self._unwind_waves_only = _uwo
+        # UNWIND AT MARKET (UNWIND_AT_MARKET_FILE): re-read when it changes
+        try:
+            _uam = os.path.getmtime(UNWIND_AT_MARKET_FILE)
+        except OSError:
+            _uam = 0.0
+        if _uam != self._unwind_at_market_mtime:
+            self._unwind_at_market = load_unwind_at_market(UNWIND_AT_MARKET_FILE) if _uam else {}
+            self._unwind_at_market_mtime = _uam
+            log(f"{self.tag} UNWIND AT MARKET ({UNWIND_AT_MARKET_FILE}): "
+                + (", ".join(f"{k}" + (f" (limit {v['limit_c']:g}c)" if v.get("limit_c") is not None else "")
+                             for k, v in sorted(self._unwind_at_market.items()))
+                   + " -- each unwinds at the best external price with "
+                   f"{UNWIND_NO_LEAD_MIN:.0f}+ lots, past cost and any fair floor"
+                   if self._unwind_at_market else "none"))
         if self.state.halted_until > now_ts:
             log(f"{self.tag} daily-loss halt active until "
                 f"{datetime.fromtimestamp(self.state.halted_until, timezone.utc)}; idle")
@@ -45537,7 +45610,7 @@ class IncentiveMarketMaker:
             # a rung (leads, closes, offsets): the reducing side alone, never
             # past flat
             if self._unwinds(t):
-                _u_touch = _u_usual = _u_nolead = None
+                _u_touch = _u_usual = _u_nolead = _u_join = None
                 if abs(own_pos) >= 1:
                     try:
                         if meta.price_step < 0.01:
@@ -45552,10 +45625,11 @@ class IncentiveMarketMaker:
                             _u_nb, _u_na = external_best(yes_levels, no_levels, own_in_book,
                                                          min_qty=UNWIND_NO_LEAD_MIN)
                         _u_touch = _u_ea if own_pos > 0 else _u_eb
-                        # NO LEAD: never better than the best external price
-                        # with real size on the reducing side
+                        # the best external price with real size on the reducing side:
+                        # NO LEAD's floor, and UNWIND AT MARKET's price
+                        _u_join = _u_na if own_pos > 0 else _u_nb
                         if UNWIND_NO_LEAD:
-                            _u_nolead = _u_na if own_pos > 0 else _u_nb
+                            _u_nolead = _u_join
                         if pvd is None and t in self._wave_unwind:
                             # a held wave market off the live list (its stop passed,
                             # _wave_unwind_manage): its EXTERNAL touch joins the
@@ -45568,7 +45642,7 @@ class IncentiveMarketMaker:
                             _u_b, _u_a = pvd_usual_px(self.state.pvd_usual.get(t), now_ts)
                             _u_usual = _u_a if own_pos > 0 else _u_b
                     except Exception:       # its own price, as before
-                        _u_touch = _u_usual = _u_nolead = None
+                        _u_touch = _u_usual = _u_nolead = _u_join = None
                 # THE WAVES' UNWIND (UNWIND_WAVES_ONLY_FILE) -- NOT AT BREAKEVEN, NEVER
                 # BAITED (Jack 2026-11-12: "unwind, doesnt have to be at breakeven but
                 # dont lead", then "and make sure unwind positions also dont get
@@ -45590,7 +45664,29 @@ class IncentiveMarketMaker:
                             and _u_usual is not None):
                         _u_be = pvd_close_bound(_u_side, _u_usual, _u_cost, PVD_CLOSE_CLAMP_C)
                     _u_be = breakeven_whole_cent(_u_be, _u_side)
-                if self._unwinds_at_breakeven(t) and abs(own_pos) >= 1 and not _u_cost:
+                # UNWIND AT MARKET (UNWIND_AT_MARKET_FILE, Jack 2026-11-19: "ok to unwind at
+                # worse than breakeven"): a named market joins the best external price with
+                # real size -- past its cost, the usual-price bound and the event fair's cap
+                # (applied to mq above) -- never past its limit_c; with no such price, as before
+                _u_mkt = self._unwind_at_market.get(t) if abs(own_pos) >= 1 else None
+                _u_am = (unwind_at_market_quotes(mq, own_pos, _u_join, _u_mkt.get("limit_c"))
+                         if _u_mkt is not None else [])
+                if _u_mkt is not None:
+                    _u_amk = ((_u_am[0].book_side, _u_am[0].price_cents, int(_u_am[0].count))
+                              if _u_am else None)
+                    if _u_amk != self._unwind_at_market_noted.get(t):
+                        log(f"{self.tag} unwind at market {t}: "
+                            + (f"{_u_amk[0]} {_u_amk[2]} @ {_u_amk[1]}c (best external "
+                               f"{_u_amk[0]} with {UNWIND_NO_LEAD_MIN:.0f}+ lots; cost "
+                               f"{'?' if not _u_cost else f'{float(_u_cost):.1f}'}c"
+                               + (f", limit {_u_mkt['limit_c']:g}c" if _u_mkt.get("limit_c") is not None
+                                  else "") + ")"
+                               if _u_am else f"no external {_u_side} with {UNWIND_NO_LEAD_MIN:.0f}+ "
+                               f"lots to join: unwinds as before"))
+                        self._unwind_at_market_noted[t] = _u_amk
+                if _u_am:
+                    mq = _u_am
+                elif self._unwinds_at_breakeven(t) and abs(own_pos) >= 1 and not _u_cost:
                     mq = []
                 else:
                     _u_in = mq

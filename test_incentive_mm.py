@@ -158,6 +158,7 @@ def setUpModule():
     imm.UNWIND_ONLY_FILE = os.path.join(tmp, "UNWIND_ONLY")
     imm.UNWIND_WAVES_FILE = os.path.join(tmp, "UNWIND_ONLY_EXCEPT_WAVES")
     imm.UNWIND_WAVES_ONLY_FILE = os.path.join(tmp, "UNWIND_ONLY_WAVES")
+    imm.UNWIND_AT_MARKET_FILE = os.path.join(tmp, "UNWIND_AT_MARKET.json")
     # every Carbon Arc family quotes in the fixtures (POS + apps are off live
     # since 2026-11-08: TestCaFamiliesOff sets it)
     imm.CA_FAMILY_BLOCK = frozenset()
@@ -45134,6 +45135,81 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         listed, rest, _l = orders(150.0, avg=70.0, unwind=True)
         self.assertEqual(listed, [("ask", 70, 150.0)])
         self.assertEqual(rest, [])
+
+    def test_unwind_at_market_joins_the_book_past_cost(self):
+        """Jack 2026-11-19 on KXUSDJPYEVENT-25NOV261500-T16150 (825 YES at 17c held at
+        the 25c fair against a 2x12 book): "ok to unwind at worse than breakeven" --
+        a market named in UNWIND_AT_MARKET_FILE joins the best external price with
+        real size, past its cost, never past its limit_c; every other market as before"""
+        Q = imm.Quote
+        qs = [Q(self.T, "bid", 40, 500), Q(self.T, "ask", 60, 200), Q(self.T, "ask", 62, 200),
+              Q(self.T, "ask", 99, 50, is_pad=True)]
+
+        def aq(*a, **k):
+            return [(q.book_side, q.price_cents, q.price_exact, q.count)
+                    for q in imm.unwind_at_market_quotes(qs, *a, **k)]
+        self.assertEqual(aq(825.0, 12), [("ask", 12, None, 825)])          # joins the 12c ask
+        self.assertEqual(aq(825.0, 12, limit=15), [("ask", 15, None, 825)])  # never under its limit
+        self.assertEqual(aq(-120.0, 47), [("bid", 47, None, 120)])
+        self.assertEqual(aq(-120.0, 47, limit=44), [("bid", 44, None, 120)])
+        self.assertEqual(aq(825.0, 6.1), [("ask", 7, 6.1, 825)])             # a 0.1c book
+        self.assertEqual(aq(0.4, 12), [])                                     # flat
+        self.assertEqual(aq(825.0, None), [])                                 # nothing to join
+        self.assertEqual(imm.unwind_at_market_quotes([Q(self.T, "bid", 40, 500)], 825.0, 12), [])
+        # the file: missing / unreadable = none; limit_c a float or None
+        p = os.path.join(tempfile.mkdtemp(), "uam.json")
+        self.assertEqual(imm.load_unwind_at_market(p), {})
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(imm.load_unwind_at_market(p), {})
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"KXA-1": {"by": "Jack"}, "KXA-2": {"limit_c": "10"}, "KXA-3": 5}, fh)
+        self.assertEqual(imm.load_unwind_at_market(p), {"KXA-1": {"by": "Jack", "limit_c": None},
+                                                         "KXA-2": {"limit_c": 10.0}, "KXA-3": {"limit_c": None}})
+
+        other = "KXGOOD-99DEC30-A"
+
+        def orders(pos, avg, at_market=None):
+            _clean_persist()
+            self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200},
+                         other: {"bid_max": 49, "ask_min": 51, "size": 200}})
+            c = FakeClient()
+            c.programs.append(dict(c.programs[0], market_ticker=other))
+            c.markets[other] = dict(c.markets[self.T], ticker=other, event_ticker="KXGOOD-99DEC30")
+            c.books[other] = c.books[self.T]
+            bot = IncentiveMarketMaker(client=c, live=False)
+            for t in (self.T, other):
+                bot.pnl.pos[t], bot.pnl.avg[t] = pos, avg
+                bot.client.positions[t] = pos
+            open(imm.UNWIND_WAVES_ONLY_FILE, "w").close()
+            if at_market is not None:
+                with open(imm.UNWIND_AT_MARKET_FILE, "w", encoding="utf-8") as fh:
+                    json.dump(at_market, fh)
+            lines = []
+            try:
+                with mock.patch.object(imm, "log", lines.append):
+                    bot.run_cycle()
+            finally:
+                for f in (imm.UNWIND_WAVES_ONLY_FILE, imm.UNWIND_AT_MARKET_FILE):
+                    if os.path.exists(f):
+                        os.remove(f)
+            by = lambda t: sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                                  for o in bot.state.sim_orders.values() if o["ticker"] == t)
+            return by(self.T), by(other), lines
+        # without it: bought at 70 over the 51c ask, it waits at 70 (as before)
+        listed, rest, lines = orders(150.0, 70.0)
+        self.assertEqual((listed, rest), ([("ask", 70, 150.0)], [("ask", 70, 150.0)]))
+        self.assertFalse(any("UNWIND AT MARKET" in x or "unwind at market" in x for x in lines), lines)
+        # named: joins the 1,200-lot 51c ask; the other market still waits at 70
+        listed, rest, lines = orders(150.0, 70.0, {self.T: {"by": "Jack 2026-11-19"}})
+        self.assertEqual((listed, rest), ([("ask", 51, 150.0)], [("ask", 70, 150.0)]))
+        self.assertTrue(any(f"UNWIND AT MARKET ({imm.UNWIND_AT_MARKET_FILE}): {self.T}" in x for x in lines), lines)
+        self.assertTrue(any(f"unwind at market {self.T}: ask 150 @ 51c" in x for x in lines), lines)
+        listed, _r, _l = orders(150.0, 70.0, {self.T: {"limit_c": 60}})        # its limit holds
+        self.assertEqual(listed, [("ask", 60, 150.0)])
+        listed, _r, _l = orders(-80.0, 45.0, {self.T: {}})                       # short: joins the 49c bid
+        self.assertEqual(listed, [("bid", 49, 80.0)])
+        self.assertEqual(orders(0.0, None, {self.T: {}})[0], [])                 # flat: nothing
 
     def test_unwind_never_leads(self):
         """Jack 2026-11-08: "when unwinding, dont lead like in
