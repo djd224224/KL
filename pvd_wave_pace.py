@@ -43,6 +43,20 @@ read by its tune's --size-mult-file; 0 = off, the sizes kept in "pre_off"):
     restart would have stopped 258 strikes on 11/14), and only if it projects under
     $1 - --keep-within (a $0.95-1.00 market is inside the estimate's noise);
   * an off market stays off (Jack 2026-11-14 13:40Z on the FX offs: "Keep them off");
+  * TRIM, on a wave whose floor "trim" is on (`set NAME floor_trim on`; Jack 2026-11-18 on
+    the FX relight: "dont overquote if unneeded to hit the target threshold"): a market
+    that needs less size for its target comes DOWN to that size. The target: a projection
+    of TRIM_TO x the aim ($1.50 on $1.20) and TRIM_MIN_SHARE of the pool (2.25%; Jack
+    11/18: "at least 2% share of each book"), modelled with the WHOLE share loss counted
+    (others standing still), so a cut lands at or over it. Only on two reads at the same
+    multiple, only a cut of 1 - TRIM_TRIGGER (20%) or more, never under TRIM_MIN_MULT, and
+    never under TRIM_MAX_CUT of the multiple in one step (the next reads measure the new
+    size before cutting again). Each trimmed market's earlier multiple waits in
+    trim_NAME.json and comes back when its period ends (a relight), when it leaves the list,
+    or when the wave's trim goes off; a size-up back to it drops the record. The $1.50 lands
+    over the $1.20 that sizes a market up, so the two don't flap. Off by default: the crypto
+    wave keeps 1,500 a side (Jack 11/15) and the default tune's --no-drop (11/07: "dont
+    drop any size after banking 1.3") stands elsewhere;
   * without --apply it only prints the plan (and records the read for the two-read rule);
     --apply writes the file, adds --size-mult-file to the wave's tune if it is missing, and
     runs the wave now. Sizing a wave up is Jack's word -- except the $1-floor protocol on a
@@ -85,10 +99,23 @@ MULT_BUCKETS = [(1.5, "1.5x or less"), (2.0, "1.5-2x"), (3.0, "2-3x"), (5.0, "3-
                 (float("inf"), "10x+")]
 PROJ_BUCKETS = [(1.30, "$1.30+"), (1.00, "$1.00-1.30"), (0.75, "$0.75-1.00"), (0.50, "$0.50-0.75"),
                 (0.25, "$0.25-0.50"), (0.0, "under $0.25")]
+# TRIM (the module docstring; Jack 2026-11-18: "dont overquote if unneeded to hit the target
+# threshold")
+TRIM_TO = 1.25             # a trim keeps the projection at 1.25 x the aim ($1.50 on $1.20)
+TRIM_MIN_SHARE = 0.0225    # ...and 2.25% of the pool (Jack 11/18: "at least 2% share of each book")
+TRIM_TRIGGER = 0.8         # only a cut to 80% of the multiple or less (no churn on noise)
+TRIM_MIN_MULT = 0.2        # the smallest multiple a trim leaves (a 5x cheap side at its base)
+TRIM_MAX_CUT = 0.25        # one step leaves at least a quarter of the multiple
+TRIM_GRID = 0.05           # a trimmed multiple rounds UP to this step
 
 
 def size_mult_path(name: str) -> str:
     return os.path.join(pw.HERE, "run-logs", "pvd-scan", f"size_mult_{name}.json")
+
+
+def trim_state_path(name: str) -> str:
+    """{ticker: {"from": the multiple before its trims, "to", "at", "stop", "period_start"}}"""
+    return os.path.join(pw.HERE, "run-logs", "pvd-scan", f"trim_{name}.json")
 
 
 def resize_state_path(name: str) -> str:
@@ -247,6 +274,44 @@ def needed_mult(j: dict, banked: float, hrs: float, m0: float, aim: float, max_m
     return (round(x, 2) if proj_at(x / m0, j, banked, hrs, real) >= aim else round(top, 2)), p_top
 
 
+def share_at(r: float, s: float) -> float:
+    """Our share with our size x r, others standing still (the module docstring's model)."""
+    s = min(max(s or 0.0, 0.0), 0.999)
+    return r * s / (1 + (r - 1) * s) if s > 0 else 0.0
+
+
+def trim_mult(j: dict, banked: float, hrs: float, m0: float, aim: float):
+    """TRIM: the smaller multiple a market over its target needs, or None. The smallest
+    TRIM_GRID step from max(TRIM_MIN_MULT, TRIM_MAX_CUT x m0) up to m0 that still keeps
+    TRIM_MIN_SHARE of the pool and projects TRIM_TO x the aim -- the whole share loss
+    counted (real = 1) -- and only if it is TRIM_TRIGGER x m0 or less."""
+    m0 = m0 or 1.0
+    s = j.get("share") or 0.0
+    if s <= 0 or m0 <= TRIM_MIN_MULT + 1e-9:
+        return None
+    target = TRIM_TO * aim
+
+    def ok(x: float) -> bool:
+        r = x / m0
+        return share_at(r, s) >= TRIM_MIN_SHARE and proj_at(r, j, banked, hrs, 1.0) >= target
+
+    k_lo = math.ceil(max(TRIM_MIN_MULT, TRIM_MAX_CUT * m0) / TRIM_GRID - 1e-9)
+    k_hi = math.floor(TRIM_TRIGGER * m0 / TRIM_GRID + 1e-9)       # a cut of 20%+ or none
+    if k_hi < k_lo or not ok(k_hi * TRIM_GRID):
+        return None
+    # ok() rises with the multiple: the smallest step that passes
+    if ok(k_lo * TRIM_GRID):
+        return round(k_lo * TRIM_GRID, 2)
+    lo, hi = k_lo, k_hi                 # ok(hi), not ok(lo)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if ok(mid * TRIM_GRID):
+            hi = mid
+        else:
+            lo = mid
+    return round(hi * TRIM_GRID, 2)
+
+
 def _bucket(v: float, buckets) -> str:
     for hi, lab in buckets:
         if v <= hi:
@@ -332,13 +397,15 @@ def measure(name: str, a, now: "datetime | None" = None, dash=None, rows=None, b
         hrs = float(dr.get("hrs_left") if dr.get("hrs_left") is not None else
                     max(0.0, ((_ts(listed[t].get("stop")) or nts) - nts) / 3600))
         m = {"ticker": t, "series": t.split("-")[0], "m0": m0, "banked": round(banked, 3), "hrs": round(hrs, 2),
-             "status": "off" if m0 == 0 else j["status"], "costs": side_costs(dr)}
+             "status": "off" if m0 == 0 else j["status"], "costs": side_costs(dr),
+             "stop": e.get("stop"), "period_start": e.get("period_start")}
         if m["status"] == "judged":
             proj = proj_at(1.0, j, banked, hrs, 0.0)
             x, p_max = needed_mult(j, banked, hrs, m0, a.aim, res["max_mult"], res["real"])
             m.update(proj=round(proj, 3), rate=round(j["rate"], 4), share=round(j["share"], 4),
                      uptime=round(j["uptime"], 3), pool=round(j["pool"], 3), two_sided=j["two_sided"],
-                     own_b=j["own_b"], own_a=j["own_a"], x_aim=x, proj_max=round(p_max, 3))
+                     own_b=j["own_b"], own_a=j["own_a"], x_aim=x, proj_max=round(p_max, 3),
+                     x_trim=trim_mult(j, banked, hrs, m0, a.aim))
             # the multiple the aim needs with no cap (for the shortfall table)
             xx, _p = needed_mult(j, banked, hrs, m0, a.aim, 1000.0, res["real"])
             m["x_aim_uncapped"] = xx
@@ -423,20 +490,33 @@ def cmd_pace(a) -> int:
 
 
 def plan_resize(res: dict, prev: dict, a, now: datetime) -> dict:
-    """{"up": {t: x}, "off": [t], "off_next": [t], "keep": n, ...} from measure()'s result
-    and the previous resize read (the two-read rule)."""
+    """{"up": {t: x}, "off": [t], "off_next": [t], "down": {t: x}, "down_next": [t], "keep": n, ...}
+    from measure()'s result and the previous resize read (the two-read rule; a trim's two
+    reads must see the same multiple). Trims only with `a.trim`."""
     nts = now.timestamp()
     prev_at = _ts(prev.get("at"))
     gap = (nts - prev_at) / 60 if prev_at else None
     prev_ok = gap is not None and TWO_READ_GAP_MIN[0] <= gap <= TWO_READ_GAP_MIN[1]
     prev_off = set(prev.get("off_candidates") or []) if prev_ok else set()
-    out = {"up": {}, "off": [], "off_next": [], "keep": 0, "at_max": 0, "borderline": 0, "skipped": collections.Counter(),
-           "prev_gap_min": round(gap, 1) if gap is not None else None, "candidates": []}
+    prev_trim = dict(prev.get("trim_candidates") or {}) if prev_ok else {}
+    trim = bool(getattr(a, "trim", False))
+    out = {"up": {}, "off": [], "off_next": [], "down": {}, "down_next": [], "keep": 0, "at_max": 0, "borderline": 0,
+           "skipped": collections.Counter(), "prev_gap_min": round(gap, 1) if gap is not None else None,
+           "candidates": [], "trim_candidates": {}}
     for m in res["markets"]:
         if m["status"] != "judged":
             out["skipped"][m["status"]] += 1
             continue
         if m["proj"] >= a.aim:
+            xt, m0 = m.get("x_trim"), m["m0"] or 1.0
+            if trim and xt is not None and xt < m0 - 1e-9:
+                out["trim_candidates"][m["ticker"]] = m0
+                pm = prev_trim.get(m["ticker"])
+                if pm is not None and abs(float(pm) - m0) < 1e-9:
+                    out["down"][m["ticker"]] = xt               # over its target on two reads at this size
+                else:
+                    out["down_next"].append(m["ticker"])
+                continue
             out["keep"] += 1
             continue
         x, m0 = m.get("x_aim"), m["m0"] or 1.0
@@ -463,6 +543,62 @@ def plan_resize(res: dict, prev: dict, a, now: datetime) -> dict:
     return out
 
 
+def wave_trim_on(name: str) -> bool:
+    """The wave's floor "trim" switch (`set NAME floor_trim on|off`); off when unreadable."""
+    try:
+        w = pw.load()["waves"].get(name) or {}
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    fl = w.get("floor") if isinstance(w.get("floor"), dict) else {}
+    return bool(fl.get("trim"))
+
+
+def apply_trims(name: str, res: dict, plan: dict, cur: dict, trim_on: bool) -> tuple:
+    """TRIM into `cur` (the multiples, in place): plan["down"]'s lower multiples, each one's
+    earlier multiple kept in trim_NAME.json; that multiple comes back when the trim is off,
+    when the market's period changed (its stop / period_start: a relight) or it left the
+    list; a record a size-up reached is dropped; an off (0) stays off. Returns (trimmed,
+    given back)."""
+    tp = trim_state_path(name)
+    try:
+        with open(tp, encoding="utf-8") as fh:
+            rec = {str(k): dict(v) for k, v in (json.load(fh) or {}).items()}
+    except (OSError, ValueError, TypeError, AttributeError):
+        rec = {}
+    if not rec and not (trim_on and plan.get("down")):
+        return 0, 0
+    live = {m["ticker"]: m for m in res.get("markets") or []}
+    n_down = n_back = 0
+    for t, r in list(rec.items()):
+        m, c, f = live.get(t), cur.get(t, 1.0), float(r.get("from") or 1.0)
+        if c == 0:
+            del rec[t]                                  # off: stays off (its pre_off keeps the sizes)
+            continue
+        moved = m is None or m.get("stop") != r.get("stop") or m.get("period_start") != r.get("period_start")
+        if not trim_on or moved:
+            if c < f - 1e-9:
+                cur[t] = f
+                n_back += 1
+            del rec[t]
+        elif c >= f - 1e-9:
+            del rec[t]                                  # a size-up reached it
+    if trim_on:
+        for t, x in (plan.get("down") or {}).items():
+            c = cur.get(t, 1.0)
+            if c == 0 or x >= c - 1e-9:
+                continue
+            m, r = live.get(t) or {}, rec.get(t)
+            rec[t] = {"from": float(r["from"]) if r else c, "to": x, "at": res.get("at"),
+                      "stop": m.get("stop"), "period_start": m.get("period_start")}
+            cur[t] = x
+            n_down += 1
+    os.makedirs(os.path.dirname(tp), exist_ok=True)
+    with open(tp + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(rec, fh, indent=0, sort_keys=True)
+    os.replace(tp + ".tmp", tp)
+    return n_down, n_back
+
+
 def cmd_resize(a) -> int:
     now = datetime.now(timezone.utc)
     res = measure(a.name, a, now=now)
@@ -475,19 +611,26 @@ def cmd_resize(a) -> int:
             prev = json.load(fh)
     except (OSError, ValueError):
         prev = {}
+    if getattr(a, "trim", None) is None:
+        a.trim = wave_trim_on(a.name)
     plan = plan_resize(res, prev, a, now)
     print(f"\nresize plan (aim ${a.aim:.2f}, up to {a.max_mult:g}x, {a.real:.0%} of the modelled gain): "
           f"{len(plan['up'])} up, {len(plan['off'])} off now (under $1 at {a.max_mult:g}x on two reads), "
           f"{len(plan['off_next'])} off at the next read if still short, {plan['keep']} keep, "
           f"{plan['borderline']} borderline kept, {plan['at_max']} already at the cap; skipped "
           f"{dict(plan['skipped'])}; previous read {plan['prev_gap_min']} min ago")
+    if a.trim:
+        print(f"  trim (${TRIM_TO * a.aim:.2f} and {TRIM_MIN_SHARE:.2%} share, whole loss counted): "
+              f"{len(plan['down'])} down now (over it on two reads at the same size), "
+              f"{len(plan['down_next'])} down at the next read if still over")
     by = collections.Counter(round(x, 2) for x in plan["up"].values())
     if by:
         print("  new multiples: " + ", ".join(f"{k:g}x {v}" for k, v in sorted(by.items())))
     # the read is recorded for the two-read rule even on a dry run (a read is a read)
     if not low or a.force:
         with open(sp + ".tmp", "w", encoding="utf-8") as fh:
-            json.dump({"at": res["at"], "off_candidates": plan["candidates"], "applied": bool(a.apply)}, fh, indent=1)
+            json.dump({"at": res["at"], "off_candidates": plan["candidates"],
+                       "trim_candidates": plan["trim_candidates"], "applied": bool(a.apply)}, fh, indent=1)
         os.replace(sp + ".tmp", sp)
     if not a.apply:
         print("dry run: nothing written (--apply writes the multiples file and runs the wave: pre-approved on a "
@@ -513,12 +656,13 @@ def cmd_resize(a) -> int:
         if cur.get(t, 1.0) != 0:
             cur[t] = 0
             n_off += 1
+    n_down, n_back = apply_trims(a.name, res, plan, cur, bool(a.trim))
     os.makedirs(os.path.dirname(mp), exist_ok=True)
     with open(mp + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(cur, fh, indent=0, sort_keys=True)
     os.replace(mp + ".tmp", mp)
-    print(f"WROTE {mp}: {n_up} up, {n_off} off ({sum(1 for v in cur.values() if v > 0)} sized, "
-          f"{sum(1 for v in cur.values() if v == 0)} off in the file)")
+    print(f"WROTE {mp}: {n_up} up, {n_off} off, {n_down} trimmed, {n_back} trim(s) given back "
+          f"({sum(1 for v in cur.values() if v > 0)} sized, {sum(1 for v in cur.values() if v == 0)} off in the file)")
     if getattr(a, "no_run", False):
         # pass_resize: the 15-min pass holds this wave's lock and tunes it next, so no setarg
         # (it would wait on that lock) and no second run
@@ -591,7 +735,9 @@ def pass_resize(name: str, w: dict, now: "datetime | None" = None) -> int:
     only when the previous read, 5-90 min earlier (the last pass), judged it the same way.
     Skips -- and changes nothing -- unless the wave's tune has --size-mult-file and a fresh
     --fair-file (the floor protocol needs a live fair); cmd_resize itself skips within 15
-    min of a bot restart and on a stale dashboard read. Never above 5x; an off stays off."""
+    min of a bot restart and on a stale dashboard read. Never above 5x; an off stays off.
+    With the wave's floor "trim" on, a market over its target comes down to it (TRIM in the
+    module docstring); with it off, the trims it made are given back."""
     now = now or datetime.now(timezone.utc)
     tune = w.get("tune") or []
     if not pw._vals(tune, "--size-mult-file"):
@@ -605,7 +751,7 @@ def pass_resize(name: str, w: dict, now: "datetime | None" = None) -> int:
     a = argparse.Namespace(name=name, aim=float(fl.get("aim", 1.20)),
                            max_mult=min(FLOOR_MAX_MULT, float(fl.get("max_mult", FLOOR_MAX_MULT))),
                            real=0.65, window_min=60.0, keep_within=0.05, no_off=False, json=None,
-                           apply=True, force=False, no_run=True)
+                           apply=True, force=False, no_run=True, trim=bool(fl.get("trim")))
     return cmd_resize(a)
 
 

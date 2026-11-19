@@ -23,6 +23,7 @@ dashboard leave registry series alone. Adding a wave never edits the task.
     python pvd_waves.py darkcheck [--min-age 20] [--act] [--update-state] [--json OUT]
     python pvd_waves.py pace NAME [--aim 1.20] [--json OUT]          # under-$1 breakdown (read-only)
     python pvd_waves.py resize NAME [--aim 1.20 --max-mult 5] [--apply]   # size to the $1 floor (Jack's word)
+    python pvd_waves.py set NAME floor_trim on|off   # the floor check also trims a market over its target (11/18)
     python pvd_waves.py whydark [NAME|all] [--json OUT]              # why each side isn't resting (read-only)
 
 PASS LOCK (2026-11-14): `run --write` holds run-logs/pvd-scan/wave_pass_NAME.lock from
@@ -1197,6 +1198,17 @@ def _set(a) -> int:
         w.setdefault("floor", {})["max_mult"] = x
         save(reg)
         print(f"{a.name}: floor max_mult = {x:g}")
+        return 0
+    elif a.key == "floor_trim":
+        # TRIM (Jack 2026-11-18 on the FX relight: "dont overquote if unneeded to hit the target
+        # threshold"): the $1-floor check also brings a market over its target down to the
+        # size that target needs (pvd_wave_pace TRIM); off gives its trims back at the next pass
+        on = v.lower() in ("1", "true", "yes", "on")
+        if on and not w.get("floor_auto"):
+            raise SystemExit("floor_trim runs in the floor check: `set NAME floor_auto on` first")
+        w.setdefault("floor", {})["trim"] = on
+        save(reg)
+        print(f"{a.name}: floor trim = {'on' if on else 'off (the next pass gives its trims back)'}")
         return 0
     elif a.key == "scan_max_mult":
         # SIZE-UP TO THE BAR (Jack 2026-11-18, "1.5-3x the size"): the scan judges a market

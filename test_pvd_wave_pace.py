@@ -405,6 +405,148 @@ class Plan(unittest.TestCase):
             self.assertEqual(p["off_next"], ["KXA-6"])
 
 
+J18 = {"pool": 17.57, "uptime": 1.0}
+
+
+class Trim(unittest.TestCase):
+    """TRIM (Jack 2026-11-18 on the FX relight: "dont overquote if unneeded to hit the target
+    threshold"): a market over its target comes down to the size that target needs."""
+
+    def test_the_cut_is_the_smallest_step_still_at_the_target(self):
+        j = dict(J18, share=0.06)
+        x = pp.trim_mult(j, 0.2, 74.0, 1.0, 1.20)
+        self.assertEqual(x, 0.4)                              # needs ~0.385: rounds UP to the grid
+        self.assertGreaterEqual(pp.share_at(x, 0.06), pp.TRIM_MIN_SHARE)
+        self.assertGreaterEqual(pp.proj_at(x, j, 0.2, 74.0, 1.0), pp.TRIM_TO * 1.20)
+        self.assertLess(pp.proj_at(x - pp.TRIM_GRID, j, 0.2, 74.0, 1.0), pp.TRIM_TO * 1.20)
+
+    def test_the_whole_share_loss_counts(self):
+        # others standing still: 6% at 1x -> 2.49% at 0.4x (not 2.4%: our size is part of the level)
+        self.assertAlmostEqual(pp.share_at(0.4, 0.06), 0.024 / 0.964)
+
+    def test_one_step_leaves_a_quarter_and_never_goes_under_the_floor(self):
+        self.assertEqual(pp.trim_mult(dict(J18, share=0.18), 0.3, 74.0, 4.0, 1.20), 1.0)   # needs ~0.42
+        self.assertEqual(pp.trim_mult(dict(J18, share=0.5), 0.0, 74.0, 0.5, 1.20), 0.2)
+        self.assertIsNone(pp.trim_mult(dict(J18, share=0.5), 0.0, 74.0, 0.2, 1.20))       # at the floor
+
+    def test_none_inside_the_trigger_under_the_target_or_with_no_share(self):
+        self.assertIsNone(pp.trim_mult(dict(J18, share=0.025), 0.2, 74.0, 1.0, 1.20))     # needs ~0.96 of it
+        self.assertIsNone(pp.trim_mult(dict(J18, share=0.012), 0.2, 74.0, 1.0, 1.20))     # under the target
+        self.assertIsNone(pp.trim_mult(dict(J18, share=0.0), 2.0, 74.0, 1.0, 1.20))
+
+    def test_banked_money_lowers_the_need_to_the_share_floor(self):
+        j = dict(J18, share=0.06)
+        self.assertEqual(pp.trim_mult(j, 0.0, 74.0, 1.0, 1.20), 0.45)      # $1.50 still to earn
+        x = pp.trim_mult(j, 1.6, 10.0, 1.0, 1.20)                          # $1.60 banked
+        self.assertEqual(x, 0.4)                                           # Jack's 2% share (+ cushion) binds
+        self.assertGreaterEqual(pp.share_at(x, 0.06), pp.TRIM_MIN_SHARE)
+
+
+def _mt(t, xt, m0, stop="2026-11-22T05:00:00Z", proj=3.0, **kw):
+    m = _m(t, proj, m0=m0, **kw)
+    m.update(x_trim=xt, stop=stop, period_start="2026-11-18T19:01:00Z")
+    return m
+
+
+class TrimPlan(unittest.TestCase):
+    A = argparse.Namespace(aim=1.20, max_mult=5.0, keep_within=0.05, no_off=False, trim=True)
+
+    def _prev(self, cands):
+        return {"at": (NOW - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"), "trim_candidates": cands}
+
+    def test_two_reads_at_the_same_multiple(self):
+        p = pp.plan_resize({"markets": [_mt("KXA-1", 0.4, 1.0)]}, self._prev({"KXA-1": 1.0}), self.A, NOW)
+        self.assertEqual((p["down"], p["down_next"], p["trim_candidates"]), ({"KXA-1": 0.4}, [], {"KXA-1": 1.0}))
+        for prev in (self._prev({"KXA-1": 2.0}), {}):        # the multiple moved since / a first read
+            p = pp.plan_resize({"markets": [_mt("KXA-1", 0.4, 1.0)]}, prev, self.A, NOW)
+            self.assertEqual((p["down"], p["down_next"]), ({}, ["KXA-1"]))
+
+    def test_off_by_default_and_nothing_under_the_aim_trims(self):
+        a = argparse.Namespace(aim=1.20, max_mult=5.0, keep_within=0.05, no_off=False)
+        p = pp.plan_resize({"markets": [_mt("KXA-1", 0.4, 1.0)]}, self._prev({"KXA-1": 1.0}), a, NOW)
+        self.assertEqual((p["down"], p["down_next"], p["keep"]), ({}, [], 1))
+        p = pp.plan_resize({"markets": [_mt("KXA-1", 0.4, 1.0, proj=1.1, x_aim=1.25)]}, self._prev({"KXA-1": 1.0}),
+                           self.A, NOW)
+        self.assertEqual((p["down"], p["up"]), ({}, {"KXA-1": 1.25}))
+
+
+class TrimApply(unittest.TestCase):
+    S, S2, P = "2026-11-22T05:00:00Z", "2026-11-29T05:00:00Z", "2026-11-18T19:01:00Z"
+
+    def setUp(self):
+        self.mult = os.path.join(TMP, "size_mult_tr.json")
+        self.state = os.path.join(TMP, "resize_state_tr.json")
+        self.trims = os.path.join(TMP, "trim_tr.json")
+        for p in (self.mult, self.state, self.trims):
+            if os.path.exists(p):
+                os.remove(p)
+        self.saved = (pp.measure, pp.print_pace, pp.size_mult_path, pp.resize_state_path, pp.trim_state_path,
+                      pp.subprocess.run)
+        pp.print_pace = lambda r: None
+        pp.size_mult_path = lambda n: self.mult
+        pp.resize_state_path = lambda n: self.state
+        pp.trim_state_path = lambda n: self.trims
+        pp.subprocess.run = lambda *a, **k: None
+
+    def tearDown(self):
+        (pp.measure, pp.print_pace, pp.size_mult_path, pp.resize_state_path, pp.trim_state_path,
+         pp.subprocess.run) = self.saved
+
+    def _write(self, path, d):
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(d, fh)
+
+    def _rec(self, frm, to, stop=None):
+        return {"from": frm, "to": to, "at": "x", "stop": stop or self.S, "period_start": self.P}
+
+    def _run(self, markets, trim=True, prev_trim=None):
+        now = datetime.now(timezone.utc)
+        if prev_trim is not None:
+            self._write(self.state, {"at": (now - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                     "off_candidates": [], "trim_candidates": prev_trim})
+        res = {"at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "since_restart_min": 200.0, "dash_age_min": 2.0,
+               "markets": markets}
+        pp.measure = lambda name, a, now=None: res
+        a = argparse.Namespace(name="tr", aim=1.20, max_mult=5.0, real=0.65, window_min=60.0, keep_within=0.05,
+                               no_off=False, json=None, apply=True, force=False, no_run=True, trim=trim)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pp.cmd_resize(a), 0)
+        with open(self.mult, encoding="utf-8") as fh:
+            mult = json.load(fh)
+        rec = {}
+        if os.path.exists(self.trims):
+            with open(self.trims, encoding="utf-8") as fh:
+                rec = json.load(fh)
+        return mult, rec
+
+    def test_a_second_read_trims_and_keeps_the_earlier_multiple(self):
+        self._write(self.mult, {"KXA-1": 2.0})
+        mult, rec = self._run([_mt("KXA-1", 0.5, 2.0), _mt("KXA-2", 0.4, 1.0)], prev_trim={"KXA-1": 2.0})
+        self.assertEqual(mult, {"KXA-1": 0.5})                # KXA-2 on its first read: unchanged
+        self.assertEqual((rec["KXA-1"]["from"], rec["KXA-1"]["to"], rec["KXA-1"]["stop"]), (2.0, 0.5, self.S))
+        # a further step keeps the first "from"
+        mult, rec = self._run([_mt("KXA-1", 0.25, 0.5)], prev_trim={"KXA-1": 0.5})
+        self.assertEqual((mult["KXA-1"], rec["KXA-1"]["from"]), (0.25, 2.0))
+
+    def test_turning_it_off_gives_the_trims_back(self):
+        self._write(self.mult, {"KXA-1": 0.5})
+        self._write(self.trims, {"KXA-1": self._rec(2.0, 0.5)})
+        mult, rec = self._run([_mt("KXA-1", 0.4, 0.5)], trim=False, prev_trim={"KXA-1": 0.5})
+        self.assertEqual((mult, rec), ({"KXA-1": 2.0}, {}))
+
+    def test_a_relight_or_a_market_off_the_list_gets_it_back(self):
+        self._write(self.mult, {"KXA-1": 0.5, "KXA-2": 0.4})
+        self._write(self.trims, {"KXA-1": self._rec(2.0, 0.5), "KXA-2": self._rec(1.0, 0.4)})
+        mult, rec = self._run([_mt("KXA-1", None, 0.5, stop=self.S2)])    # a new period; KXA-2 not listed
+        self.assertEqual((mult, rec), ({"KXA-1": 2.0, "KXA-2": 1.0}, {}))
+
+    def test_a_size_up_past_it_drops_the_record_and_an_off_stays_off(self):
+        self._write(self.mult, {"KXA-1": 0.5, "KXA-2": 0})
+        self._write(self.trims, {"KXA-1": self._rec(1.0, 0.5), "KXA-2": self._rec(2.0, 0.5)})
+        mult, rec = self._run([_mt("KXA-1", None, 0.5, proj=0.9, x_aim=1.25), _mt("KXA-2", None, 0, status="off")])
+        self.assertEqual((mult, rec), ({"KXA-1": 1.25, "KXA-2": 0}, {}))
+
+
 class WhyDark(unittest.TestCase):
     def _ctx(self, **kw):
         c = {"pos": {}, "holds": {}, "sel": {}, "guards": {}, "log": {}, "books": {}, "cycle": {}, "wave_off": None}
@@ -484,7 +626,25 @@ class FloorPass(unittest.TestCase):
             pp.pass_resize("wt", self.w, now=NOW)
         a = self.calls[0]
         self.assertEqual((a.name, a.apply, a.no_run, a.force, a.no_off), ("wt", True, True, False, False))
-        self.assertEqual((a.aim, a.max_mult), (1.20, 5.0))
+        self.assertEqual((a.aim, a.max_mult, a.trim), (1.20, 5.0, False))      # no trim unless the wave turns it on
+        self.w["floor"] = {"trim": True}
+        with redirect_stdout(io.StringIO()):
+            pp.pass_resize("wt", self.w, now=NOW)
+        self.assertTrue(self.calls[1].trim)
+
+    def test_floor_trim_needs_the_floor_check(self):
+        _save_reg({"wt": _wave()})
+        with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()):
+            pw._set(argparse.Namespace(name="wt", key="floor_trim", value="on"))
+        with redirect_stdout(io.StringIO()):
+            pw._set(argparse.Namespace(name="wt", key="floor_auto", value="on"))
+            pw._set(argparse.Namespace(name="wt", key="floor_trim", value="on"))
+        self.assertEqual(pw.load()["waves"]["wt"]["floor"], {"trim": True})
+        self.assertTrue(pp.wave_trim_on("wt"))
+        with redirect_stdout(io.StringIO()):
+            pw._set(argparse.Namespace(name="wt", key="floor_trim", value="off"))
+        self.assertFalse(pp.wave_trim_on("wt"))
+        self.assertFalse(pp.wave_trim_on("no-such-wave"))
 
     def test_skips_without_a_live_fair_or_a_multiples_file(self):
         self._fair(NOW - timedelta(minutes=1))
