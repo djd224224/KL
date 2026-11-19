@@ -56,7 +56,7 @@ Lookup tables for the market-wave runbook (`SKILL.md` beside this file). Read th
 |---|---|
 | `IMM_JOIN_WAIT`, `_SUBPENNY`, `_REST_MEMORY_H` | on, on, 24 |
 | `IMM_PVD_OFF_USUAL`, `_C`, `_HOURS`, `_COLD` | on, 3, 6, base (`IMM_CRYPTO_WAVE_COLD_SIZE` 400 for crypto strikes) |
-| `IMM_FAR_FROM_FAIR_C` | 20 (8281473: a wave side this far on the safe side of its live FX / crypto event fair skips the join wait and the off-usual cut; 0 = off) |
+| `IMM_FAR_FROM_FAIR_C` | 10 (8281473 built it at 20; 10 since 32bd17c, Jack 11/18: "Yes, 10c"). A wave side this far on the safe side of its live FX / crypto event fair skips the join wait and the off-usual cut; 20 = the old threshold, 0 = off |
 | `IMM_FX_EVENT_EDGE_C` (read by `fx_event_fair.py`) | 0 (13ffefe: bid <= floor(fair), ask >= ceil(fair); `off` = the 11/14 2c + vol-error + requote margin) |
 | `IMM_PVD_CLOSE_CLAMP`, `_C` | on, 5 (breakeven or better also rests) |
 | `IMM_UNWIND_WAVES_HELD`, `IMM_UNWIND_WAVES_EXEMPT_NEW` | on, on |

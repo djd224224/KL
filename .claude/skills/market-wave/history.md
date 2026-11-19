@@ -189,6 +189,7 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
 - **Jack: "0c edge is ok" -> 13ffefe** (live 00:21Z, `=off` restores the old margin). T176000's limits went 89/100 -> 94/97 at 1c, then 95/96 at 0c.
 - **00:41Z ("check again that all 336 are above 2% share"):** 313 at 2%+ (median 4.2%). The 23 under: 2 off, 2 one-sided UK GDP, and 19 with a side within 20c of its fair (off-usual still applies) or past the 15c tier.
   - Offered: `IMM_FAR_FROM_FAIR_C` 10c or a 20c tier.
+- **Jack: "Yes, 10c" -> 32bd17c** (live 01:58:23Z, 4,440 orders handed over; 2,184 tests OK): `IMM_FAR_FROM_FAIR_C` 20 -> 10. A fill on an exempt side still sells 10c+ over, or buys 10c+ under, the fair. It covers the crypto event strikes too.
 
 ## Open questions closed since 11/08
 
@@ -197,7 +198,7 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
   - "1.5-3x the size": `scan_max_mult 2`.
   - Cheap tiers to 15c ("yes, extend to 10c", "Yes, extend to 15c").
   - Near-fair quoting: "No, stay at walls".
-  - Far-from-fair guard exemption: "Yes, build it".
+  - Far-from-fair guard exemption: "Yes, build it". Its threshold 20c -> 10c: "Yes, 10c" (32bd17c).
   - FX margin 0c ("also 1c of edge is enough", then "0c edge is ok"). This supersedes the 11/15 "Yes, keep it" on the vol cushion.
 
 - 11/14: the $1-floor protocol runs on its own, in manual mode, on type B waves with a live fair ("Yes, pre-approve"); `floor_auto` on w1113-fxmetals ("Yes, every 15 min"), on w1114-cryptoev since 11/15 (offs only).
