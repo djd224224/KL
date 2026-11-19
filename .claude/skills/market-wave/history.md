@@ -207,6 +207,7 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
   - From 12:05Z it walked 38 -> 32 -> 28 -> 26c (12:08Z) and stopped at the live fair: spot 159.93 vs the 161.50 strike, 25.2c, so with the 0c edge it never sells under 26c. It went to 25c at 12:21Z as the fair slipped.
   - Jack asked "why is this unwinding at 74c": Kalshi shows our 26c YES ask as a NO bid at 74c.
   - At 25.2c the position is +$68; at the book's 12c, -$41.
+  - Jack: "ok to unwind at worse than breakeven" -> ebf88f7, `UNWIND_AT_MARKET.json` naming T16150 (live 13:06Z restart). Its ask went 25c -> 17c at 13:08Z, joining the best 20+ lot ask; the book was back to 5x16-17 by then, so that was our cost.
 
 ## Open questions closed since 11/08
 
