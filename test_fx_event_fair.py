@@ -61,21 +61,24 @@ class Calendar(unittest.TestCase):
         self.assertAlmostEqual(fx.trading_days(U(2026, 11, 19, 15), t0, weekday_from=wed), 1.4)
         self.assertAlmostEqual(fx.trading_days(U(2026, 11, 23, 15), t0, weekday_from=wed), 3.0 * 1.4 + 0.5)
 
-    def test_one_cent_of_edge_is_enough(self):
-        # Jack 2026-11-18: "also 1c of edge is enough" -- the margin is EDGE_C alone (the default),
-        # weekday or weekend, near the money or in the tails
-        self.assertEqual(fx.EDGE_C, 1.0)
+    def test_the_edge(self):
+        # Jack 2026-11-18: "also 1c of edge is enough", then "0c edge is ok" -- the margin is
+        # EDGE_C alone (0c by default), weekday or weekend, near the money or in the tails
+        self.assertEqual(fx.EDGE_C, 0.0)
         p, m, b, a = fx.strike_fair("KXGOLDEVENT", 100.0, 100.0, 2.0, True)
-        self.assertEqual((m, b, a), (1.0, 49, 51))
-        # KXUSDMXNEVENT-16DEC261015-T176000 on 11/18: a ~95.5c fair; its 97c ask wall now passes
+        self.assertEqual((m, b, a), (0.0, 50, 50))                  # at the fair, both sides
+        # KXUSDMXNEVENT-16DEC261015-T176000 on 11/18: a ~95.4c fair -- bids to 95c, asks from 96c
         p, m, b, a = fx.strike_fair("KXUSDMXNEVENT", 18.85, 17.60, 28.0, True)
         self.assertAlmostEqual(100 * p, 95.5, delta=1.5)
-        self.assertEqual((m, a), (1.0, int(math.ceil(100 * p + 1.0 - 1e-9))))
-        self.assertLessEqual(a, 97)
-        # a deep tail (fair ~0): no bid, an ask from 1c -- 1c of edge (the 11/14 margin read 0 / 2)
-        self.assertEqual(fx.strike_fair("KXGOLDEVENT", 100.0, 140.0, 2.0, True)[2:], (0, 1))
+        self.assertEqual((b, a), (int(math.floor(100 * p)), int(math.ceil(100 * p))))
+        with mock.patch.object(fx, "EDGE_C", 1.0):                   # "1c of edge" (the 23:27Z deploy)
+            self.assertEqual(fx.strike_fair("KXGOLDEVENT", 100.0, 100.0, 2.0, True)[1:], (1.0, 49, 51))
+        # a deep tail (fair ~0): no bid, an ask from the bottom
+        b, a = fx.strike_fair("KXGOLDEVENT", 100.0, 140.0, 2.0, True)[2:]
+        self.assertEqual(b, 0)
+        self.assertLessEqual(a, 1)
 
-    @mock.patch.object(fx, "EDGE_C", 0.0)          # IMM_FX_EVENT_EDGE_C=0: the margin as built 11/14
+    @mock.patch.object(fx, "EDGE_C", None)         # IMM_FX_EVENT_EDGE_C=off: the margin as built 11/14
     def test_the_margin(self):
         # at the money: the 2c base (every series, copper too since 11/14), + on a weekday the requote term
         p, m, b, a = fx.strike_fair("KXGOLDEVENT", 100.0, 100.0, 2.0, False)
@@ -142,7 +145,7 @@ class Watch(unittest.TestCase):
         self.assertIn("p", snap["markets"]["KXGOLDEVENT-18NOV262000-T388000"])   # no cutoff on a weekend
         self.assertIn("not an 'above' strike", snap["markets"]["KXGOLDEVENT-23NOV261500-B388000"]["err"])
 
-    @mock.patch.object(fx, "EDGE_C", 0.0)          # the requote term is the 11/14 margin's
+    @mock.patch.object(fx, "EDGE_C", None)         # the requote term is the 11/14 margin's
     def test_a_weekday_read_cuts_near_measurement_and_widens(self):
         now = U(2026, 11, 18, 15)                                 # Wed 10 AM ET
         snap = self.watch().refresh(now.timestamp())
