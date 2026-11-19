@@ -450,7 +450,7 @@ python pvd_waves.py run --only <NAME> --write                      # apply now (
 | One side dark, book moved off an old trade | last vs touch | `follow_book` (preset default) |
 | Asks / bids behind the book on a wave with a fair | `whydark` "past its limit (re-anchor)" | Fair limits replace the 5c walk (crypto 28837b4) |
 | Pacing under $1 | `pace NAME` | Section 11 |
-| Under-$1 count jumps on a type B wave | the touch vs the cheap tiers (did the walls step up?) | The wall race, section 12: extend the tier (Jack's word; each step drew the next one on 11/18) |
+| Under-$1 count jumps on a type B wave | the touch vs the cheap tiers (did the walls step up?) | The wall race, section 12. With `floor_tier` on (FX: to 25c), the floor check reaches past the tier for the markets that need it. Extending the wave's tier itself is Jack's word, and each step drew the next one on 11/18 |
 | One-sided / dark on a fair-gated wave | `whydark` + the bot log's `earn-only` / `join wait` / `off-usual size` lines | "Fair clamp": leave it if the missing side would trade at or through the fair. Guard lines on sides 10c+ from the fair: the far-from-fair exemption (8281473; 10c since 32bd17c) covers them |
 | Markets go off right after a tier / size change | the pass order: scan -> resize -> tune | Lift their 0s after that pass (section 11, "the pass order") |
 | Total rate dropped | restart / re-size times; others' size at our levels | Restarts and re-sizes read low ~15-25 min; competition: re-read, size by measured share |
@@ -468,6 +468,7 @@ python pvd_waves.py set NAME floor_auto on|off                                  
 python pvd_waves.py set NAME floor_max_mult 1                                     # the check only turns markets off (a wave already at 5x)
 python pvd_waves.py set NAME scan_max_mult 2                                      # size-up to the bar at LISTING (Jack's word per wave; needs --size-mult-file)
 python pvd_waves.py set NAME floor_trim on|off                                    # the check also TRIMS a market over its target (OFF: over-cut on FX 11/19)
+python pvd_waves.py set NAME floor_tier 25|off                                    # a market the multiple can't take to the aim gets the last cheap tier out to 25c (ON for FX 11/19)
 ```
 
 **Size-up to the bar at listing (`scan_max_mult`, Jack 2026-11-18 on w1113-fxmetals: "1.5-3x the size"):** the scan judges a market still under the $1.10 bar after the cheap tiers again at the wave's bank size (`--bank-max`, where the tune's bank step rests every market that can't bank at the flat size), then quarter steps up to `scan_max_mult` x that; the first that clears lists it and goes into `size_mult_NAME.json` (never lowering one, never lifting an off). The relight alert says how many listed only sized up, and what the denied ones were judged at. Set on w1113-fxmetals at 2 (11/18): 1,500-3,000 a side at 3-5c, 3,000-6,000 at 1-2c. 1 = off; at most 5.
@@ -484,6 +485,13 @@ What it did on FX on 11/19 (on 02:50Z, 186 cuts at 03:16Z, off at 03:26Z, all gi
 - **Even where it held, the excess size was good money.** The 112 that stayed at 2%+ gave up $59/day to free $35k: ~0.17%/day, ~60% a year, on that collateral.
 
 Don't re-offer it on FX. Elsewhere, offer it only when collateral is binding, and rebuild it first as step-and-measure: at most a halving a step, and a strike that falls under 2% gets its size back at once. The crypto wave keeps 1,500 a side (Jack 11/15), and the default `--no-drop` stands everywhere.
+
+**The cheap tier past its edge, only where needed: the tier reach (`floor_tier`, 5e2f061).** Jack 2026-11-19, with the FX walls at 16-25c, past the 15c tier: "Up to 25c on cheap tier multiplier if needed". A blanket 25c tier would have put ~$415k more on the books (5x the 463 sides at 16-25c), while 305 of 305 judged strikes already projected $1+. So it goes a market at a time:
+- The multiple goes first: a quarter step raises the cheap side too, and that is the cheaper share. A market gets the reach only when its multiple can't take it to the aim: at the 5x cap still short of $1.20, or under $1 even at the cap. The reach comes INSTEAD of an off.
+- The reach = the last cheap tier's multiple (FX: x5) on a side costing past that tier, up to the reach (25c a contract; the code refuses more). One per market a period. A market still under $1 at the cap with it goes off on two reads, as before, and stays off.
+- A market the check turned off, with a side now inside the reach, comes back at 1x with it. The next reads size it like any other.
+- Files: `tier_NAME.json` (the tune's `--tier-file`). A relight or leaving the list drops a market's reach; `set NAME floor_tier off` drops them all at the next tune. Preflight WARNs while it is on.
+- First use (FX, on at 12:24Z 11/19). The 12:22Z read-only plan gave no judged strike the reach: all 311 cleared the aim. It brought back 15 USD/MXN strikes, off since 03:46-04:31Z, at 1x with x5 on their bid. They are deep in the money (fair 87-99.99c), so the fair keeps their asks out, and their bids sat at 20-25c walls. The other 7 offs stay off: walls past 25c, or at the money.
 
 **Walls move: the cheap tier's edge is a cliff.** A side past the wave's last cheap tier falls back to the base size. When other makers step their walls over that edge, a whole batch drops under $1 at once. The 11/18 relight's sequence, and what was done each time, is section 12's **wall race**.
 
@@ -558,6 +566,7 @@ Kalshi's "after economic events" series: will gold / silver / copper, USD/JPY, E
 | ~22:40 | 10-13c / 87-89c | rate $260 -> $155/day; 75 under $1 on the 15-min mean | Jack "Yes, extend to 15c" (told each extension had drawn the next step) |
 | ~23:10 | 12-15c / 84-91c | 99 one-sided, 43 dark: the one-sided loop below | Jack "Yes, build it": the far-from-fair exemption (8281473) |
 | 11/19 02:53-03:15 | 16-17c / 83-84c | 324 of 336 with a side past the 15c tier; tier sides fell ~7,000 -> ~1,400 a side at the 03:01Z / 03:16Z tunes; 239 at 2%+ (median 2.7%) at 03:33-03:37Z | No tier change (Jack 11/18: "dont overquote if unneeded to hit the target threshold"): the floor check sizes the strikes under $1.20 up, to that aim |
+| 11/19 by 12:00 | 16-25c / 75-84c (463 sides at 16-25c, 35 past 25c; every strike has a side past 15c) | 305 of 305 judged project $1+ on the floor check's raises ($265/day, 1.05M contracts); 66 under 2% on the 15-min mean; 22 off, 15 of them MXN deep in the money (asks fair-clamped, bids at 20-25c) | Jack "Up to 25c on cheap tier multiplier if needed": the per-market tier reach (5e2f061, `floor_tier 25`; section 11), not a blanket 25c tier (~$415k more on the books) |
 
 - **The one-sided loop on a step-up:** the join wait (2 s per $ at risk past $50: 100-270 s here) holds our side at the old price behind the new wall. Earn-only pulls it, because 1,000+ contracts sit in front, past the walk. When it rejoins, the off-usual cut holds it at base, because the price is 3c+ past its 6 h usual. 23:05-23:19Z: 465 of the 499 sides those guards held sat 20c+ from their live fair, where no bait can hurt.
 - **Far-from-fair exemption (8281473):** a wave side `IMM_FAR_FROM_FAIR_C` (10c since 32bd17c, Jack 11/18: "Yes, 10c"; built at 20c) or more on the safe side of its LIVE FX / crypto event fair -- a bid that far under, an ask that far over -- skips the join wait and the off-usual cut. Every other guard stands: the lone-ref and alone-front guards, the bait-fingerprint stop, every breaker, the fair hold pull, the close clamp, the twin check, earn-only. Jack: "Make sure bait guards are up" -- after a deploy, list them from the startup lines. `=0` turns it off.

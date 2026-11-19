@@ -198,6 +198,15 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
   - Share fell ~10x for a 4x cut on the 50-70k wall books (the model expected ~4x). 74 strikes fell under 2% and 21 projected under $1.
   - The 03:31Z pass gave 169 trims back; the other 17 had already been sized up past their old size.
   - Jack, shown that the 112 that held gave up $59/day to free $35k (~60%/yr on it): "Leave it off".
+- **11/19 ~12:00Z, the walls at 16-25c / 75-84c:** 463 sides at 16-25c, 35 past 25c, and every strike had a side past the 15c tier. The floor check had held the wave anyway: 305 of 305 judged projected $1+, $265/day, 1.05M contracts resting. 66 were under 2% on the 15-min mean, and 22 were off.
+  - Jack: "Up to 25c on cheap tier multiplier if needed" -> 5e2f061, the per-market tier reach (`floor_tier 25`, on at 12:24Z). A blanket 25c tier would have put ~$415k more on the books.
+  - The reach goes only where the multiple can't reach the aim. A market the check turned off whose side now sits inside the reach comes back at 1x with it.
+  - The 22 offs: 15 USD/MXN strikes deep in the money, off since 03:46-04:31Z. Their asks were fair-clamped (fair 87-99.99c, ask_min 88-100) and their bids sat at 20-25c walls past the tier. The other 7: 3 UK GDP 12/11 strikes at the money, 3 MXN strikes with walls past 25c, and GBP 12/08 T13475 (its wide side costs 85c).
+- **11/19 11:53Z, USD/JPY 11/25 T16150:** our 825 bid at 17c filled 5 min after it joined the 16-17c wall. The book went to 2x12, and the pick-off watch flagged -$41 at the 12c outside ask and stood it down at 200.
+  - The unwind-only switch rests one closing ask for the whole 825. Nothing rested 11:53:25-12:05Z: the sweep breaker's 10-min pull (the join wait's "rests 74c" log line is a computed hold, not an order; orders_2026-11-19.jsonl has none).
+  - From 12:05Z it walked 38 -> 32 -> 28 -> 26c (12:08Z) and stopped at the live fair: spot 159.93 vs the 161.50 strike, 25.2c, so with the 0c edge it never sells under 26c. It went to 25c at 12:21Z as the fair slipped.
+  - Jack asked "why is this unwinding at 74c": Kalshi shows our 26c YES ask as a NO bid at 74c.
+  - At 25.2c the position is +$68; at the book's 12c, -$41.
 
 ## Open questions closed since 11/08
 
@@ -208,6 +217,7 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
   - Near-fair quoting: "No, stay at walls".
   - Far-from-fair guard exemption: "Yes, build it". Its threshold 20c -> 10c: "Yes, 10c" (32bd17c).
   - The floor trim (ae46e39): "Leave it off" (11/19), after it over-cut and cost $90/day.
+  - The cheap tier past 15c: "Up to 25c on cheap tier multiplier if needed" (11/19). Done as the per-market reach (`floor_tier 25`, 5e2f061), not a blanket tier.
   - FX margin 0c ("also 1c of edge is enough", then "0c edge is ok"). This supersedes the 11/15 "Yes, keep it" on the vol cushion.
 
 - 11/14: the $1-floor protocol runs on its own, in manual mode, on type B waves with a live fair ("Yes, pre-approve"); `floor_auto` on w1113-fxmetals ("Yes, every 15 min"), on w1114-cryptoev since 11/15 (offs only).
