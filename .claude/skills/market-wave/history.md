@@ -208,6 +208,11 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
   - Jack asked "why is this unwinding at 74c": Kalshi shows our 26c YES ask as a NO bid at 74c.
   - At 25.2c the position is +$68; at the book's 12c, -$41.
   - Jack: "ok to unwind at worse than breakeven" -> ebf88f7, `UNWIND_AT_MARKET.json` naming T16150 (live 13:06Z restart). Its ask went 25c -> 17c at 13:08Z, joining the best 20+ lot ask; the book was back to 5x16-17 by then, so that was our cost.
+- **11/19 ~17:25Z, Jack: ":8782 the P&L looks broken"** -> d6b19ea (all nine dashboards restarted 17:41-17:45Z). Three faults:
+  - The Latest relight row read $0.02: at 17:01Z 439 new strikes (January FX events) listed on a period of their own, and the row took only the newest period, dropping the 336 still running since the 11/18 relight ($239 banked, T16150). It now covers every running period: 780 markets, $243 banked, net $136.
+  - Two settled markets sat "open" at their last trade with realized $0.00: T15600 (180 sold at 93c, settled YES 11/16) -$10.80 vs -$12.60 paid; T13550 (10 at 2c, settled NO 11/17) $0.00 vs -$0.20. Both were still in cash held.
+  - The chart's +$249 spike at 11:53Z: that read caught T16150 just before its first trade and marked our 825 at 48.5c, the mid of a 17 x 80 book (+$259.87).
+  - Whole wave after the fix: -$120.05 = -$12.80 realized + -$107.25 open. T16150 stays at its 4c last trade (Kalshi's valuation) on a 7 x 15 book: at the bot's 11c mark it would be -$49.50. The :8782 history was restated to match (891 rows; backup `history.json.bak-20261119-pl`). :8774 also booked 2 settled markets (KXGOPFAVSEN AL13 -$8.00, KXTHUNEELECT +$16.66).
 
 ## Open questions closed since 11/08
 
