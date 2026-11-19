@@ -190,6 +190,8 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
 - **00:41Z ("check again that all 336 are above 2% share"):** 313 at 2%+ (median 4.2%). The 23 under: 2 off, 2 one-sided UK GDP, and 19 with a side within 20c of its fair (off-usual still applies) or past the 15c tier.
   - Offered: `IMM_FAR_FROM_FAIR_C` 10c or a 20c tier.
 - **Jack: "Yes, 10c" -> 32bd17c** (live 01:58:23Z, 4,440 orders handed over; 2,184 tests OK): `IMM_FAR_FROM_FAIR_C` 20 -> 10. A fill on an exempt side still sells 10c+ over, or buys 10c+ under, the fair. It covers the crypto event strikes too.
+  - Before it went live, the 00:41Z "19 under" had mostly released on their own: 328 at 2%+ over 01:41-01:56Z. After it, 333 over 02:04-02:18Z (median 4.2%). Only 2 of the 73 sides 10-20c from their fair got bigger, and the 3 under were the UK GDP 12/11 strikes turned off. So the 10c guards the next step-up.
+  - 2d23c19 (another session, 02:18Z restart) put KXINXEVENT on the FX event gate, so the exemption covers listed S&P 500 strikes too.
 
 ## Open questions closed since 11/08
 
