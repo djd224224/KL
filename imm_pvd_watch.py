@@ -15,9 +15,11 @@ nobody) x the market's pool $/day, integrated poll to poll from the go-live
 (GO_LIVE; the stretch before the first read at the first read's rate).
 Kalshi has paid ~1.15x the bot's estimate; the page shows the raw estimate.
 TRADING P&L: the bot's fills since GO_LIVE from its fills sink
-(fills_*.jsonl), FIFO per market: realized on matched contracts, open on the
-rest marked at the LAST TRADE (a dead book's mid -- 1c x 99c -> 50c -- is
-no mark), falling back to the mid.
+(fills_*.jsonl), FIFO per market: realized on matched contracts and on what
+a DECIDED market paid (settle_cents: its result, the bot's settlement rule),
+open on the rest marked at the LAST TRADE, as Kalshi values the account (a
+dead book's mid -- 1c x 99c -> 50c -- is no mark); with no last trade in the
+read, the bot's own P&L mark rule on the touch (mark_fn), never a wide mid.
 
     python imm_pvd_watch.py [--port 8771]
 
@@ -172,8 +174,12 @@ def bot_fills(tickers: set, start_ts: float) -> list:
     return sorted(rows, key=lambda r: _f(r.get("ts")))
 
 
-def fifo(fills: list, mark) -> dict:
-    """[(yes_delta, px_cents)] -> realized $, open $ at `mark`, open contracts."""
+def fifo(fills: list, mark, settle=None) -> dict:
+    """[(yes_delta, px_cents)] -> realized $, open $ at `mark`, open contracts.
+    `mark`: the YES mark in cents (None = at cost), or a function (net, avg cents) -> mark
+    (mark_fn), called only while something is open. `settle`: a decided market's payout
+    (settle_cents) -- the open lots close at it as realized ("void": at their own cost),
+    leaving nothing open or held."""
     lots: list = []
     real = 0.0
     for d, px in fills:
@@ -188,10 +194,51 @@ def fifo(fills: list, mark) -> dict:
                 lots.pop(0)
         if abs(q) > 1e-9:
             lots.append([q, px])
+    if settle is not None and lots:
+        if settle != "void":
+            real += sum(l[0] * (settle - l[1]) for l in lots) / 100.0
+        lots = []
     net = sum(l[0] for l in lots)
+    if callable(mark):
+        mark = mark(net, sum(l[0] * l[1] for l in lots) / net) if lots and abs(net) > 1e-9 else None
     opn = sum(l[0] * ((mark if mark is not None else l[1]) - l[1]) for l in lots) / 100.0
     cost = sum(abs(l[0]) * (l[1] if l[0] > 0 else 100 - l[1]) for l in lots) / 100.0
-    return {"real": real, "open": opn, "net": net, "cost": cost, "lots": [(l[0], l[1]) for l in lots]}
+    return {"real": real, "open": opn, "net": net, "cost": cost, "mark": mark,
+            "lots": [(l[0], l[1]) for l in lots]}
+
+
+def settle_cents(m: dict):
+    """What a DECIDED market pays a YES contract, in cents -- 100 / 0 for a yes / no
+    result, a scalar's settlement_value once Kalshi finalizes it, "void" for a void
+    (refunded at cost) -- or None while it isn't decided: the bot's settlement rule
+    (incentive_mm _settle_or_drop). The page marked a decided market at its last trade
+    and called it open: 2026-11-19 the w1113-fxmetals page held
+    KXUSDJPYEVENT-15NOV261950-T15600 (180 YES sold at 93c, settled YES 11/16) at -$10.80
+    open against -$12.60 paid, and KXGBPUSDEVENT-17NOV260930-T13550 (10 bought at 2c,
+    settled NO 11/17) at $0.00 against -$0.20; "realized $0.00" and both in cash held."""
+    result = str(m.get("result") or "").lower()
+    if result in ("yes", "no"):
+        return 100.0 if result == "yes" else 0.0
+    if result in ("scalar", "void") and str(m.get("status") or "").lower() in imm.SETTLED_STATUSES:
+        return "void" if result == "void" else imm.settlement_value_cents(m)
+    return None
+
+
+def mark_fn(m: dict):
+    """How the page values an open position, as a function (net, avg cents) -> YES cents:
+    Kalshi's LAST TRADE, as Kalshi values the account (the IMM dashboard since 11/09, Jack:
+    "if kalshi uses last-traded then conform to last-traded"). With no last trade in the
+    read -- a market that never traded, or one read just before its first -- the bot's own
+    P&L mark rule (imm.halt_mark_cents) on the touch: the mid of a two-sided book under
+    50c wide, else the price the position exits at now (a long at the bid, a short at the
+    ask), else cost. It fell back to the plain mid: 2026-11-19 11:53Z the w1113-fxmetals
+    page read KXUSDJPYEVENT-25NOV261500-T16150 moments before its first trade (our 825 at
+    17c), marked them at 48.5c, the mid of a 17 x 80 book, and showed +$259.87 for a read."""
+    last = _f(m.get("last_price_dollars")) * 100 or None
+    if last is not None:
+        return lambda net, avg: last
+    bid, ask = imm.yes_touch_cents(m)
+    return lambda net, avg: imm.halt_mark_cents(bid, ask, None, net, avg)
 
 
 def read_markets(tickers: list) -> dict:
@@ -326,6 +373,14 @@ def our_sides(r: dict) -> str:
 UNWIND_STATES = ("unwinding", "unwinding, nothing resting")
 
 
+def latest_periods(rows: dict) -> set:
+    """The program periods the LATEST RELIGHT block covers: every one with a market still
+    before its stop (active), or the newest once all have ended. "wave-1104" = no period."""
+    real_p = {r["period"] for r in rows.values() if r["period"] != "wave-1104"}
+    return ({r["period"] for r in rows.values() if r["period"] != "wave-1104" and r["active"]}
+            or ({max(real_p)} if real_p else set()))
+
+
 def unwind_state(r: dict) -> str:
     """A page row's position state: "" (flat), "unwinding", "unwinding, nothing resting"
     or "holding + quoting" (see UNWINDING)."""
@@ -406,6 +461,7 @@ def poll(client, hist: dict) -> dict:
         est_rate += rate
         rows[t] = {"ticker": t, "event": e.get("event"), "series": t.split("-")[0],
                    "sub": m.get("yes_sub_title") or "", "status": m.get("status"),
+                   "settle": settle_cents(m),
                    "bid": bid, "ask": ask, "last": round(last, 1) if last else None,
                    "limits": [e.get("bid_max"), e.get("ask_min")],
                    "our_bid": max((p for s, p, q in own[t] if s == "bid"), default=None),
@@ -484,9 +540,8 @@ def poll(client, hist: dict) -> dict:
            "fill_ct": sum(_f(f.get("count")) for f in fills), "rest_coll": round(rest_coll, 2),
            "cash0": _cash_cache.get("shard0"), "cash_all": _cash_cache.get("total"), "cash_at": _cash_cache.get("at")}
     for t, r in rows.items():
-        mark = r["last"] if r["last"] is not None else (
-            (r["bid"] + r["ask"]) / 2 if r["bid"] and r["ask"] else None)
-        fx = fifo(per[t], mark)
+        fx = fifo(per[t], mark_fn(mk.get(t) or {}), r["settle"])
+        mark = fx["mark"]
         r.update(real=round(fx["real"], 2), open=round(fx["open"], 2),
                  trade=round(fx["real"] + fx["open"], 2), pos=round(fx["net"]),
                  est=round(cum.get(t, 0.0), 2), n_fills=len(per[t]))
@@ -531,24 +586,35 @@ def poll(client, hist: dict) -> dict:
             b["rew"] += r.get("est", 0.0) * w
             b["rate"] += r.get("rate", 0.0) * w
     # LATEST RELIGHT (Jack 2026-11-18, the w1113-fxmetals relight: "clearly show this data for
-    # the latest relit wave"): the header's numbers over the markets on the NEWEST program
-    # period only. The page's own totals run since go-live and mix in every earlier period's
-    # rewards, fills and positions (11/18: $2,774 "so far" since 11/13, and its 2 fills and
-    # -$10.80 were on 11/15 and 11/17 events). Rewards = banked this period; fills, trading
-    # P&L and cash held = this period's fills only; pacing vs $1 and LATEST_TARGET.
+    # the latest relit wave"): the header's numbers over the markets on the program periods
+    # RUNNING NOW -- every period with a market still before its stop -- or, once all have
+    # ended, the newest one. The page's own totals run since go-live and mix in every
+    # earlier period's rewards, fills and positions (11/18: $2,774 "so far" since 11/13, and
+    # its 2 fills and -$10.80 were on 11/15 and 11/17 events). Each market counts from ITS
+    # period's start: rewards banked this period; fills, trading P&L and cash held = its
+    # fills since; pacing vs $1 and LATEST_TARGET. It took the NEWEST period only: 11/19
+    # 17:01Z 439 new w1113-fxmetals strikes (January events) listed on a period of their
+    # own, and the block dropped the 336 still running since the 11/18 relight -- $239
+    # banked and T16150's 825 -- to read $0.02 (Jack: "the P&L looks broken").
     latest = None
-    lp = max((r["period"] for r in rows.values() if r["period"] != "wave-1104"), default=None)
-    if lp:
-        lts = [t for t, r in rows.items() if r["period"] == lp]
-        lp_ts = _ts(lp)
+    lps = latest_periods(rows)
+    if lps:
+        lp = max(lps)
+        lts = [t for t, r in rows.items() if r["period"] in lps]
+        p_ts = {p: _ts(p) for p in lps}
         lfills: dict = {t: [] for t in lts}
         for f in fills:
-            if f["ticker"] in lfills and (lp_ts is None or _f(f.get("ts")) >= lp_ts.timestamp()):
+            t = f["ticker"]
+            if t not in lfills:
+                continue
+            ps = p_ts.get(rows[t]["period"])
+            if ps is None or _f(f.get("ts")) >= ps.timestamp():
                 n = _f(f.get("count"))
-                lfills[f["ticker"]].append((n if f.get("our_book_side") == "bid" else -n,
-                                            _f(f.get("yes_price_cents"))))
+                lfills[t].append((n if f.get("our_book_side") == "bid" else -n,
+                                  _f(f.get("yes_price_cents"))))
         la = [rows[t] for t in lts if rows[t]["active"]]
-        latest = {"period": lp, "n": len(lts), "listed": len(la), "quoted": sum(1 for r in la if r["rest_ct"]),
+        latest = {"period": lp, "periods": [[p, sum(1 for t in lts if rows[t]["period"] == p)] for p in sorted(lps)],
+                  "n": len(lts), "listed": len(la), "quoted": sum(1 for r in la if r["rest_ct"]),
                   "two_sided": sum(1 for r in la if r["sides"] == 2),
                   "both": sum(1 for r in la if our_sides(r) == "both sides"),
                   "one": sum(1 for r in la if our_sides(r) in ("bid only", "ask only")
@@ -575,10 +641,7 @@ def poll(client, hist: dict) -> dict:
                   "fill_ct": sum(abs(q) for v in lfills.values() for q, _p in v),
                   "real": 0.0, "open": 0.0, "cost": 0.0}
         for t in lts:
-            r = rows[t]
-            mark = r["last"] if r["last"] is not None else (
-                (r["bid"] + r["ask"]) / 2 if r["bid"] and r["ask"] else None)
-            fx = fifo(lfills[t], mark)
+            fx = fifo(lfills[t], mark_fn(mk.get(t) or {}), rows[t]["settle"])
             latest["real"] += fx["real"]
             latest["open"] += fx["open"]
             latest["cost"] += fx["cost"]
@@ -876,7 +939,7 @@ function render(){
   $('tiles').innerHTML=[
     ['big','Net (est rewards + trading)',`<span class="${cls(t.net)}">${money(t.net)}</span>`,''],
     ['big','Est rewards so far',`<span style="color:var(--est)">${money(t.est)}</span>`,`projected ${money(t.proj_est)} by the end at today's rate`],
-    ['big','Trading P&L',`<span class="${cls(t.trade)}">${money(t.trade)}</span>`,`realized ${money(t.real)} &middot; open ${money(t.open)} (at last trade)`],
+    ['big','Trading P&L',`<span class="${cls(t.trade)}">${money(t.trade)}</span>`,`realized ${money(t.real)} (a settled market at what it paid) &middot; open ${money(t.open)} at the last trade`],
     ['','Est reward rate now',money(t.rate)+'/day',`raw model; Kalshi has paid ~1.15x`],
     ['','Markets quoting',`${t.quoted} / ${t.listed}`,`${t.two_sided} with both book sides qualifying &middot; ${t.rest_ct.toLocaleString()} contracts resting${t.ended?` &middot; ${t.ended} past their stop`:''}`],
     ['','This period vs $1',`<span class="up">${t.period_ok}</span> / <span class="dn">${t.period_short}</span>`,`active markets projected over / under $1 by their stop${t.period_short_unwind?` &middot; ${t.period_short_unwind} of the under are unwinding a position`:''}`],
@@ -887,11 +950,14 @@ function render(){
   const L=d.latest;
   if(L){
     $('lhead').style.display='';$('thead').style.display='';
-    $('lhead').innerHTML=`Latest relight <span class="mut" style="font-weight:400;font-size:12px">(the ${L.n.toLocaleString()} markets on the program period from ${etS(L.period)} ET: rewards banked this period, this period's fills only)</span>`;
+    const LP=L.periods||[[L.period,L.n]];
+    $('lhead').innerHTML=`Latest relight <span class="mut" style="font-weight:400;font-size:12px">(the ${L.n.toLocaleString()} markets on `+
+      (LP.length>1?`the ${LP.length} program periods running now: `+LP.map(([p,n])=>`${n.toLocaleString()} from ${etS(p)} ET`).join(', ')
+                  :`the program period from ${etS(LP[0][0])} ET`)+`: rewards banked this period, this period's fills only)</span>`;
     $('ltiles').innerHTML=[
       ['big','Net this period',`<span class="${cls(L.net)}">${money(L.net)}</span>`,'est rewards this period + trading on this period\'s fills'],
       ['big','Est rewards this period',`<span style="color:var(--est)">${money(L.est)}</span>`,`projected ${money(L.proj_est)} by the stop at today's rate`],
-      ['big','Trading P&L',`<span class="${cls(L.trade)}">${money(L.trade)}</span>`,`realized ${money(L.real)} &middot; open ${money(L.open)} (at last trade)`],
+      ['big','Trading P&L',`<span class="${cls(L.trade)}">${money(L.trade)}</span>`,`realized ${money(L.real)} (a settled market at what it paid) &middot; open ${money(L.open)} at the last trade`],
       ['','Est reward rate now',money(L.rate)+'/day',`raw model; Kalshi has paid ~1.15x`],
       ['','Markets quoting',`${L.quoted} / ${L.listed}`,`we quote both sides on ${L.both??'-'}, one side on ${L.one??'-'}${L.unwind_n!=null?`, only a closing order on ${L.unwind_rest}`:''} &middot; ${L.rest_ct.toLocaleString()} contracts resting`],
       ['',`Pacing vs $${L.target.toFixed(2)}`,`<span class="up">${L.ok_target}</span> / ${L.listed}`,`active markets projected $${L.target.toFixed(2)}+ by their stop &middot; $1+: ${L.ok_1} &middot; under $1: <span class="dn">${L.short_1}</span>`+
