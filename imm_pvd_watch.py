@@ -314,6 +314,32 @@ def our_sides(r: dict) -> str:
     return "both sides" if b and a else "bid only" if b else "ask only" if a else "not quoting"
 
 
+# UNWINDING (Jack 2026-11-19: "make that clear in the dashboard, what has resting positions
+# already and are unwinding"). A market holding a position from this page's fills:
+#   * "unwinding": only the order that closes it rests (our ask when long, our bid when
+#     short). That is every held wave market while UNWIND_ONLY_WAVES exists, and every
+#     market a resize turned off (multiple 0). It earns ~nothing, so it isn't paced for $1.
+#   * "unwinding, nothing resting": held, and no order rests (a bound or a 1-4 lot).
+#   * "holding + quoting": held, and the side that adds to it rests too.
+# The pacing table and the latest-relight tiles count the unwinding ones on their own line,
+# so the under-$1 rows are the markets quoting to earn.
+UNWIND_STATES = ("unwinding", "unwinding, nothing resting")
+
+
+def unwind_state(r: dict) -> str:
+    """A page row's position state: "" (flat), "unwinding", "unwinding, nothing resting"
+    or "holding + quoting" (see UNWINDING)."""
+    pos = r.get("pos") or 0
+    if abs(pos) < 1:
+        return ""
+    close_k, add_k = ("our_ask", "our_bid") if pos > 0 else ("our_bid", "our_ask")
+    if r.get("rest_ct") and r.get(add_k) is not None:
+        return "holding + quoting"
+    if r.get("rest_ct") and r.get(close_k) is not None:
+        return "unwinding"
+    return "unwinding, nothing resting"
+
+
 def poll(client, hist: dict) -> dict:
     now = datetime.now(timezone.utc)
     lst = load_list()
@@ -465,6 +491,9 @@ def poll(client, hist: dict) -> dict:
                  trade=round(fx["real"] + fx["open"], 2), pos=round(fx["net"]),
                  est=round(cum.get(t, 0.0), 2), n_fills=len(per[t]))
         r["net"] = round(r["trade"] + r["est"], 2)
+        # UNWINDING: the position's state and what it ties up at cost
+        r["pos_cost"] = round(fx["cost"], 2)
+        r["ustate"] = unwind_state(r)
         tot["real"] += fx["real"]
         tot["open"] += fx["open"]
         tot["cost"] += fx["cost"]
@@ -522,7 +551,8 @@ def poll(client, hist: dict) -> dict:
         latest = {"period": lp, "n": len(lts), "listed": len(la), "quoted": sum(1 for r in la if r["rest_ct"]),
                   "two_sided": sum(1 for r in la if r["sides"] == 2),
                   "both": sum(1 for r in la if our_sides(r) == "both sides"),
-                  "one": sum(1 for r in la if our_sides(r) in ("bid only", "ask only")),
+                  "one": sum(1 for r in la if our_sides(r) in ("bid only", "ask only")
+                             and r.get("ustate") not in UNWIND_STATES),
                   "rest_ct": sum(rows[t]["rest_ct"] for t in lts),
                   "rest_coll": sum((px if sd == "bid" else 100 - px) * q for t in lts for sd, px, q in own[t]) / 100.0,
                   "est": sum(rows[t]["period_est"] for t in lts),
@@ -532,6 +562,15 @@ def poll(client, hist: dict) -> dict:
                   "ok_target": sum(1 for r in la if r["proj_period"] >= LATEST_TARGET),
                   "ok_1": sum(1 for r in la if r["proj_period"] >= 1.0),
                   "short_1": sum(1 for r in la if r["proj_period"] < 1.0),
+                  # UNWINDING: held markets resting only the closing order (or nothing),
+                  # and how many of the under-$1 are those
+                  "unwind_n": sum(1 for r in la if r.get("ustate") in UNWIND_STATES),
+                  "unwind_rest": sum(1 for r in la if r.get("ustate") == "unwinding"),
+                  "unwind_ct": sum(abs(r.get("pos") or 0) for r in la if r.get("ustate") in UNWIND_STATES),
+                  "unwind_cost": sum(r.get("pos_cost") or 0.0 for r in la if r.get("ustate") in UNWIND_STATES),
+                  "hold_quote_n": sum(1 for r in la if r.get("ustate") == "holding + quoting"),
+                  "short_1_unwind": sum(1 for r in la if r["proj_period"] < 1.0
+                                        and r.get("ustate") in UNWIND_STATES),
                   "fills": sum(len(v) for v in lfills.values()),
                   "fill_ct": sum(abs(q) for v in lfills.values() for q, _p in v),
                   "real": 0.0, "open": 0.0, "cost": 0.0}
@@ -558,6 +597,9 @@ def poll(client, hist: dict) -> dict:
     tot["rest_ct"] = sum(r["rest_ct"] for r in rows.values())
     tot["period_ok"] = sum(1 for r in act if r["proj_period"] >= 1.0)
     tot["period_short"] = sum(1 for r in act if r["proj_period"] < 1.0)
+    tot["period_short_unwind"] = sum(1 for r in act if r["proj_period"] < 1.0
+                                     and r.get("ustate") in UNWIND_STATES)
+    tot["unwind_n"] = sum(1 for r in act if r.get("ustate") in UNWIND_STATES)
     stops = sorted({r["stop"] for r in act if r["stop"]})
     end = _ts(stops[0]) if stops else None
     hrs_left = max(0.0, (end - now).total_seconds() / 3600.0) if end else 0.0
@@ -630,35 +672,49 @@ def poll(client, hist: dict) -> dict:
     pace_b = [{"label": f"${PACE_BAR:.2f} with {PACE_SPARE_H:g}h to spare"},
               {"label": f"${PACE_BAR:.2f} by the end"}, {"label": "$1.15"},
               {"label": "$1.00"}, {"label": "$0.75"}, {"label": "under $0.75"}]
+    # UNWINDING markets (holding a position, only the closing order resting) get a row
+    # of their own under the buckets: they aren't quoting to earn, so they aren't paced
+    unw = {"label": "Unwinding: holding a position, only the closing order rests",
+           "n": 0, "rate": 0.0, "proj": 0.0, "zero": 0, "under_1": 0, "pos_ct": 0, "cost": 0.0}
     for b in pace_b:
         b.update(n=0, rate=0.0, proj=0.0, zero=0)
     for r in quoted_rows:
         end_p = r["period_est"] + r["rate"] * r["hrs_left"] / 24.0
         early_p = r["period_est"] + r["rate"] * max(0.0, r["hrs_left"] - PACE_SPARE_H) / 24.0
-        i = (0 if early_p >= PACE_BAR else 1 if end_p >= PACE_BAR else 2 if end_p >= 1.15
-             else 3 if end_p >= 1.00 else 4 if end_p >= 0.75 else 5)
-        b = pace_b[i]
+        if r.get("ustate") in UNWIND_STATES:
+            b = unw
+            unw["under_1"] += 1 if end_p < 1.0 else 0
+            unw["pos_ct"] += abs(r.get("pos") or 0)
+            unw["cost"] += r.get("pos_cost") or 0.0
+        else:
+            i = (0 if early_p >= PACE_BAR else 1 if end_p >= PACE_BAR else 2 if end_p >= 1.15
+                 else 3 if end_p >= 1.00 else 4 if end_p >= 0.75 else 5)
+            b = pace_b[i]
         b["n"] += 1
         b["rate"] += r["rate"]
         b["proj"] += end_p
         b["zero"] += 1 if not r["rate"] else 0
-    for b in pace_b:
+    for b in pace_b + [unw]:
         b["share"] = round(b["n"] / len(quoted_rows), 4) if quoted_rows else 0.0
-        b["rate"], b["proj"] = round(b["rate"], 2), round(b["proj"], 2)
+        b["rate"], b["proj"], b["cost"] = round(b["rate"], 2), round(b["proj"], 2), round(b.get("cost", 0.0), 2)
     pace = {"quoted": len(quoted_rows), "active": sum(1 for r in rows.values() if r["active"]),
             "src_bot": sum(1 for r in quoted_rows if r.get("est_src") == "bot"),
-            "bar": PACE_BAR, "spare_h": PACE_SPARE_H, "buckets": pace_b}
+            "bar": PACE_BAR, "spare_h": PACE_SPARE_H, "buckets": pace_b, "unwind": unw}
     # ONE SIDE OR BOTH (Jack 2026-11-18: "build into the dash how many markets are one sided
     # vs two sided. and whether they're above threshold or not based on that split"): every
     # active market by the sides WE rest (our bid / our ask -- not the book's qualifying
     # sides), each group by where it paces this period (banked + the rate now x the hours to
     # its stop) against LATEST_TARGET and Kalshi's $1 floor
+    # (an UNWINDING market -- holding, only the closing order resting -- is its own group,
+    # not "bid only" / "ask only")
     sides_g = {k: {"label": k, "n": 0, "ok_target": 0, "ok_1": 0, "short": 0, "rate": 0.0, "proj": 0.0}
-               for k in ("both sides", "bid only", "ask only", "not quoting")}
+               for k in ("both sides", "bid only", "ask only", "unwinding (closing order only)",
+                         "not quoting")}
     for r in rows.values():
         if not r["active"]:
             continue
-        g = sides_g[our_sides(r)]
+        g = sides_g["unwinding (closing order only)" if r.get("ustate") in UNWIND_STATES
+                    else our_sides(r)]
         pj = r["proj_period"]
         g["n"] += 1
         g["ok_target" if pj >= LATEST_TARGET else "ok_1" if pj >= 1.0 else "short"] += 1
@@ -718,6 +774,7 @@ th{font-weight:600;color:var(--mut);font-size:12px;cursor:pointer;user-select:no
 tr.pos td{background:var(--hi)}tr.off td{opacity:.5}
 .err{color:var(--dn);margin:8px 0}.key{font-size:12px}
 .tag{display:inline-block;padding:1px 6px;border-radius:9px;font-size:11px;font-weight:600;color:#fff}.tag.dead{background:var(--dead)}.tag.live{background:var(--live)}
+.tag.unw{background:var(--trade)}.tag.hq{background:var(--est)}tr.unwrow td{font-style:italic}
 </style></head><body>
 <h1>Post-vote dead books</h1><div class="mut" id="sub">loading...</div>
 <div class="mut" id="scan" style="font-size:12px;margin-top:2px"></div>
@@ -750,7 +807,7 @@ tr.pos td{background:var(--hi)}tr.off td{opacity:.5}
 <div class="wrap"><table><thead><tr><th>Source</th><th>Entries</th><th>Active</th><th>Quoting</th><th>Est rewards</th><th>Trading P&amp;L</th><th>Net</th><th>Est $/day now</th><th>Fills</th></tr></thead><tbody id="src"></tbody></table></div>
 <h2>By series</h2>
 <div class="wrap"><table><thead><tr><th>Series</th><th>Listed</th><th>Quoting</th><th>Est rewards</th><th>Trading P&amp;L</th><th>Net</th><th>Est $/day now</th><th>Fills</th></tr></thead><tbody id="ser"></tbody></table></div>
-<h2>Markets <span class="mut" style="font-weight:400;font-size:12px">(click a header to sort; highlighted = holding a position from these quotes; faded = no order resting or past its stop. Banked = est rewards this program period, vs Kalshi's $1 floor)</span></h2>
+<h2>Markets <span class="mut" style="font-weight:400;font-size:12px">(click a header to sort; highlighted = holding a position from these quotes -- Status <b>unwinding</b> = only the order that closes it rests, <b>holding + quoting</b> = the adding side rests too; faded = no order resting or past its stop. Banked = est rewards this program period, vs Kalshi's $1 floor)</span></h2>
 <div class="wrap"><table><thead><tr id="mh"></tr></thead><tbody id="rows"></tbody></table></div>
 <h2>Recent fills</h2>
 <div class="wrap"><table><thead><tr><th>Time (UTC)</th><th>Market</th><th>Side</th><th>Qty</th><th>Price</th></tr></thead><tbody id="fills"></tbody></table></div>
@@ -759,7 +816,7 @@ const $=id=>document.getElementById(id);
 const money=v=>(v<0?'-$':'$')+Math.abs(v).toFixed(2);
 const cls=v=>v>0.005?'up':v<-0.005?'dn':'';
 const COLS=[['ticker','Market'],['kind','Kind'],['src','Source'],['stop','Stop (ET)'],['size','Size'],['bid','Book bid'],['ask','Book ask'],['last','Last'],['our_bid','Our bid'],['our_ask','Our ask'],
- ['limits','Limits'],['pos','Pos'],['trade','Trading P&L'],['est','Est rewards'],['net','Net'],['period_est','Banked (period)'],['proj_period','Proj. by stop'],['rate','Est $/day'],['share','Share'],['n_fills','Fills']];
+ ['limits','Limits'],['pos','Pos'],['ustate','Status'],['trade','Trading P&L'],['est','Est rewards'],['net','Net'],['period_est','Banked (period)'],['proj_period','Proj. by stop'],['rate','Est $/day'],['share','Share'],['n_fills','Fills']];
 const etS=s=>s?new Date(s).toLocaleString('en-US',{timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}):'-';
 const bar=v=>v>=1.3?'up':v>=1.0?'':'dn';
 let sortK='trade',sortDir=1,D=null;
@@ -792,11 +849,14 @@ function render(){
   }
   const pc=d.pace;
   if(pc){
-    $('pacesub').textContent=`(${pc.quoted} quoted of ${pc.active} active; banked this period + the rate now x the hours to the stop; Kalshi pays a period only from $1; share from the bot's own cycle log for ${pc.src_bot??0} of ${pc.quoted})`;
+    const u=pc.unwind;
+    $('pacesub').textContent=`(${pc.quoted} quoted of ${pc.active} active; each row runs from its price up to the row above, so under $1 = the $0.75 and under-$0.75 rows; banked this period + the rate now x the hours to the stop; Kalshi pays a period only from $1; markets holding a position and only closing it are on the Unwinding row, not in the rows above it; share from the bot's own cycle log for ${pc.src_bot??0} of ${pc.quoted})`;
     $('pace').innerHTML=pc.buckets.map((b,i)=>`<tr><td>${i<2?'<b>'+b.label+'</b>':b.label}</td><td>${b.n.toLocaleString()}</td>`+
       `<td>${(100*b.share).toFixed(1)}%</td><td>${money(b.rate)}</td><td>${money(b.proj)}</td><td>${b.zero?b.zero.toLocaleString():''}</td></tr>`).join('')+
-      `<tr><td class="mut">total</td><td>${pc.quoted.toLocaleString()}</td><td></td><td>${money(pc.buckets.reduce((a,b)=>a+b.rate,0))}</td>`+
-      `<td>${money(pc.buckets.reduce((a,b)=>a+b.proj,0))}</td><td>${pc.buckets.reduce((a,b)=>a+b.zero,0).toLocaleString()||''}</td></tr>`;
+      (u&&u.n?`<tr class="unwrow"><td><span class="tag unw">unwinding</span> ${u.label}<div class="mut" style="font-size:11px">${Math.round(u.pos_ct).toLocaleString()} contracts held, ${money(u.cost)} at cost &middot; ${u.under_1} of them under $1 (not sized up: they earn ~nothing while they close)</div></td>`+
+        `<td>${u.n.toLocaleString()}</td><td>${(100*u.share).toFixed(1)}%</td><td>${money(u.rate)}</td><td>${money(u.proj)}</td><td>${u.zero?u.zero.toLocaleString():''}</td></tr>`:'')+
+      `<tr><td class="mut">total</td><td>${pc.quoted.toLocaleString()}</td><td></td><td>${money(pc.buckets.reduce((a,b)=>a+b.rate,0)+(u?u.rate:0))}</td>`+
+      `<td>${money(pc.buckets.reduce((a,b)=>a+b.proj,0)+(u?u.proj:0))}</td><td>${(pc.buckets.reduce((a,b)=>a+b.zero,0)+(u?u.zero:0)).toLocaleString()||''}</td></tr>`;
   }
   const sd=d.sides;
   if(sd){
@@ -819,7 +879,7 @@ function render(){
     ['big','Trading P&L',`<span class="${cls(t.trade)}">${money(t.trade)}</span>`,`realized ${money(t.real)} &middot; open ${money(t.open)} (at last trade)`],
     ['','Est reward rate now',money(t.rate)+'/day',`raw model; Kalshi has paid ~1.15x`],
     ['','Markets quoting',`${t.quoted} / ${t.listed}`,`${t.two_sided} with both book sides qualifying &middot; ${t.rest_ct.toLocaleString()} contracts resting${t.ended?` &middot; ${t.ended} past their stop`:''}`],
-    ['','This period vs $1',`<span class="up">${t.period_ok}</span> / <span class="dn">${t.period_short}</span>`,`active markets projected over / under $1 by their stop`],
+    ['','This period vs $1',`<span class="up">${t.period_ok}</span> / <span class="dn">${t.period_short}</span>`,`active markets projected over / under $1 by their stop${t.period_short_unwind?` &middot; ${t.period_short_unwind} of the under are unwinding a position`:''}`],
     ['','Fills since go-live',`${t.fills}`,`${Math.round(t.fill_ct).toLocaleString()} contracts &middot; open cost ${money(t.cost)}`],
     ['big','Cash held in positions',money(t.cost),`this page's fills since go-live, at cost &middot; free cash ${t.cash0!=null?money(t.cash0):'-'} (shard 0)${t.cash_all!=null?` / ${money(t.cash_all)} all shards`:''}`],
     ['','If every resting order filled',money(t.rest_coll||0),`what this page's resting orders would tie up (Kalshi reserves nothing for them until a fill)`]
@@ -833,8 +893,10 @@ function render(){
       ['big','Est rewards this period',`<span style="color:var(--est)">${money(L.est)}</span>`,`projected ${money(L.proj_est)} by the stop at today's rate`],
       ['big','Trading P&L',`<span class="${cls(L.trade)}">${money(L.trade)}</span>`,`realized ${money(L.real)} &middot; open ${money(L.open)} (at last trade)`],
       ['','Est reward rate now',money(L.rate)+'/day',`raw model; Kalshi has paid ~1.15x`],
-      ['','Markets quoting',`${L.quoted} / ${L.listed}`,`we quote both sides on ${L.both??'-'}, one side on ${L.one??'-'} &middot; ${L.rest_ct.toLocaleString()} contracts resting`],
-      ['',`Pacing vs $${L.target.toFixed(2)}`,`<span class="up">${L.ok_target}</span> / ${L.listed}`,`active markets projected $${L.target.toFixed(2)}+ by their stop &middot; $1+: ${L.ok_1} &middot; under $1: <span class="dn">${L.short_1}</span>`],
+      ['','Markets quoting',`${L.quoted} / ${L.listed}`,`we quote both sides on ${L.both??'-'}, one side on ${L.one??'-'}${L.unwind_n!=null?`, only a closing order on ${L.unwind_rest}`:''} &middot; ${L.rest_ct.toLocaleString()} contracts resting`],
+      ['',`Pacing vs $${L.target.toFixed(2)}`,`<span class="up">${L.ok_target}</span> / ${L.listed}`,`active markets projected $${L.target.toFixed(2)}+ by their stop &middot; $1+: ${L.ok_1} &middot; under $1: <span class="dn">${L.short_1}</span>`+
+        (L.short_1_unwind!=null?` (<b>${L.short_1-L.short_1_unwind}</b> quoting to earn, ${L.short_1_unwind} unwinding)`:'')],
+      ...(L.unwind_n!=null?[['','Unwinding',`<span style="color:var(--trade)">${L.unwind_n}</span>`,`markets holding a position from our fills, only the closing order resting (${L.unwind_rest} resting it) &middot; ${Math.round(L.unwind_ct).toLocaleString()} contracts, ${money(L.unwind_cost)} at cost &middot; not sized up${L.hold_quote_n?` &middot; ${L.hold_quote_n} more hold one and still quote both sides`:''}`]]:[]),
       ['','Fills this period',`${L.fills}`,`${Math.round(L.fill_ct).toLocaleString()} contracts &middot; open cost ${money(L.cost)}`],
       ['big','Cash held in positions',money(L.cost),`this period's fills, at cost`],
       ['','If every resting order filled',money(L.rest_coll||0),`what these markets' resting orders would tie up (Kalshi reserves nothing until a fill)`]
@@ -859,6 +921,7 @@ function render(){
     <td>${r.bsize===r.asize?r.bsize:r.bsize+' / '+r.asize}</td>
     <td>${v(r.bid)}</td><td>${v(r.ask)}</td><td>${v(r.last)}</td><td>${v(r.our_bid)}</td><td>${v(r.our_ask)}</td>
     <td class="mut">&le;${r.limits[0]} / &ge;${r.limits[1]}</td><td class="${cls(r.pos)}">${r.pos||''}</td>
+    <td>${r.ustate?`<span class="tag ${r.ustate.startsWith('unwinding')?'unw':'hq'}">${r.ustate}</span>`:''}</td>
     <td class="${cls(r.trade)}">${money(r.trade)}</td><td style="color:var(--est)">${money(r.est)}</td><td class="${cls(r.net)}"><b>${money(r.net)}</b></td>
     <td class="${bar(r.period_est)}">${money(r.period_est)}</td><td class="${r.active?bar(r.proj_period):'mut'}">${money(r.proj_period)}</td>
     <td>${money(r.rate)}</td><td>${(r.share*100).toFixed(1)}%</td><td>${r.n_fills||''}</td></tr>`).join('');
