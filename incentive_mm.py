@@ -3700,8 +3700,10 @@ _DEFAULT_SCAN_GRADUATE_SERIES = (
     # travel and visits
     "KXNJGOLFVISITCOUNT,KXNERIVISITS,KXNJONTIME,KXNVVISIT,KXORLHOTELDEMAND,"
     "KXNYCSUBWAY,KXNHASKIVISITS,"
-    # energy and mining
-    "KXMARCELLUSGAS,KXMNTACONITE,KXWYCOAL,KXEIACRUDEW,KXOKOIL,KXKYCOAL,"
+    # energy and mining (KXEIACRUDEW out 2026-11-19, Jack: "dont quote, realtime pickoff risk?"
+    # -- the API's weekly crude number prints the evening before EIA's, and its fills lost
+    # -$47 in the month before 10/22 a day or two ahead of a release)
+    "KXMARCELLUSGAS,KXMNTACONITE,KXWYCOAL,KXOKOIL,KXKYCOAL,"
     "KXAKCRUDEOIL,KXRIRESPOWER,KXWVCOAL,"
     # near-breakeven: 4-week net -$2 or better
     "KXGENERICBALLOTVOTEHUB,KXCANEVTARIFF,KXLAGODAYS,KXMANOFFVAC,KXALMWP,"
@@ -20838,10 +20840,14 @@ FX_EVENT_TTL_SECS = _env_int("IMM_FX_EVENT_TTL_SECS", 180)
 FX_EVENT_REFRESH_SECS = _env_int("IMM_FX_EVENT_REFRESH_SECS", 15)
 FX_EVENT_FAIR_FILE = os.environ.get(
     "IMM_FX_EVENT_FAIR_FILE", os.path.join(STATUS_DIR, "fx_event_fair.json"))
+# + KXINXEVENT (Jack 2026-11-19: "Build a fair, then list"): the S&P 500 "after economic events"
+# strikes, the same gate off fx_event_fair's S&P fair (Hyperliquid's trade.xyz SP500 perp moving
+# an anchor wave_fair.py keeps at the latest regular-hours ^GSPC bar); quoted only as wave books
+# (w1119-inx)
 FX_EVENT_SERIES = frozenset(s_.strip().upper() for s_ in os.environ.get(
     "IMM_FX_EVENT_SERIES",
     "KXGOLDEVENT,KXSILVEREVENT,KXCOPPEREVENT,KXUSDJPYEVENT,KXEURUSDEVENT,KXAUDUSDEVENT,"
-    "KXUSDMXNEVENT,KXUSDCADEVENT,KXGBPUSDEVENT").split(",") if s_.strip())
+    "KXUSDMXNEVENT,KXUSDCADEVENT,KXGBPUSDEVENT,KXINXEVENT").split(",") if s_.strip())
 _fx_event_state: dict = {"snap": None}
 
 

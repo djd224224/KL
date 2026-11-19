@@ -68,15 +68,32 @@ ET = ZoneInfo("America/New_York")
 CLOSE_1113 = {"KXUSDJPYEVENT": 159.686, "KXEURUSDEVENT": 1.1028, "KXAUDUSDEVENT": 0.6774,
               "KXUSDMXNEVENT": 18.523, "KXUSDCADEVENT": 1.4267, "KXGBPUSDEVENT": 1.3209,
               "KXGOLDEVENT": 3884.10, "KXSILVEREVENT": 48.75, "KXCOPPEREVENT": 6.15}
-CLOSE = CLOSE_1113                   # the series this fair covers (and the 11/13 values)
+# the series this fair covers: the 11/13 values, and None for a SESSION_ANCHOR series
+CLOSE = dict(CLOSE_1113, KXINXEVENT=None)
 VOL_D = {"KXUSDJPYEVENT": .0057, "KXEURUSDEVENT": .0044, "KXAUDUSDEVENT": .0063,
          "KXUSDMXNEVENT": .0076, "KXUSDCADEVENT": .0038, "KXGBPUSDEVENT": .0050,
-         "KXGOLDEVENT": .0113, "KXSILVEREVENT": .019, "KXCOPPEREVENT": .0139}
+         "KXGOLDEVENT": .0113, "KXSILVEREVENT": .019, "KXCOPPEREVENT": .0139,
+         "KXINXEVENT": .0125}
 PROXY = {"KXGOLDEVENT": ("hl", "xyz:GOLD"), "KXSILVEREVENT": ("hl", "xyz:SILVER"),
          "KXCOPPEREVENT": ("hl", "xyz:COPPER"), "KXUSDJPYEVENT": ("hl", "xyz:JPY"),
          "KXEURUSDEVENT": ("hl", "xyz:EUR"), "KXGBPUSDEVENT": ("hl", "xyz:GBP"),
          "KXAUDUSDEVENT": ("kraken", "AUDUSD"), "KXUSDCADEVENT": ("kraken", "USDCAD"),
-         "KXUSDMXNEVENT": ("bitso", "usd_mxn")}
+         "KXUSDMXNEVENT": ("bitso", "usd_mxn"), "KXINXEVENT": ("hl", "xyz:SP500")}
+# THE S&P 500 (KXINXEVENT, Jack 2026-11-19: "Build a fair, then list"): "S&P 500 at least 7,300
+# after Michigan sentiment?" = the index at 10:14:59 AM ET on the release day. Priced like the
+# FX strikes off its 24/7 source (Hyperliquid's trade.xyz SP500 perp), but its kept "close" is a
+# SESSION ANCHOR, not the Friday 5 PM close: each run takes the latest regular-hours ^GSPC 5-min
+# bar (9:30-16:00 ET, complete) and the perp's 5-min bar starting the same minute, so S = the
+# index at that bar x (the perp now / the perp then). The perp's basis to the index moved -0.15%
+# to +0.06% between the 11/13-11/18 closes (-0.048, -0.083, -0.149, +0.056%): a week-old Friday
+# anchor would carry it, ~3c at the money two days out. The anchor is kept under the week's key
+# in CLOSES_FILE (the bot's fx_event_fair reads it there), checked within CLOSE_CHECK_PCT of the
+# perp; a failed read keeps the last anchor kept for the week; none = no fair. vol_d 1.25% = VIX
+# 24.6 on 11/18 over sqrt(390) of this model's time units a year (20-day realized 22.3%).
+SESSION_ANCHOR = {"KXINXEVENT": "%5EGSPC"}          # Yahoo chart symbol (^GSPC, URL-encoded)
+SESSION_FIRST_BAR, SESSION_LAST_BAR = (9, 30), (15, 55)    # ET start of the first / last 5-min bar
+# "above K" strikes: FX / metals "greater"; the S&P's "greater_or_equal" (the same on a continuum)
+ABOVE_STRIKE_TYPES = ("greater", "greater_or_equal")
 # where each weekend's close comes from (what was read by hand on 11/13)
 CLOSE_SRC = {"KXGOLDEVENT": ("kalshi", "KXGOLDW"), "KXSILVEREVENT": ("kalshi", "KXSILVERW"),
              "KXCOPPEREVENT": ("kalshi", "KXCOPPERW"), "KXUSDJPYEVENT": ("yahoo", "JPY=X"),
@@ -218,6 +235,8 @@ def live_moves(prev: dict, now: datetime, fetch=None, t0: datetime = None, refs:
         prev_at = None
     same_close = str(prev.get("close_at") or t0.strftime("%Y-%m-%dT%H:%MZ")) == t0.strftime("%Y-%m-%dT%H:%MZ")
     for s, (src, sym) in PROXY.items():
+        if s in SESSION_ANCHOR and not refs.get(s):
+            continue          # no session anchor kept: session_anchors() reports why (no Friday bars)
         try:
             if refs.get(s):
                 ref, cur = float(refs[s]), fetch[src](sym, starts, need_ref=False)[1]
@@ -228,10 +247,99 @@ def live_moves(prev: dict, now: datetime, fetch=None, t0: datetime = None, refs:
             out[s] = {"src": f"{src}:{sym}", "ref": ref, "now": cur, "ratio": cur / ref}
         except Exception as ex:  # noqa: BLE001
             p = prev_live.get(s)
-            if p and same_close and prev_at is not None and now - prev_at < timedelta(minutes=reuse_min):
+            # an anchored series reuses its last price only against the same anchor
+            same_ref = s not in SESSION_ANCHOR or (p or {}).get("ref") == refs.get(s)
+            if p and same_close and same_ref and prev_at is not None \
+                    and now - prev_at < timedelta(minutes=reuse_min):
                 out[s] = dict(p, from_prev=str(prev.get("at")))
             else:
                 failed[s] = f"{src}:{sym}: {ex!r:.100}"
+    return out, failed
+
+
+def fetch_yahoo_bars(sym: str, now: datetime, get=None) -> list:
+    """[(bar start UTC, close)] of the public Yahoo chart's 5-min bars over the 5 days to now."""
+    get = get or _get
+    p2 = int(now.timestamp())
+    r = get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=5m"
+            f"&period1={p2 - 5 * 86400}&period2={p2}")["chart"]["result"][0]
+    return [(datetime.fromtimestamp(int(t), timezone.utc), float(c))
+            for t, c in zip(r.get("timestamp") or [], r["indicators"]["quote"][0].get("close") or [])
+            if c is not None]
+
+
+def fetch_hl_bar(coin: str, start: datetime, get=None) -> float:
+    """The close of the Hyperliquid perp's 5-min bar starting at `start`."""
+    get = get or _get
+    bars = get("https://api.hyperliquid.xyz/info", {"type": "candleSnapshot", "req": {
+        "coin": coin, "interval": "5m", "startTime": _ms(start), "endTime": _ms(start) + 60_000}})
+    for b in bars or []:
+        if int(b["t"]) == _ms(start):
+            return float(b["c"])
+    raise ValueError(f"no {coin} bar at {start:%Y-%m-%dT%H:%MZ}")
+
+
+ANCHOR_FETCH = {"yahoo_bars": fetch_yahoo_bars, "hl_bar": fetch_hl_bar}
+
+
+def _session_bar(t: datetime, now: datetime) -> bool:
+    """A complete regular-hours 5-min bar: it starts 9:30-15:55 ET on a weekday and ended
+    a minute or more before now (Yahoo's trailing point at 16:00 / the bar in progress are
+    not bars)."""
+    lo = t.astimezone(ET)
+    hm = (lo.hour, lo.minute)
+    return (lo.weekday() < 5 and SESSION_FIRST_BAR <= hm <= SESSION_LAST_BAR
+            and t + timedelta(minutes=6) <= now)
+
+
+def session_anchors(t0: datetime, now: datetime, fetch=None, path: str = None) -> tuple:
+    """({series: (index, perp, source)} read now, {series: why no anchor}) for SESSION_ANCHOR
+    series; each new anchor is kept in CLOSES_FILE under t0's key as the series' "close" and
+    "venue_ref". A failed read with an anchor already kept for the week is not a failure."""
+    fetch = ANCHOR_FETCH if fetch is None else fetch
+    path = path or CLOSES_FILE
+    key = t0.strftime("%Y-%m-%dT%H:%MZ")
+    out, failed = {}, {}
+    for s, sym in SESSION_ANCHOR.items():
+        coin = PROXY[s][1]
+        try:
+            bars = [(t, c) for t, c in fetch["yahoo_bars"](sym, now) if _session_bar(t, now)]
+            if not bars:
+                raise ValueError("no regular-hours bar in the last 5 days")
+            t, c = bars[-1]
+            ref = float(fetch["hl_bar"](coin, t))
+            if not (c > 0 and ref > 0):
+                raise ValueError(f"bad prices {c} / {ref}")
+            off = 100 * (ref / c - 1)
+            if abs(off) > CLOSE_CHECK_PCT:
+                raise ValueError(f"the perp {ref:g} is {off:+.2f}% off the index {c:g} at {t:%m-%d %H:%MZ}")
+            out[s] = (float(c), ref, f"{sym.replace('%5E', '^')} 5m bar {t:%Y-%m-%dT%H:%MZ} / hl:{coin}")
+        except Exception as ex:  # noqa: BLE001
+            failed[s] = f"session anchor {sym.replace('%5E', '^')}/{coin}: {str(ex)[:120]}"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            book = json.load(fh)
+    except (OSError, ValueError):
+        book = {}
+    wk = dict(book.get(key) or {})
+    close, src, refs = (dict(wk.get("close") or {}), dict(wk.get("source") or {}),
+                        dict(wk.get("venue_ref") or {}))
+    changed = False
+    for s, (c, r, why) in out.items():
+        if close.get(s) != c or refs.get(s) != r:
+            close[s], refs[s], src[s], changed = c, r, why, True
+    if changed:
+        book[key] = dict(wk, close=close, source=src, venue_ref=refs,
+                         at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        book = {k: v for k, v in sorted(book.items())[-8:]}      # the last 8 weekends
+        tmp = path + ".tmp"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(book, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    for s in list(failed):
+        if close.get(s) and refs.get(s):
+            del failed[s]                     # the week's last anchor stands
     return out, failed
 
 
@@ -298,16 +406,19 @@ def weekend_closes(t0: datetime, venue_ref: dict, fetch=None, path: str = None) 
     except (OSError, ValueError):
         book = {}
     wk = book.get(key) or {"close": {}, "source": {}}
-    if t0 == T0 and not wk["close"]:
-        wk = dict(wk, close=dict(CLOSE_1113), source={s: "entered by hand 11/13" for s in CLOSE_1113})
+    wk = dict(wk, close=dict(wk.get("close") or {}), source=dict(wk.get("source") or {}))
+    if t0 == T0 and not any(s in wk["close"] for s in CLOSE_1113):
+        # (a session anchor kept before them is not one of the 11/13 closes)
+        wk["close"].update(CLOSE_1113)
+        wk["source"].update({s: "entered by hand 11/13" for s in CLOSE_1113})
     close, src, failed, added = dict(wk["close"]), dict(wk["source"]), {}, False
     refs = dict(wk.get("venue_ref") or {})
     for s, v in (venue_ref or {}).items():
         if v and s not in refs:
             refs[s], added = float(v), True
     for s in CLOSE:
-        if s in close:
-            continue
+        if s in close or s in SESSION_ANCHOR:
+            continue                     # (an anchored series' close is session_anchors')
         kind, sym = CLOSE_SRC[s]
         try:
             v = float(fetch[kind](sym, t0))
@@ -392,7 +503,10 @@ def main(out_path: str, live_on: bool, now: datetime = None, list_markets=None) 
                 prev = json.load(fh)
         except (OSError, ValueError):
             prev = {}
+        _anc, a_fail = session_anchors(t0, now)       # the S&P's anchor first: kept_refs reads it
         live, failed = live_moves(prev, now, t0=t0, refs=kept_refs(t0), reuse_min=reuse)
+        for s, why in a_fail.items():
+            failed.setdefault(s, why)
         if not live:
             print(f"! every 24/7 source failed ({failed}): {out_path} left as it is (it runs out at its valid_until)")
             return 1
@@ -411,7 +525,7 @@ def main(out_path: str, live_on: bool, now: datetime = None, list_markets=None) 
             continue                     # no close or no live price: no fair
         for m in list_markets(s):
             K = float(m.get("floor_strike") or 0)
-            if not K or m.get("strike_type") != "greater" or not m.get("close_time"):
+            if not K or m.get("strike_type") not in ABOVE_STRIKE_TYPES or not m.get("close_time"):
                 skipped += 1
                 continue
             T = datetime.fromisoformat(m["close_time"].replace("Z", "+00:00"))

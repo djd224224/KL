@@ -15,8 +15,10 @@ run-logs/pvd-scan/wave_fair_closes.json, which wave_fair.py (the wave's pass-7 f
 once a weekend (Kalshi's weekly metals settlements, Yahoo's last FX bar, each checked within
 0.5% of its source). No close kept for the current close = no fair for that series: the gate
 stands it aside (fails closed). The 24/7 sources (public, no key): Hyperliquid trade.xyz
-perps (gold, silver, copper, JPY, EUR, GBP: one call), Kraken spot FX (AUD/USD, USD/CAD: one
-call), Bitso (USD/MXN). Pyth, the settlement source, needs a key for live prices (401).
+perps (gold, silver, copper, JPY, EUR, GBP, and the S&P 500 for KXINXEVENT: one call), Kraken
+spot FX (AUD/USD, USD/CAD: one call), Bitso (USD/MXN). Pyth, the settlement source, needs a key
+for live prices (401). KXINXEVENT's kept close is re-anchored each wave_fair.py run to the latest
+regular-hours ^GSPC bar (see SERIES below); the formula here is the same.
 
 MODES (as wave_fair.py):
   weekend  FX and metals shut (Fri 5 PM - Sun 5 PM ET): time from the close; floor 2c (a bid
@@ -56,16 +58,27 @@ CLOSES_FILE = os.environ.get("IMM_FX_EVENT_CLOSES_FILE",
                              os.path.join(HERE, "run-logs", "pvd-scan", "wave_fair_closes.json"))
 
 # wave_fair.py's (keep in step: test_fx_event_fair checks them against it)
+# KXINXEVENT (Jack 2026-11-19: "Build a fair, then list"): the S&P 500 "after economic events"
+# strikes ("S&P 500 at least 7,300 after Michigan sentiment?", the index at 10:14:59 AM ET),
+# priced like the FX ones off Hyperliquid's trade.xyz SP500 perp (24/7, ~$300M a day). Its kept
+# "close" is not the Friday close: wave_fair.py re-anchors it to the latest regular-hours
+# ^GSPC 5-min bar and the perp's bar at the same minute (SESSION_ANCHOR there), because the
+# perp's basis to the index moved -0.15% to +0.06% between the 11/13-11/18 closes. vol_d 1.25%
+# = VIX 24.6 on 11/18 (/ sqrt(390) of this model's units a year; 20-day realized 22.3%).
 SERIES = ("KXUSDJPYEVENT", "KXEURUSDEVENT", "KXAUDUSDEVENT", "KXUSDMXNEVENT", "KXUSDCADEVENT",
-          "KXGBPUSDEVENT", "KXGOLDEVENT", "KXSILVEREVENT", "KXCOPPEREVENT")
+          "KXGBPUSDEVENT", "KXGOLDEVENT", "KXSILVEREVENT", "KXCOPPEREVENT", "KXINXEVENT")
 VOL_D = {"KXUSDJPYEVENT": .0057, "KXEURUSDEVENT": .0044, "KXAUDUSDEVENT": .0063,
          "KXUSDMXNEVENT": .0076, "KXUSDCADEVENT": .0038, "KXGBPUSDEVENT": .0050,
-         "KXGOLDEVENT": .0113, "KXSILVEREVENT": .019, "KXCOPPEREVENT": .0139}
+         "KXGOLDEVENT": .0113, "KXSILVEREVENT": .019, "KXCOPPEREVENT": .0139,
+         "KXINXEVENT": .0125}
 PROXY = {"KXGOLDEVENT": ("hl", "xyz:GOLD"), "KXSILVEREVENT": ("hl", "xyz:SILVER"),
          "KXCOPPEREVENT": ("hl", "xyz:COPPER"), "KXUSDJPYEVENT": ("hl", "xyz:JPY"),
          "KXEURUSDEVENT": ("hl", "xyz:EUR"), "KXGBPUSDEVENT": ("hl", "xyz:GBP"),
          "KXAUDUSDEVENT": ("kraken", "AUDUSD"), "KXUSDCADEVENT": ("kraken", "USDCAD"),
-         "KXUSDMXNEVENT": ("bitso", "usd_mxn")}
+         "KXUSDMXNEVENT": ("bitso", "usd_mxn"), "KXINXEVENT": ("hl", "xyz:SP500")}
+# "above K" strikes: the FX / metals ones are "greater"; the S&P's are "greater_or_equal" ("at
+# least 7,300"), the same probability on a continuous price
+ABOVE_STRIKE_TYPES = ("greater", "greater_or_equal")
 MARGIN = {s: 2.0 for s in SERIES}        # copper too since 11/14 evening (was 6c)
 WEEKEND_GAP_DAYS = 0.5
 CUTOFF_H = 12.0
@@ -363,7 +376,8 @@ class FxEventWatch:
                 mk[t] = {"series": s, "err": ser[s]["err"]}
                 continue
             k, T = m.get("floor_strike"), _close_dt(m)
-            if m.get("strike_type") != "greater" or m.get("early_close_condition") or not k or T is None:
+            if m.get("strike_type") not in ABOVE_STRIKE_TYPES or m.get("early_close_condition") \
+                    or not k or T is None:
                 mk[t] = {"series": s, "err": "not an 'above' strike with a close time"}
                 continue
             if T <= now:

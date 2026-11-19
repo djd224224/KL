@@ -157,6 +157,33 @@ class Watch(unittest.TestCase):
         wk = self.watch().refresh(U(2026, 11, 14, 12).timestamp())["markets"]["KXGOLDEVENT-23NOV261500-T388000"]
         self.assertGreater(far["margin"], wk["margin"] + 1.0)      # the requote term
 
+    def test_the_sp500_prices_its_at_least_strikes(self):
+        # KXINXEVENT (Jack 2026-11-19: "Build a fair, then list"): "at least" strikes off the
+        # anchor wave_fair.py keeps (the index at a regular-hours bar, the perp at that minute)
+        close = dict(CLOSE, KXINXEVENT=7322.28)
+        refs = dict(CLOSE, KXINXEVENT=7326.35)
+        self.write_closes(close=close, refs=refs)
+        self.mids["KXINXEVENT"] = 7326.35 * 1.002                  # the perp +0.2% since the bar
+        self.mk.append(dict(market("KXINXEVENT-24NOV261015-T735000", 7350.0, U(2026, 11, 24, 15, 15)),
+                            strike_type="greater_or_equal"))
+        self.mk.append(dict(market("KXINXEVENT-24NOV261015-B735000", 7350.0, U(2026, 11, 24, 15, 15)),
+                            strike_type="between"))
+        self.mk.append(dict(market("KXINXEVENT-20NOV261015-T735000", 7350.0, U(2026, 11, 20, 15, 15)),
+                            strike_type="greater_or_equal"))
+        now = U(2026, 11, 19, 3)                                    # Wed 10 PM ET
+        snap = self.watch().refresh(now.timestamp())
+        s = snap["series"]["KXINXEVENT"]
+        self.assertAlmostEqual(s["spot"], 7322.28 * 1.002)
+        e = snap["markets"]["KXINXEVENT-24NOV261015-T735000"]
+        sig = 0.0125 * math.sqrt(fx.trading_days(U(2026, 11, 24, 15, 15), U(2026, 11, 13, 22), weekday_from=now))
+        p = 0.5 * (1 + math.erf(math.log(7322.28 * 1.002 / 7350.0) / sig / math.sqrt(2)))
+        self.assertAlmostEqual(e["p"], p, places=4)
+        self.assertIn("not an 'above' strike", snap["markets"]["KXINXEVENT-24NOV261015-B735000"]["err"])
+        # inside 12 h of its 10:15 measurement: nothing rests (Thu 11 PM ET for Friday's)
+        late = self.watch().refresh(U(2026, 11, 20, 4).timestamp())
+        self.assertTrue(late["markets"]["KXINXEVENT-20NOV261015-T735000"].get("cut"))
+        self.assertIn("p", late["markets"]["KXINXEVENT-24NOV261015-T735000"])
+
     def test_no_close_kept_stands_the_series_aside(self):
         self.write_closes(close={s: v for s, v in CLOSE.items() if s != "KXGOLDEVENT"})
         snap = self.watch().refresh(U(2026, 11, 14, 12).timestamp())
@@ -208,7 +235,8 @@ class Mids(unittest.TestCase):
         def get(url, body=None):
             calls.append(url)
             if "hyperliquid" in url:
-                names = ["xyz:GOLD", "xyz:SILVER", "xyz:COPPER", "xyz:JPY", "xyz:EUR", "xyz:GBP", "xyz:TSLA"]
+                names = ["xyz:GOLD", "xyz:SILVER", "xyz:COPPER", "xyz:JPY", "xyz:EUR", "xyz:GBP", "xyz:TSLA",
+                         "xyz:SP500"]
                 return [{"universe": [{"name": n} for n in names]},
                         [{"midPx": str(i + 1.5)} for i in range(len(names))]]
             if "kraken" in url:
@@ -262,7 +290,7 @@ class Mids(unittest.TestCase):
             return {"payload": {"bid": "18.695", "ask": "18.705"}}
         mids, err = fx.fetch_mids(get)
         self.assertEqual(set(err), {"KXAUDUSDEVENT", "KXUSDCADEVENT", "KXSILVEREVENT", "KXCOPPEREVENT",
-                                    "KXUSDJPYEVENT", "KXEURUSDEVENT", "KXGBPUSDEVENT"})
+                                    "KXUSDJPYEVENT", "KXEURUSDEVENT", "KXGBPUSDEVENT", "KXINXEVENT"})
         self.assertEqual(set(mids), {"KXGOLDEVENT", "KXUSDMXNEVENT"})
 
 

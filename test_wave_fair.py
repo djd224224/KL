@@ -1,5 +1,5 @@
 """wave_fair.py: the Friday-close reference and the per-source fallback (no network)."""
-import importlib.util, json, os, sys, tempfile, unittest
+import importlib.util, json, math, os, sys, tempfile, unittest
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -117,7 +117,7 @@ class WeekendRollTests(unittest.TestCase):
         ref["KXCOPPEREVENT"] = 6.2 * 1.02                                          # 2% away: refused
         del ref["KXUSDCADEVENT"]                                                   # no venue price: refused
         close, src, failed = wf.weekend_closes(t0, ref, fetch=self.fetch(vals), path=self.path)
-        self.assertEqual(set(close), set(wf.CLOSE) - {"KXCOPPEREVENT", "KXUSDCADEVENT"})
+        self.assertEqual(set(close), set(wf.CLOSE) - {"KXCOPPEREVENT", "KXUSDCADEVENT"} - set(wf.SESSION_ANCHOR))
         self.assertEqual(close["KXGOLDEVENT"], 3900.0)
         self.assertEqual(src["KXUSDJPYEVENT"], "yahoo:JPY=X")
         self.assertIn("off the 24/7 source", failed["KXCOPPEREVENT"])
@@ -128,7 +128,7 @@ class WeekendRollTests(unittest.TestCase):
         ref["KXUSDCADEVENT"] = 1.42
         close, src, failed = wf.weekend_closes(t0, ref, fetch=self.fetch(vals), path=self.path)
         self.assertEqual(sorted(self.calls), ["CAD=X", "KXCOPPERW"])
-        self.assertEqual((set(close), failed), (set(wf.CLOSE), {}))
+        self.assertEqual((set(close), failed), (set(wf.CLOSE) - set(wf.SESSION_ANCHOR), {}))
 
     def test_metals_before_kalshi_settles_get_no_fair_yet(self):
         t0 = U(2026, 11, 20, 22)
@@ -155,8 +155,9 @@ class WeekdayFairTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = (wf.FETCH, wf.CLOSE_FETCH, wf.CLOSES_FILE)
+        self.saved = (wf.FETCH, wf.CLOSE_FETCH, wf.CLOSES_FILE, wf.ANCHOR_FETCH)
         wf.CLOSES_FILE = os.path.join(self.tmp.name, "closes.json")
+        wf.ANCHOR_FETCH = {}                     # no S&P anchor: the FX series alone
         self.need_ref = []
 
         def venue(sym, starts=None, need_ref=True):
@@ -168,7 +169,7 @@ class WeekdayFairTests(unittest.TestCase):
         self.out = os.path.join(self.tmp.name, "fair.json")
 
     def tearDown(self):
-        wf.FETCH, wf.CLOSE_FETCH, wf.CLOSES_FILE = self.saved
+        wf.FETCH, wf.CLOSE_FETCH, wf.CLOSES_FILE, wf.ANCHOR_FETCH = self.saved
         self.tmp.cleanup()
 
     def markets(self, now):
@@ -204,7 +205,7 @@ class WeekdayFairTests(unittest.TestCase):
         self.assertTrue(all(self.need_ref))                          # the first run read the close bars
         with open(wf.CLOSES_FILE) as fh:
             book = json.load(fh)
-        self.assertEqual(set(book["2026-11-13T22:00Z"]["venue_ref"]), set(wf.CLOSE))
+        self.assertEqual(set(book["2026-11-13T22:00Z"]["venue_ref"]), set(wf.CLOSE) - set(wf.SESSION_ANCHOR))
         self.assertEqual(book["2026-11-13T22:00Z"]["close"], wf.CLOSE_1113)
         self.need_ref.clear()
         self.run_main(U(2026, 11, 18, 15, 15))
@@ -221,6 +222,91 @@ class WeekdayFairTests(unittest.TestCase):
         rc = wf.main(self.out, False, now=U(2026, 11, 18, 15), list_markets=self.markets(U(2026, 11, 18, 15)))
         self.assertEqual(rc, 1)
         self.assertFalse(os.path.exists(self.out))
+
+
+class SessionAnchorTests(unittest.TestCase):
+    """KXINXEVENT (Jack 2026-11-19: "Build a fair, then list"): the S&P 500 strikes' kept close is
+    the latest regular-hours ^GSPC 5-min bar and the SP500 perp's bar at the same minute."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "closes.json")
+        self.t0 = U(2026, 11, 13, 22)
+        # Wed 11/18: bars to the 15:55 ET bar (20:55Z), Yahoo's trailing 16:00 point, then nothing
+        self.bars = [(U(2026, 11, 18, 20, 50), 7330.0), (U(2026, 11, 18, 20, 55), 7322.28),
+                     (U(2026, 11, 18, 21, 0), 7323.63)]
+        self.perp = {U(2026, 11, 18, 20, 50): 7333.0, U(2026, 11, 18, 20, 55): 7326.35}
+        self.hl_calls = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fetch(self):
+        def hl_bar(coin, start):
+            self.hl_calls.append((coin, start))
+            if start not in self.perp:
+                raise ValueError("no bar")
+            return self.perp[start]
+        return {"yahoo_bars": lambda sym, now: list(self.bars), "hl_bar": hl_bar}
+
+    def book(self):
+        with open(self.path) as fh:
+            return json.load(fh)["2026-11-13T22:00Z"]
+
+    def test_the_latest_regular_hours_bar_and_the_perp_at_it(self):
+        out, failed = wf.session_anchors(self.t0, U(2026, 11, 19, 3), fetch=self.fetch(), path=self.path)
+        self.assertEqual(failed, {})
+        self.assertEqual(out["KXINXEVENT"][:2], (7322.28, 7326.35))       # the 15:55 bar, not the 16:00 point
+        self.assertEqual(self.hl_calls, [("xyz:SP500", U(2026, 11, 18, 20, 55))])
+        wk = self.book()
+        self.assertEqual((wk["close"]["KXINXEVENT"], wk["venue_ref"]["KXINXEVENT"]), (7322.28, 7326.35))
+        self.assertIn("^GSPC 5m bar 2026-11-18T20:55Z", wk["source"]["KXINXEVENT"])
+
+    def test_a_bar_in_progress_is_not_an_anchor(self):
+        now = U(2026, 11, 18, 21, 0, 30)                  # 30 s after the 15:55 bar ended
+        out, _f = wf.session_anchors(self.t0, now, fetch=self.fetch(), path=self.path)
+        self.assertEqual(out["KXINXEVENT"][:2], (7330.0, 7333.0))
+
+    def test_a_perp_far_off_the_index_is_refused(self):
+        self.perp[U(2026, 11, 18, 20, 55)] = 7322.28 * 1.01
+        out, failed = wf.session_anchors(self.t0, U(2026, 11, 19, 3), fetch=self.fetch(), path=self.path)
+        self.assertEqual(out, {})
+        self.assertIn("off the index", failed["KXINXEVENT"])
+
+    def test_a_failed_read_keeps_the_weeks_anchor(self):
+        wf.session_anchors(self.t0, U(2026, 11, 19, 3), fetch=self.fetch(), path=self.path)
+        out, failed = wf.session_anchors(self.t0, U(2026, 11, 19, 4), fetch={}, path=self.path)
+        self.assertEqual((out, failed), ({}, {}))
+        self.assertEqual(self.book()["close"]["KXINXEVENT"], 7322.28)
+
+    def test_the_fx_closes_and_the_anchor_share_the_week(self):
+        wf.session_anchors(self.t0, U(2026, 11, 19, 3), fetch=self.fetch(), path=self.path)
+        close, _src, failed = wf.weekend_closes(wf.T0, {}, fetch={}, path=self.path)
+        self.assertEqual(close, dict(wf.CLOSE_1113, KXINXEVENT=7322.28))   # the hand closes still apply
+        self.assertEqual(failed, {})
+
+    def test_a_weekday_fair_for_an_at_least_strike(self):
+        saved = (wf.FETCH, wf.CLOSE_FETCH, wf.CLOSES_FILE, wf.ANCHOR_FETCH)
+        try:
+            wf.CLOSES_FILE, wf.ANCHOR_FETCH, wf.CLOSE_FETCH = self.path, self.fetch(), {}
+            mids = dict(wf.CLOSE_1113, KXINXEVENT=7326.35 * 1.002)
+            wf.FETCH = {k: (lambda sym, starts=None, need_ref=True:
+                            ((mids[next(s for s, (_x, v) in wf.PROXY.items() if v == sym)] if need_ref else None),
+                             mids[next(s for s, (_x, v) in wf.PROXY.items() if v == sym)]))
+                        for k in ("hl", "kraken", "bitso")}
+            now = U(2026, 11, 19, 3)
+            rows = [{"ticker": "KXINXEVENT-24NOV261015-T735000", "floor_strike": 7350, "strike_type":
+                     "greater_or_equal", "close_time": "2026-11-24T15:15:00Z"}]
+            out = os.path.join(self.tmp.name, "fair.json")
+            self.assertEqual(wf.main(out, True, now=now, list_markets=lambda s: rows if s == "KXINXEVENT" else []), 0)
+            with open(out) as fh:
+                doc = json.load(fh)
+            self.assertAlmostEqual(doc["spot"]["KXINXEVENT"], 7322.28 * 1.002, places=3)
+            sig = 0.0125 * math.sqrt(wf.trading_days(U(2026, 11, 24, 15, 15), wf.T0, weekday_from=now))
+            self.assertAlmostEqual(doc["fair"]["KXINXEVENT-24NOV261015-T735000"],
+                                   100 * wf.N(math.log(7322.28 * 1.002 / 7350) / sig), delta=0.01)
+        finally:
+            wf.FETCH, wf.CLOSE_FETCH, wf.CLOSES_FILE, wf.ANCHOR_FETCH = saved
 
 
 if __name__ == "__main__":

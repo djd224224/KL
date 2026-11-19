@@ -47953,10 +47953,14 @@ class TestFxEventFair(unittest.TestCase):
         self.assertTrue(imm.fx_event_series("KXUSDMXNEVENT"))
         self.assertFalse(imm.fx_event_series("KXBTCEVENT"))         # crypto's own gate
         self.assertFalse(imm.fx_event_series("KX10YRRATEEVENT"))    # yields: no fair
+        self.assertTrue(imm.fx_event_series("KXINXEVENT"))          # the S&P 500 (11/19)
         self.assertEqual(imm.fair_gate_of("KXGOLDEVENT"), "fx event")
         with mock.patch.object(imm, "FX_EVENT_FAIR", False):
             self.assertFalse(imm.fx_event_series("KXGOLDEVENT"))
-        self.assertEqual(len(imm.FX_EVENT_SERIES), 9)
+        self.assertEqual(len(imm.FX_EVENT_SERIES), 10)
+        # the bot's gate covers what the fair prices
+        import fx_event_fair
+        self.assertEqual(set(imm.FX_EVENT_SERIES), set(fx_event_fair.SERIES))
 
     def test_gate_reasons_fail_closed(self):
         t, _d = self._t()
