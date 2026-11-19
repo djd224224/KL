@@ -22441,6 +22441,26 @@ HOME_ONE_SIDE_BREACH = os.environ.get("IMM_HOME_ONE_SIDE_BREACH", "1") == "1"
 # stand-asides -- no read, a stale check, a new release, an unmodelled or a
 # decided strike -- still take everything off. IMM_HOME_EDGES=0: the old caps.
 HOME_EDGES = os.environ.get("IMM_HOME_EDGES", "1") == "1"
+# JOIN THE REFERENCE (Jack 2026-11-18: "why does KXSEAHOME-30NOV26-GT890000
+# sit so low in the orderbook and not in the top200?" -> "2c margin"). The
+# program pays full weight only down to its reference -- the price where the
+# first target/5 contracts (200 of a 1,000 target) from the best end -- and
+# halves it every cent behind. With the leads off (0579b54) the +/-15c band
+# set every near-month quote, so where the book AGREED with the model it kept
+# both sides out: GT890000's fair 11.5c on a 10x13 book put the ask floor at
+# 27c behind a 15c reference (624 contracts in front, weight 0.5^12) and the
+# bid cap at 1c behind 6,500. On 11/18 50 of the 80 near-month strikes had
+# neither side at its reference. So a side whose EXTERNAL reference (our own
+# orders out) sits at least HOME_JOIN_REF_CENTS on the model's side of the
+# fair may rest AT it -- the bid cap rises to the bid reference when that is
+# <= fair - margin, the ask floor falls to the ask reference when that is >=
+# fair + margin -- never ahead of it (the cap IS the reference, so no lead
+# and no join-ahead past it), the band cap kept wherever it is the looser.
+# Only a market the gate clears (a breach's sides keep THE 1c / 99c EDGES /
+# ONE SIDE OFF A BREACH; a far month follows the book). On 11/18 2c put 73 of
+# the 80 at their reference on at least one side. IMM_HOME_JOIN_REF=0: off.
+HOME_JOIN_REF = os.environ.get("IMM_HOME_JOIN_REF", "1") == "1"
+HOME_JOIN_REF_CENTS = _env_float("IMM_HOME_JOIN_REF_CENTS", 2.0)
 HOME_STATUS_FILE = os.environ.get(
     "IMM_HOME_STATUS_FILE", os.path.join(STATUS_DIR, "home_value_fair.json"))
 # the regions parsed out of Zillow's files, by Last-Modified (a restart reuses
@@ -22653,6 +22673,43 @@ def home_xmonth_caps(caps: Tuple[Optional[int], Optional[int]],
         why.append(by_b)
     if by_a and ext_ask is not None and ask_floor is not None and ext_ask < ask_floor:
         why.append(by_a)
+    return (bid_cap, ask_floor), "; ".join(why)
+
+
+def home_ext_refs(yes_ext: List[List[float]], no_ext: List[List[float]],
+                  target: float) -> Tuple[Optional[int], Optional[int]]:
+    """(bid reference in YES cents, ask reference in YES cents) of an
+    EXTERNAL book -- the first level, best first, target/5 deep
+    (side_reference_level) -- whatever LADDER_MODE is; None where a side
+    never gets that deep."""
+    rb = side_reference_level(levels_desc(yes_ext), target)
+    rn = side_reference_level(levels_desc(no_ext), target)
+    return rb, (None if rn is None else 100 - rn)
+
+
+def home_join_ref_caps(caps: Tuple[Optional[int], Optional[int]], fair: float,
+                       ref_bid: Optional[int], ref_ask: Optional[int]
+                       ) -> Tuple[Tuple[Optional[int], Optional[int]], str]:
+    """(caps loosened to JOIN THE REFERENCE, why): the bid cap up to the bid
+    reference when that is at most fair - HOME_JOIN_REF_CENTS, the ask floor
+    down to the ask reference when that is at least fair + it -- never past
+    it, the looser of the two kept. A side the gate left out (None) stays
+    out. `why` names each side moved, else ''."""
+    bid_cap, ask_floor = caps
+    if not HOME_JOIN_REF:
+        return caps, ""
+    m = HOME_JOIN_REF_CENTS
+    why = []
+    if (bid_cap is not None and ref_bid is not None and 1 <= ref_bid <= 99
+            and ref_bid <= fair - m + 1e-9 and ref_bid > bid_cap):
+        why.append(f"bid joins the {ref_bid}c reference (cap {bid_cap}c)")
+        bid_cap = int(ref_bid)
+    if (ask_floor is not None and ref_ask is not None and 1 <= ref_ask <= 99
+            and ref_ask >= fair + m - 1e-9 and ref_ask < ask_floor):
+        why.append(f"ask joins the {ref_ask}c reference (floor {ask_floor}c)")
+        ask_floor = int(ref_ask)
+    if why:
+        why.append(f"fair {fair:.1f}c, {m:g}c margin")
     return (bid_cap, ask_floor), "; ".join(why)
 
 
@@ -29907,6 +29964,7 @@ class IncentiveMarketMaker:
         self._home_stood: Set[str] = set()        # zillow home gate stand-asides
         self._home_edges: Set[str] = set()        # ...and its edges-only markets
         self._home_xmonth_note: Dict[str, str] = {}   # ...and its cross-month bounds
+        self._home_join_note: Dict[str, str] = {}     # ...and the sides joining the reference
         self._home_pre_x1 = False                      # ...and its pre-release window
         self._cev_stood: Set[str] = set()         # crypto event gate stand-asides
         self._fev_stood: Set[str] = set()         # FX event gate stand-asides
@@ -41137,6 +41195,9 @@ class IncentiveMarketMaker:
                 _hw, _hi, _hc = home_gate(meta.ticker, _now.timestamp(), eb, ea)
                 if _hc is not None and not _hw and _hi.get("follow_book"):
                     _hc = self._home_xmonth(meta.ticker, _hc)[0]     # (CROSS-MONTH BOUND)
+                elif _hc is not None and not _hw:
+                    # (JOIN THE REFERENCE: the probe's external references)
+                    _hc = home_join_ref_caps(_hc, float(_hi["fair"]), rpb, rpa)[0]
                 out = [] if _hc is None else mort_cap_quotes(out, *_hc)
             if crypto_event_series(meta.series):
                 # crypto event gate: the same, the band plus CRYPTO_EVENT_TOL_CENTS
@@ -44036,6 +44097,22 @@ class IncentiveMarketMaker:
                             self._home_xmonth_note[t] = xm_why
                         else:
                             self._home_xmonth_note.pop(t, None)
+                # a near month the gate clears: JOIN THE REFERENCE (the
+                # external book's, our own orders out)
+                elif not hg_why and home_caps is not None and HOME_JOIN_REF:
+                    _jy, _jn = (external_levels(yes_levels, no_levels, own_in_book)
+                                if own_in_book else (yes_levels, no_levels))
+                    home_caps, jr_why = home_join_ref_caps(
+                        home_caps, float(hg_in["fair"]),
+                        *home_ext_refs(_jy, _jn, meta.target_size))
+                    _jk = "+".join(s_ for s_ in ("bid", "ask") if f"{s_} joins" in jr_why)
+                    if _jk != self._home_join_note.get(t, ""):
+                        log(f"{self.tag} home-value join-ref {t}: "
+                            + (jr_why or "off (no reference on the model's side)"))
+                        if _jk:
+                            self._home_join_note[t] = _jk
+                        else:
+                            self._home_join_note.pop(t, None)
                 home_edges_only = bool(hg_why) and home_caps is not None
                 if home_edges_only != (t in self._home_edges):
                     if home_edges_only:
@@ -49171,7 +49248,10 @@ class IncentiveMarketMaker:
                    f"Home Value Index)" if HOME_AUTO else "")
                 + f" fail-closed, "
                 f"bids <= fair - {HOME_FAIR_TOL_CENTS}c, asks >= fair + "
-                f"{HOME_FAIR_TOL_CENTS}c, a touch fighting the fair by more "
+                f"{HOME_FAIR_TOL_CENTS}c"
+                + (f" or AT the side's reference when that sits {HOME_JOIN_REF_CENTS:g}c+ "
+                   f"on the model's side (never ahead of it)" if HOME_JOIN_REF else "")
+                + ", a touch fighting the fair by more "
                 + ("sends that side to its 1c / 99c edge (the other keeps its cap)"
                    if HOME_ONE_SIDE_BREACH else "rests the 1c / 99c edges alone")
                 + f", {HOME_RELEASE_HOLD_MIN}m out after a Zillow release"

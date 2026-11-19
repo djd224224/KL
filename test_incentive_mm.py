@@ -26636,8 +26636,9 @@ class TestZillowHomeGate(unittest.TestCase):
                     {px for s_, px in q if s_ == "ask"})
         self.assertEqual(cycle(0.70), ({48, 49, 50}, {90, 91, 92}))  # 55 / 85
         self.assertNotIn(self.T, bot._home_stood)
-        self.assertEqual(cycle(0.60), ({45}, {90, 91, 92}))   # bids capped at 45
-        self.assertEqual(cycle(0.80), ({48, 49, 50}, {95}))   # asks lifted to 95
+        with mock.patch.object(imm, "HOME_JOIN_REF", False):  # the band alone
+            self.assertEqual(cycle(0.60), ({45}, {90, 91, 92}))   # bids capped at 45
+            self.assertEqual(cycle(0.80), ({48, 49, 50}, {95}))   # asks lifted to 95
         # bid touch 50 over 30 + 15: the bid to its 1c edge, the asks at the
         # book as ever (ONE SIDE OFF A BREACH, 2026-11-18), no lead
         self._snap(p=0.30)
@@ -26666,6 +26667,105 @@ class TestZillowHomeGate(unittest.TestCase):
         bot.run_cycle()
         self.assertEqual(self._quotes(bot), [])
         self.assertNotIn(self.T, bot._home_edges)
+
+
+class TestHomeJoinRef(unittest.TestCase):
+    """JOIN THE REFERENCE (Jack 2026-11-18: "why does
+    KXSEAHOME-30NOV26-GT890000 sit so low in the orderbook and not in the
+    top200?" -> "2c margin"): a near-month side whose external reference
+    (the price target/5 deep) sits HOME_JOIN_REF_CENTS or more on the model's
+    side of the fair rests AT it -- never ahead of it -- instead of 15c off
+    the fair. TestZillowHomeGate's fixture (book 46/48/50 x 90/92/94, 400 a
+    level, target 1000: references 50 / 90)."""
+
+    T, EV, CLOSE = TestZillowHomeGate.T, TestZillowHomeGate.EV, TestZillowHomeGate.CLOSE
+    setUp, tearDown = TestZillowHomeGate.setUp, TestZillowHomeGate.tearDown
+    _snap, _bot, _quotes = (TestZillowHomeGate._snap, TestZillowHomeGate._bot,
+                            TestZillowHomeGate._quotes)
+
+    def test_the_caps_move_to_a_reference_on_the_models_side(self):
+        j = imm.home_join_ref_caps
+        # 11/18 KXSEAHOME-30NOV26-GT890000: fair 11.5c, band caps 1c / 27c,
+        # references 4c (2,175 at 4 behind 150 at 10) / 15c (414 at 15)
+        caps, why = j((1, 27), 11.52, 4, 15)
+        self.assertEqual(caps, (4, 15))
+        self.assertIn("bid joins the 4c reference (cap 1c)", why)
+        self.assertIn("ask joins the 15c reference (floor 27c)", why)
+        self.assertIn("2c margin", why)
+        # the margin, both ways: at it joins, inside it does not
+        self.assertEqual(j((37, 67), 52.0, 50, None)[0], (50, 67))      # 50 <= 52 - 2
+        self.assertEqual(j((36, 67), 51.5, 50, None), ((36, 67), ""))   # 50 > 49.5
+        self.assertEqual(j((1, 28), 13.0, None, 15)[0], (1, 15))       # 15 >= 13 + 2
+        self.assertEqual(j((1, 29), 13.5, None, 15), ((1, 29), ""))    # 15 < 15.5
+        # never tighter: a band cap already past the reference stays
+        self.assertEqual(j((55, 85), 70.0, 50, 90), ((55, 85), ""))
+        # no reference (the side never gets target/5 deep): the band
+        self.assertEqual(j((1, 27), 11.52, None, None), ((1, 27), ""))
+        # a side the gate left out stays out (IMM_HOME_EDGES=0 on a low fair)
+        self.assertEqual(j((None, 25), 9.4, 1, None), ((None, 25), ""))
+        with mock.patch.object(imm, "HOME_JOIN_REF_CENTS", 5.0):
+            self.assertEqual(j((1, 27), 11.52, 4, 15)[0], (4, 27))     # 15 < 16.5
+        with mock.patch.object(imm, "HOME_JOIN_REF", False):
+            self.assertEqual(j((1, 27), 11.52, 4, 15), ((1, 27), ""))
+
+    def test_the_references_are_read_off_the_external_book(self):
+        yes = [[10, 150], [4, 2175], [2, 2371], [1, 1000]]
+        no = [[87, 27], [86, 64], [85, 414], [84, 119], [73, 45]]
+        self.assertEqual(imm.home_ext_refs(yes, no, 1000.0), (4, 15))
+        self.assertEqual(imm.home_ext_refs(yes, no, 0.0), (None, None))
+        self.assertEqual(imm.home_ext_refs([[10, 150]], [], 1000.0), (None, None))
+        # our own 300 at 10c netted out first: the reference is still 4c
+        ey, en = imm.external_levels(yes + [[10, 300]], no, [("bid", 10, 300)])
+        self.assertEqual(imm.home_ext_refs(ey, en, 1000.0), (4, 15))
+
+    def test_the_quote_loop_rests_at_the_reference(self):
+        bot = self._bot()
+
+        def cycle(p, **patch):
+            self._snap(p=p)
+            bot.state.universe_at = 0.0
+            lines = []
+            with mock.patch.object(imm, "log", lines.append), \
+                    mock.patch.multiple(imm, **patch) if patch else contextlib.nullcontext():
+                bot.run_cycle()
+            q = self._quotes(bot)
+            return ({px for s_, px in q if s_ == "bid"},
+                    {px for s_, px in q if s_ == "ask"}), lines
+        # fair 60: the band cap 45 -> the 50c bid reference (50 <= 58)
+        got, lines = cycle(0.60)
+        self.assertEqual(got, ({48, 49, 50}, {90, 91, 92}))
+        self.assertTrue(any(f"home-value join-ref {self.T}: bid joins the 50c "
+                            "reference (cap 45c)" in s for s in lines), lines[-30:])
+        self.assertEqual(bot._home_join_note.get(self.T), "bid")
+        # ...said once, not every cycle
+        got, lines = cycle(0.60)
+        self.assertFalse(any("home-value join-ref" in s for s in lines))
+        # fair 80: the band floor 95 -> the 90c ask reference (90 >= 82)
+        got, lines = cycle(0.80)
+        self.assertEqual(got, ({48, 49, 50}, {90, 91, 92}))
+        self.assertTrue(any("ask joins the 90c reference (floor 95c)" in s for s in lines))
+        self.assertEqual(bot._home_join_note.get(self.T), "ask")
+        # fair 51.5: the bid reference 50 sits inside the 2c margin -> the band
+        got, lines = cycle(0.515)
+        self.assertEqual(got[0], {36})
+        self.assertTrue(any(f"home-value join-ref {self.T}: off" in s for s in lines))
+        self.assertNotIn(self.T, bot._home_join_note)
+        # off: the band alone
+        got, _ = cycle(0.60, HOME_JOIN_REF=False)
+        self.assertEqual(got[0], {45})
+
+    def test_a_breach_side_never_joins(self):
+        # a 10-lot bid at 85 over fair 50 + 15 fights the fair: that side
+        # goes to its edge even though the 40c reference sits under 48
+        bot = self._bot()
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.40", "400"], ["0.85", "10"]],
+            "no_dollars": [["0.06", "400"], ["0.08", "400"], ["0.10", "400"]]}}
+        self._snap(p=0.50)
+        bot.run_cycle()
+        bids = {px for s_, px in self._quotes(bot) if s_ == "bid"}
+        self.assertFalse(bids - {1}, bids)
+        self.assertNotIn(self.T, bot._home_join_note)
 
 
 class TestHomeFarSize(unittest.TestCase):
