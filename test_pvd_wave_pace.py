@@ -547,6 +547,159 @@ class TrimApply(unittest.TestCase):
         self.assertEqual((mult, rec), ({"KXA-1": 1.25, "KXA-2": 0}, {}))
 
 
+def _mr(t, proj, costs, x_aim=None, proj_max=0.0, m0=1.0, status="judged", pre_off=None,
+        stop="2026-11-22T05:00:00Z"):
+    m = _m(t, proj, x_aim=x_aim, proj_max=proj_max, m0=m0, status=status)
+    m.update(costs=costs, stop=stop, period_start="2026-11-18T19:01:00Z")
+    if pre_off is not None:
+        m["pre_off"] = pre_off
+    return m
+
+
+class ReachPlan(unittest.TestCase):
+    """TIER REACH (Jack 2026-11-19, the FX walls past the 15c tier: "Up to 25c on cheap tier
+    multiplier if needed"): the last tier out to 25c, a market at a time, only where the
+    multiple can't take it to the aim."""
+    A = argparse.Namespace(aim=1.20, max_mult=5.0, keep_within=0.05, no_off=False, reach_to=25.0, reach_lo=15.0)
+    PREV = {"at": (NOW - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"), "off_candidates": ["KXA-2"]}
+
+    def _markets(self):
+        return [_mr("KXA-1", 1.1, {"bid": 21.0}, proj_max=1.1, m0=5.0),               # at the cap, short of the aim
+                _mr("KXA-2", 0.3, {"bid": 20.0, "ask": 4.0}, proj_max=0.5, m0=3.0),     # under $1 even at 5x
+                _mr("KXA-3", 0.3, {"bid": 27.0, "ask": 4.0}, proj_max=0.5),             # its wall past 25c
+                _mr("KXA-4", 0.3, {"bid": 12.0}, proj_max=0.5),                         # inside the tiers already
+                _mr("KXA-5", 0.0, {"bid": 21.0}, m0=0, status="off", pre_off=True),     # off: back at 1x
+                _mr("KXA-6", 0.0, {"bid": 21.0}, m0=0, status="off", pre_off=False),    # no sizes to bring back
+                _mr("KXA-7", 0.0, {"bid": 80.0}, m0=0, status="off", pre_off=True),     # at the money: no reach
+                _mr("KXA-8", 0.6, {"bid": 21.0}, x_aim=2.5, proj_max=1.9),              # the multiple goes first
+                _mr("KXA-9", 0.6, {"bid": 21.0}, proj_max=1.05, m0=3.0)]                # ...as far as the cap
+
+    def test_only_where_the_multiple_runs_out(self):
+        p = pp.plan_resize({"markets": self._markets()}, self.PREV, self.A, NOW)
+        self.assertEqual(set(p["reach"]), {"KXA-1", "KXA-2"})
+        self.assertIn("at the 5x cap, short of the $1.20 aim", p["reach"]["KXA-1"])
+        self.assertIn("under $1 even at 5x", p["reach"]["KXA-2"])
+        self.assertEqual(p["reach_restore"], {"KXA-5": 1.0})
+        self.assertEqual(p["up"], {"KXA-8": 2.5, "KXA-9": 5.0})
+        self.assertEqual((p["off"], sorted(p["off_next"])), ([], ["KXA-3", "KXA-4"]))   # KXA-2: not off
+        self.assertEqual(p["skipped"]["off"], 2)
+
+    def test_once_a_market_and_none_when_off(self):
+        a = argparse.Namespace(**vars(self.A))
+        a.reach_granted = {"KXA-1", "KXA-2", "KXA-5"}
+        p = pp.plan_resize({"markets": self._markets()}, self.PREV, a, NOW)
+        self.assertEqual((p["reach"], p["reach_restore"]), ({}, {}))
+        self.assertEqual(p["off"], ["KXA-2"])                 # with its reach, under $1 on two reads: off
+        self.assertEqual(p["at_max"], 1)
+        self.assertEqual(p["skipped"]["off"], 3)
+        for to, lo in ((0.0, 15.0), (30.0, 15.0), (25.0, None), (15.0, 15.0)):   # off / past 25c / no tier
+            a = argparse.Namespace(**dict(vars(self.A), reach_to=to, reach_lo=lo))
+            p = pp.plan_resize({"markets": self._markets()}, self.PREV, a, NOW)
+            self.assertEqual((p["reach"], p["reach_restore"]), ({}, {}), (to, lo))
+        a = argparse.Namespace(aim=1.20, max_mult=5.0, keep_within=0.05, no_off=False)   # no reach args at all
+        self.assertEqual(pp.plan_resize({"markets": self._markets()}, self.PREV, a, NOW)["reach"], {})
+
+    def test_last_tier_and_reach_sides(self):
+        self.assertEqual(pp.last_tier(["--cheap-tiers", "2:10,5:5,15:5"]), (15.0, 5.0))
+        self.assertEqual(pp.last_tier(["--cheap-tiers", "15:5,2:10"]), (15.0, 5.0))
+        self.assertIsNone(pp.last_tier(["--room", "3"]))
+        self.assertEqual(pp.reach_sides({"bid": 21.0, "ask": 15.0}, 15.0, 25.0), ["bid"])
+        self.assertEqual(pp.reach_sides({"bid": 25.0, "ask": 25.5}, 15.0, 25.0), ["bid"])
+        self.assertEqual(pp.reach_sides(None, 15.0, 25.0), [])
+
+
+class ReachApply(unittest.TestCase):
+    S, S2, P = "2026-11-22T05:00:00Z", "2026-11-29T05:00:00Z", "2026-11-18T19:01:00Z"
+
+    def setUp(self):
+        self.mult = os.path.join(TMP, "size_mult_ra.json")
+        self.state = os.path.join(TMP, "resize_state_ra.json")
+        self.tiers = os.path.join(TMP, "tier_ra.json")
+        for p in (self.mult, self.state, self.tiers):
+            if os.path.exists(p):
+                os.remove(p)
+        self.saved = (pp.measure, pp.print_pace, pp.size_mult_path, pp.resize_state_path, pp.tier_state_path,
+                      pp.subprocess.run)
+        pp.print_pace = lambda r: None
+        pp.size_mult_path = lambda n: self.mult
+        pp.resize_state_path = lambda n: self.state
+        pp.tier_state_path = lambda n: self.tiers
+        pp.subprocess.run = lambda *a, **k: None
+
+    def tearDown(self):
+        (pp.measure, pp.print_pace, pp.size_mult_path, pp.resize_state_path, pp.tier_state_path,
+         pp.subprocess.run) = self.saved
+
+    def _write(self, path, d):
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(d, fh)
+
+    def _run(self, markets, reach_to=25.0, prev_off=None):
+        now = datetime.now(timezone.utc)
+        if prev_off is not None:
+            self._write(self.state, {"at": (now - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                     "off_candidates": prev_off})
+        res = {"at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "since_restart_min": 200.0, "dash_age_min": 2.0,
+               "markets": markets}
+        pp.measure = lambda name, a, now=None: res
+        a = argparse.Namespace(name="ra", aim=1.20, max_mult=5.0, real=0.65, window_min=60.0, keep_within=0.05,
+                               no_off=False, json=None, apply=True, force=False, no_run=True, trim=False,
+                               reach_to=reach_to, reach_lo=15.0)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(pp.cmd_resize(a), 0)
+        with open(self.mult, encoding="utf-8") as fh:
+            mult = json.load(fh)
+        d = {}
+        if os.path.exists(self.tiers):
+            with open(self.tiers, encoding="utf-8") as fh:
+                d = json.load(fh)
+        return mult, d, out.getvalue()
+
+    def test_given_and_restored_with_a_record_each(self):
+        self._write(self.mult, {"KXA-1": 5.0, "KXA-5": 0})
+        mult, d, out = self._run([_mr("KXA-1", 1.1, {"bid": 21.0}, proj_max=1.1, m0=5.0),
+                                  _mr("KXA-5", 0.0, {"bid": 22.0, "ask": 3.0}, m0=0, status="off", pre_off=True)])
+        self.assertEqual(mult, {"KXA-1": 5.0, "KXA-5": 1.0})         # the reach keeps KXA-1's multiple
+        self.assertEqual(d["to"], 25.0)
+        self.assertEqual(sorted(d["markets"]), ["KXA-1", "KXA-5"])
+        r1, r5 = d["markets"]["KXA-1"], d["markets"]["KXA-5"]
+        self.assertEqual((r1["sides"], r1["stop"], r1["period_start"]), (["bid"], self.S, self.P))
+        self.assertEqual((r5["why"], r5["restored"], r5["sides"]), ("back from off with the reach", 1.0, ["bid"]))
+        self.assertIn("tier reach: 1 given, 1 back from off, 0 dropped", out)
+
+    def test_one_reach_a_market_then_off_on_two_reads_and_never_back(self):
+        self._write(self.mult, {"KXA-2": 3.0})
+        m = _mr("KXA-2", 0.3, {"bid": 20.0}, proj_max=0.5, m0=3.0)
+        mult, d, _ = self._run([m])
+        self.assertEqual((mult, sorted(d["markets"])), ({"KXA-2": 3.0}, ["KXA-2"]))
+        mult, d, _ = self._run([m], prev_off=[])                      # still short with it: first read
+        mult, d, _ = self._run([m], prev_off=["KXA-2"])               # second read: off
+        self.assertEqual(mult, {"KXA-2": 0})
+        self.assertIn("KXA-2", d["markets"])                          # the record stays...
+        mult, d, _ = self._run([_mr("KXA-2", 0.0, {"bid": 20.0}, m0=0, status="off", pre_off=True)])
+        self.assertEqual(mult, {"KXA-2": 0})                          # ...so it isn't brought back
+
+    def test_off_drops_every_reach_and_a_relight_or_leaving_drops_one(self):
+        self._write(self.mult, {"KXA-1": 5.0, "KXA-5": 1.0, "KXA-9": 2.0})
+        self._write(self.tiers, {"to": 25.0, "markets": {
+            t: {"at": "x", "why": "y", "sides": ["bid"], "stop": self.S, "period_start": self.P}
+            for t in ("KXA-1", "KXA-5", "KXA-9")}})
+        mult, d, _ = self._run([_mr("KXA-1", 1.5, {"bid": 21.0}, m0=5.0),
+                                _mr("KXA-5", 1.5, {"bid": 21.0}, stop=self.S2)])   # KXA-5 relit; KXA-9 gone
+        self.assertEqual(sorted(d["markets"]), ["KXA-1"])
+        mult, d, out = self._run([_mr("KXA-1", 1.5, {"bid": 21.0}, m0=5.0)], reach_to=0.0)
+        self.assertEqual(d, {"to": 0.0, "markets": {}})
+        self.assertEqual(mult["KXA-1"], 5.0)                          # its multiple stays; judged without it
+        self.assertIn("tier reach: 0 given, 0 back from off, 1 dropped", out)
+
+    def test_nothing_written_on_a_wave_that_never_had_one(self):
+        self._write(self.mult, {"KXA-1": 2.0})
+        mult, d, out = self._run([_mr("KXA-1", 1.5, {"bid": 21.0}, m0=2.0)], reach_to=0.0)
+        self.assertEqual((mult, d), ({"KXA-1": 2.0}, {}))
+        self.assertNotIn("tier reach", out)
+
+
 class WhyDark(unittest.TestCase):
     def _ctx(self, **kw):
         c = {"pos": {}, "holds": {}, "sel": {}, "guards": {}, "log": {}, "books": {}, "cycle": {}, "wave_off": None}
@@ -645,6 +798,45 @@ class FloorPass(unittest.TestCase):
             pw._set(argparse.Namespace(name="wt", key="floor_trim", value="off"))
         self.assertFalse(pp.wave_trim_on("wt"))
         self.assertFalse(pp.wave_trim_on("no-such-wave"))
+
+    def test_floor_tier_needs_the_floor_check_a_tier_and_stays_within_25c(self):
+        """Jack 2026-11-19: "Up to 25c on cheap tier multiplier if needed" """
+        tune = list(pw.PRESETS["default"])
+        tune[tune.index("--cheap-tiers") + 1] = "2:10,5:5,15:5"
+        _save_reg({"wt": _wave(tune=tune)})
+        for v in ("25", ):
+            with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()):
+                pw._set(argparse.Namespace(name="wt", key="floor_tier", value=v))    # no floor check yet
+        with redirect_stdout(io.StringIO()):
+            pw._set(argparse.Namespace(name="wt", key="floor_auto", value="on"))
+        for v in ("26", "15", "10"):                                  # past Jack's 25c / not past the tier
+            with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()):
+                pw._set(argparse.Namespace(name="wt", key="floor_tier", value=v))
+        with redirect_stdout(io.StringIO()):
+            pw._set(argparse.Namespace(name="wt", key="floor_tier", value="25"))
+            pw._set(argparse.Namespace(name="wt", key="floor_tier", value="25"))    # the flag added once
+        w = pw.load()["waves"]["wt"]
+        self.assertEqual(w["floor"]["tier_to"], 25.0)
+        self.assertEqual(pw._vals(w["tune"], "--tier-file"), [pp.tier_state_path("wt")])
+        self.assertEqual(pp.wave_reach("wt"), (25.0, 15.0))
+        checks = {k: (st, msg) for st, k, msg in pw.wave_checks("wt", w)}
+        self.assertEqual(checks["wt main floor tier reach"][0], pw.WARN)
+        with redirect_stdout(io.StringIO()):
+            pp.pass_resize("wt", dict(w, tune=w["tune"] + ["--fair-file", self.fair]), now=NOW)
+        self.assertEqual((self.calls[-1].reach_to, self.calls[-1].reach_lo), (25.0, 15.0))
+        with redirect_stdout(io.StringIO()):
+            pw._set(argparse.Namespace(name="wt", key="floor_tier", value="off"))
+        w = pw.load()["waves"]["wt"]
+        self.assertEqual((w["floor"]["tier_to"], pw._vals(w["tune"], "--tier-file")), (0, []))
+        self.assertEqual(pp.wave_reach("wt"), (0.0, 15.0))
+        self.assertNotIn("wt main floor tier reach", {k for _st, k, _m in pw.wave_checks("wt", w)})
+        with redirect_stdout(io.StringIO()):
+            pp.pass_resize("wt", dict(w, tune=w["tune"] + ["--fair-file", self.fair]), now=NOW)
+        self.assertEqual(self.calls[-1].reach_to, 0.0)
+        _save_reg({"wt": _wave(floor_auto=True)})                     # the default preset: 2:10,5:5
+        with redirect_stdout(io.StringIO()):
+            pw._set(argparse.Namespace(name="wt", key="floor_tier", value="25"))
+        self.assertEqual(pp.wave_reach("wt"), (25.0, 5.0))
 
     def test_skips_without_a_live_fair_or_a_multiples_file(self):
         self._fair(NOW - timedelta(minutes=1))

@@ -24,6 +24,7 @@ dashboard leave registry series alone. Adding a wave never edits the task.
     python pvd_waves.py pace NAME [--aim 1.20] [--json OUT]          # under-$1 breakdown (read-only)
     python pvd_waves.py resize NAME [--aim 1.20 --max-mult 5] [--apply]   # size to the $1 floor (Jack's word)
     python pvd_waves.py set NAME floor_trim on|off   # the floor check also trims a market over its target (11/18)
+    python pvd_waves.py set NAME floor_tier 25|off   # ...gives a market short at the cap the last cheap tier to 25c (11/19)
     python pvd_waves.py whydark [NAME|all] [--json OUT]              # why each side isn't resting (read-only)
 
 PASS LOCK (2026-11-14): `run --write` holds run-logs/pvd-scan/wave_pass_NAME.lock from
@@ -1210,6 +1211,36 @@ def _set(a) -> int:
         save(reg)
         print(f"{a.name}: floor trim = {'on' if on else 'off (the next pass gives its trims back)'}")
         return 0
+    elif a.key == "floor_tier":
+        # TIER REACH (Jack 2026-11-19, the FX walls past the 15c tier: "Up to 25c on cheap tier
+        # multiplier if needed"): the $1-floor check gives a market its multiple can't take to
+        # the aim the LAST cheap tier's multiple on a side costing up to C c (pvd_wave_pace TIER
+        # REACH). Off drops the --tier-file from the tune (every reach goes at the next tune)
+        import pvd_wave_pace
+        tune = list(w.get("tune") or [])
+        if v.strip().lower() in ("0", "off", "none", "no", "false"):
+            w.setdefault("floor", {})["tier_to"] = 0
+            w["tune"] = [x for f, val in args_table(tune) if f != "--tier-file"
+                         for x in ([f] if val == "on" else [f, val])]
+            save(reg)
+            print(f"{a.name}: floor tier reach off (the next tune drops every reach)")
+            return 0
+        x = float(v)
+        lt = pvd_wave_pace.last_tier(tune)
+        if not w.get("floor_auto"):
+            raise SystemExit("floor_tier runs in the floor check: `set NAME floor_auto on` first")
+        if lt is None:
+            raise SystemExit("floor_tier reaches past the wave's --cheap-tiers, and it has none")
+        if not lt[0] < x <= pvd_wave_pace.TIER_REACH_MAX:
+            raise SystemExit(f"floor_tier: past the last tier ({lt[0]:g}c) up to {pvd_wave_pace.TIER_REACH_MAX:g}c "
+                             "(Jack 2026-11-19: \"Up to 25c\"), or off")
+        w.setdefault("floor", {})["tier_to"] = x
+        if not _vals(tune, "--tier-file"):
+            w["tune"] = tune + ["--tier-file", pvd_wave_pace.tier_state_path(a.name)]
+        save(reg)
+        print(f"{a.name}: floor tier reach to {x:g}c (x{lt[1]:g} past the {lt[0]:g}c tier, a market at a time "
+              f"where the multiple can't reach the aim); --tier-file {pvd_wave_pace.tier_state_path(a.name)}")
+        return 0
     elif a.key == "scan_max_mult":
         # SIZE-UP TO THE BAR (Jack 2026-11-18, "1.5-3x the size"): the scan judges a market
         # under the bar again at the wave's bank max, then up to this multiple of it, and
@@ -1746,6 +1777,11 @@ def wave_checks(name: str, w: dict, auto: bool = False) -> list:
             if over:
                 out.append((FAIL if auto else WARN, f"{tag} cheap tiers",
                             f"{spec} is above the default preset ({base_tiers}) at {over[0]}-{over[-1]}c"))
+        fl = w.get("floor") if isinstance(w.get("floor"), dict) else {}
+        if group == "main" and float(fl.get("tier_to") or 0) > 0 and _vals(tune, "--tier-file"):
+            out.append((FAIL if auto else WARN, f"{tag} floor tier reach",
+                        f"the last cheap tier out to {float(fl['tier_to']):g}c on a market the floor check finds "
+                        f"short at the cap (Jack 2026-11-19: \"Up to 25c on cheap tier multiplier if needed\")"))
         if "--reanchor" in tune or "--follow-book" in tune:
             step = float((_vals(tune, "--reanchor-step") or ["5"])[-1])
             jump = float((_vals(tune, "--reanchor-jump") or ["10"])[-1])

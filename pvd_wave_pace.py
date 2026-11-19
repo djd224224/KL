@@ -59,6 +59,22 @@ read by its tune's --size-mult-file; 0 = off, the sizes kept in "pre_off"):
     over the $1.20 that sizes a market up, so the two don't flap. Off by default: the crypto
     wave keeps 1,500 a side (Jack 11/15) and the default tune's --no-drop (11/07: "dont
     drop any size after banking 1.3") stands elsewhere;
+  * TIER REACH, on a wave whose floor "tier_to" is set (`set NAME floor_tier 25`; Jack
+    2026-11-19, the FX walls having stepped to 16-25c past the 15c tier: "Up to 25c on cheap
+    tier multiplier if needed"): the LAST cheap tier's multiple (FX: x5) on a side costing
+    past that tier up to tier_to c a contract (never past TIER_REACH_MAX, 25c), for one
+    market at a time, ONLY where it is needed -- the multiple goes first (a quarter step
+    raises the cheap side too, the cheaper share), and a market gets the reach when its
+    multiple can't take it to the aim: at the cap still short of the aim, or under $1 even
+    at the cap (instead of going off). A market the check turned off whose side now sits in
+    the reach comes back at 1x with it (the 11/19 FX offs: deep in-the-money MXN strikes
+    whose asks the fair keeps out and whose bids sat at 20-25c walls), and the next reads
+    size it like any other. One reach per market a period: one still under $1 at the cap
+    with it goes off on two reads as before and stays off. The reaches live in
+    tier_NAME.json (the tune's --tier-file); a relight or leaving the list drops a market's,
+    and `floor_tier off` drops them all at the next tune. A blanket 25c tier would have
+    put ~$415k more on the FX books (5x the 463 sides at 16-25c, 11/19 12:00Z) while 305 of
+    305 judged strikes already projected $1+;
   * without --apply it only prints the plan (and records the read for the two-read rule);
     --apply writes the file, adds --size-mult-file to the wave's tune if it is missing, and
     runs the wave now. Sizing a wave up is Jack's word -- except the $1-floor protocol on a
@@ -109,6 +125,8 @@ TRIM_TRIGGER = 0.8         # only a cut to 80% of the multiple or less (no churn
 TRIM_MIN_MULT = 0.2        # the smallest multiple a trim leaves (a 5x cheap side at its base)
 TRIM_MAX_CUT = 0.25        # one step leaves at least a quarter of the multiple
 TRIM_GRID = 0.05           # a trimmed multiple rounds UP to this step
+# TIER REACH (the module docstring; Jack 2026-11-19: "Up to 25c on cheap tier multiplier if needed")
+TIER_REACH_MAX = 25.0      # no market's reach past 25c a contract (Jack's cap)
 
 
 def size_mult_path(name: str) -> str:
@@ -122,6 +140,70 @@ def trim_state_path(name: str) -> str:
 
 def resize_state_path(name: str) -> str:
     return os.path.join(pw.HERE, "run-logs", "pvd-scan", f"resize_state_{name}.json")
+
+
+def tier_state_path(name: str) -> str:
+    """{"to": C, "markets": {ticker: {"at", "why", "sides", "stop", "period_start"}}} -- the
+    tune's --tier-file (TIER REACH)"""
+    return os.path.join(pw.HERE, "run-logs", "pvd-scan", f"tier_{name}.json")
+
+
+def last_tier(tune) -> "tuple | None":
+    """(C, X) of the tune's last --cheap-tiers step (the highest C), or None."""
+    specs = pw._vals(tune or [], "--cheap-tiers")
+    best = None
+    for part in (specs[-1] if specs else "").split(","):
+        try:
+            c, x = (float(v) for v in part.split(":"))
+        except ValueError:
+            continue
+        if best is None or c > best[0]:
+            best = (c, x)
+    return best
+
+
+def reach_sides(costs, lo: float, hi: float) -> list:
+    """The sides costing past the last tier (lo) and within the reach (hi) c a contract."""
+    out = []
+    for k, c in sorted((costs or {}).items()):
+        try:
+            if lo < float(c) <= hi:
+                out.append(k)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def load_reach(name: str) -> dict:
+    """{ticker: record} from tier_NAME.json ({} when missing or unreadable)."""
+    try:
+        with open(tier_state_path(name), encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+        return {str(k): dict(v) for k, v in (d.get("markets") or {}).items()}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def wave_reach(name: str) -> tuple:
+    """reach_of() for a registry wave by name ((0, None) when unreadable)."""
+    try:
+        w = pw.load()["waves"].get(name) or {}
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0.0, None
+    return reach_of(w)
+
+
+def reach_of(w: dict) -> tuple:
+    """(tier_to, the last tier's C) for a wave's TIER REACH: tier_to is 0 unless its floor
+    "tier_to" is set past its last tier and its tune reads the --tier-file; never past
+    TIER_REACH_MAX."""
+    tune = w.get("tune") or []
+    lt = last_tier(tune)
+    fl = w.get("floor") if isinstance(w.get("floor"), dict) else {}
+    to = min(TIER_REACH_MAX, float(fl.get("tier_to") or 0))
+    if not pw._vals(tune, "--tier-file") or lt is None or to <= lt[0]:
+        to = 0.0
+    return to, (lt[0] if lt else None)
 
 
 def _ts(s):
@@ -401,6 +483,9 @@ def measure(name: str, a, now: "datetime | None" = None, dash=None, rows=None, b
         m = {"ticker": t, "series": t.split("-")[0], "m0": m0, "banked": round(banked, 3), "hrs": round(hrs, 2),
              "status": "off" if m0 == 0 else j["status"], "costs": side_costs(dr),
              "stop": e.get("stop"), "period_start": e.get("period_start")}
+        if m0 == 0:
+            # its sizes wait in "pre_off" (the tune's): only then can a 0 lifted bring it back
+            m["pre_off"] = isinstance(e.get("pre_off"), dict)
         if m["status"] == "judged":
             proj = proj_at(1.0, j, banked, hrs, 0.0)
             x, p_max = needed_mult(j, banked, hrs, m0, a.aim, res["max_mult"], res["real"])
@@ -492,9 +577,11 @@ def cmd_pace(a) -> int:
 
 
 def plan_resize(res: dict, prev: dict, a, now: datetime) -> dict:
-    """{"up": {t: x}, "off": [t], "off_next": [t], "down": {t: x}, "down_next": [t], "keep": n, ...}
-    from measure()'s result and the previous resize read (the two-read rule; a trim's two
-    reads must see the same multiple). Trims only with `a.trim`."""
+    """{"up": {t: x}, "off": [t], "off_next": [t], "down": {t: x}, "down_next": [t], "keep": n,
+    "reach": {t: why}, "reach_restore": {t: x}, ...} from measure()'s result and the previous
+    resize read (the two-read rule; a trim's two reads must see the same multiple). Trims only
+    with `a.trim`; TIER REACH only with `a.reach_to` past `a.reach_lo` (the last tier's C), never
+    twice for a market (`a.reach_granted`)."""
     nts = now.timestamp()
     prev_at = _ts(prev.get("at"))
     gap = (nts - prev_at) / 60 if prev_at else None
@@ -502,10 +589,25 @@ def plan_resize(res: dict, prev: dict, a, now: datetime) -> dict:
     prev_off = set(prev.get("off_candidates") or []) if prev_ok else set()
     prev_trim = dict(prev.get("trim_candidates") or {}) if prev_ok else {}
     trim = bool(getattr(a, "trim", False))
+    reach_to = float(getattr(a, "reach_to", 0) or 0)
+    reach_lo = getattr(a, "reach_lo", None)
+    granted = set(getattr(a, "reach_granted", None) or ())
+    reach_on = reach_lo is not None and reach_lo < reach_to <= TIER_REACH_MAX
+
+    def reach(m) -> list:
+        """The market's sides the reach would size, when it may get one."""
+        if not reach_on or m["ticker"] in granted:
+            return []
+        return reach_sides(m.get("costs"), reach_lo, reach_to)
     out = {"up": {}, "off": [], "off_next": [], "down": {}, "down_next": [], "keep": 0, "at_max": 0, "borderline": 0,
            "skipped": collections.Counter(), "prev_gap_min": round(gap, 1) if gap is not None else None,
-           "candidates": [], "trim_candidates": {}}
+           "candidates": [], "trim_candidates": {}, "reach": {}, "reach_restore": {}}
     for m in res["markets"]:
+        if m["status"] == "off" and m.get("pre_off") and reach(m):
+            # off for being under $1 at the cap -- with a side now inside the reach: back at
+            # 1x with it, sized from there like any other market
+            out["reach_restore"][m["ticker"]] = 1.0
+            continue
         if m["status"] != "judged":
             out["skipped"][m["status"]] += 1
             continue
@@ -531,8 +633,15 @@ def plan_resize(res: dict, prev: dict, a, now: datetime) -> dict:
         if m["proj_max"] >= 1.0:
             if a.max_mult > m0 + 1e-9:
                 out["up"][m["ticker"]] = a.max_mult      # reaches $1, not the aim: as far as the cap goes
+            elif reach(m):
+                # at the cap, short of the aim: the multiple has nothing left -- the reach
+                out["reach"][m["ticker"]] = f"at the {m0:g}x cap, short of the ${a.aim:.2f} aim"
             else:
                 out["at_max"] += 1
+            continue
+        if reach(m):
+            # under $1 even at the cap: the reach before an off (the next reads judge it with it)
+            out["reach"][m["ticker"]] = f"under $1 even at {a.max_mult:g}x (${m['proj_max']:.2f})"
             continue
         if m["proj"] >= 1.0 - a.keep_within:
             out["borderline"] += 1                      # inside the noise: keeps its banked share
@@ -601,6 +710,50 @@ def apply_trims(name: str, res: dict, plan: dict, cur: dict, trim_on: bool) -> t
     return n_down, n_back
 
 
+def apply_reach(name: str, res: dict, plan: dict, cur: dict, reach_to: float, reach_lo) -> tuple:
+    """TIER REACH into tier_NAME.json (the tune's --tier-file) and `cur` (the multiples, in
+    place): plan["reach"]'s markets get a record; plan["reach_restore"]'s come back from 0 at
+    their multiple with one. A record goes when the reach is off (reach_to 0: every one),
+    when its market's period changed (its stop / period_start: a relight) or it left the
+    list; one whose market went off again stays, so it isn't brought back twice. The file's
+    "to" is the reach the tune applies now. Returns (given, restored, dropped)."""
+    tp = tier_state_path(name)
+    rec = load_reach(name)
+    if not rec and not os.path.exists(tp) and not (reach_to and (plan.get("reach") or plan.get("reach_restore"))):
+        return 0, 0, 0
+    live = {m["ticker"]: m for m in res.get("markets") or []}
+    n_drop = 0
+    for t, r in list(rec.items()):
+        m = live.get(t)
+        moved = m is None or m.get("stop") != r.get("stop") or m.get("period_start") != r.get("period_start")
+        if not reach_to or moved:
+            del rec[t]
+            n_drop += 1
+    n_give = n_rest = 0
+
+    def record(t: str, why: str) -> dict:
+        m = live.get(t) or {}
+        return {"at": res.get("at"), "why": why, "sides": reach_sides(m.get("costs"), reach_lo or 0.0, reach_to),
+                "stop": m.get("stop"), "period_start": m.get("period_start")}
+    if reach_to:
+        for t, why in (plan.get("reach") or {}).items():
+            if t in rec or cur.get(t, 1.0) == 0:
+                continue
+            rec[t] = record(t, why)
+            n_give += 1
+        for t, x in (plan.get("reach_restore") or {}).items():
+            if t in rec or cur.get(t, 1.0) != 0:
+                continue
+            cur[t] = x
+            rec[t] = dict(record(t, "back from off with the reach"), restored=x)
+            n_rest += 1
+    os.makedirs(os.path.dirname(tp), exist_ok=True)
+    with open(tp + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump({"to": reach_to, "markets": rec}, fh, indent=0, sort_keys=True)
+    os.replace(tp + ".tmp", tp)
+    return n_give, n_rest, n_drop
+
+
 def cmd_resize(a) -> int:
     now = datetime.now(timezone.utc)
     res = measure(a.name, a, now=now)
@@ -615,6 +768,9 @@ def cmd_resize(a) -> int:
         prev = {}
     if getattr(a, "trim", None) is None:
         a.trim = wave_trim_on(a.name)
+    if getattr(a, "reach_to", None) is None:
+        a.reach_to, a.reach_lo = wave_reach(a.name)
+    a.reach_granted = set(load_reach(a.name))
     plan = plan_resize(res, prev, a, now)
     print(f"\nresize plan (aim ${a.aim:.2f}, up to {a.max_mult:g}x, {a.real:.0%} of the modelled gain): "
           f"{len(plan['up'])} up, {len(plan['off'])} off now (under $1 at {a.max_mult:g}x on two reads), "
@@ -625,6 +781,10 @@ def cmd_resize(a) -> int:
         print(f"  trim (${TRIM_TO * a.aim:.2f} and {TRIM_MIN_SHARE:.2%} share, whole loss counted): "
               f"{len(plan['down'])} down now (over it on two reads at the same size), "
               f"{len(plan['down_next'])} down at the next read if still over")
+    if a.reach_to:
+        print(f"  tier reach to {a.reach_to:g}c (a side past the {a.reach_lo:g}c tier, where the multiple can't "
+              f"reach the aim): {len(plan['reach'])} given, {len(plan['reach_restore'])} back from off at 1x; "
+              f"{len(a.reach_granted)} held one already")
     by = collections.Counter(round(x, 2) for x in plan["up"].values())
     if by:
         print("  new multiples: " + ", ".join(f"{k:g}x {v}" for k, v in sorted(by.items())))
@@ -659,12 +819,15 @@ def cmd_resize(a) -> int:
             cur[t] = 0
             n_off += 1
     n_down, n_back = apply_trims(a.name, res, plan, cur, bool(a.trim))
+    n_reach, n_rest, n_rdrop = apply_reach(a.name, res, plan, cur, float(a.reach_to or 0), a.reach_lo)
     os.makedirs(os.path.dirname(mp), exist_ok=True)
     with open(mp + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(cur, fh, indent=0, sort_keys=True)
     os.replace(mp + ".tmp", mp)
     print(f"WROTE {mp}: {n_up} up, {n_off} off, {n_down} trimmed, {n_back} trim(s) given back "
-          f"({sum(1 for v in cur.values() if v > 0)} sized, {sum(1 for v in cur.values() if v == 0)} off in the file)")
+          f"({sum(1 for v in cur.values() if v > 0)} sized, {sum(1 for v in cur.values() if v == 0)} off in the file)"
+          + (f"; tier reach: {n_reach} given, {n_rest} back from off, {n_rdrop} dropped"
+             if a.reach_to or n_rdrop else ""))
     if getattr(a, "no_run", False):
         # pass_resize: the 15-min pass holds this wave's lock and tunes it next, so no setarg
         # (it would wait on that lock) and no second run
@@ -739,7 +902,9 @@ def pass_resize(name: str, w: dict, now: "datetime | None" = None) -> int:
     --fair-file (the floor protocol needs a live fair); cmd_resize itself skips within 15
     min of a bot restart and on a stale dashboard read. Never above 5x; an off stays off.
     With the wave's floor "trim" on, a market over its target comes down to it (TRIM in the
-    module docstring); with it off, the trims it made are given back."""
+    module docstring); with it off, the trims it made are given back. With its floor
+    "tier_to" set (and --tier-file in its tune), a market the multiple can't take to the aim
+    gets the last cheap tier out to tier_to c (TIER REACH)."""
     now = now or datetime.now(timezone.utc)
     tune = w.get("tune") or []
     if not pw._vals(tune, "--size-mult-file"):
@@ -750,10 +915,12 @@ def pass_resize(name: str, w: dict, now: "datetime | None" = None) -> int:
         print(f"    skipped: {why} (the floor protocol needs a live fair)")
         return 0
     fl = w.get("floor") if isinstance(w.get("floor"), dict) else {}
+    reach_to, reach_lo = reach_of(w)
     a = argparse.Namespace(name=name, aim=float(fl.get("aim", 1.20)),
                            max_mult=min(FLOOR_MAX_MULT, float(fl.get("max_mult", FLOOR_MAX_MULT))),
                            real=0.65, window_min=60.0, keep_within=0.05, no_off=False, json=None,
-                           apply=True, force=False, no_run=True, trim=bool(fl.get("trim")))
+                           apply=True, force=False, no_run=True, trim=bool(fl.get("trim")),
+                           reach_to=reach_to, reach_lo=reach_lo)
     return cmd_resize(a)
 
 

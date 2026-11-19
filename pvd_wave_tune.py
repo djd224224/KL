@@ -75,6 +75,13 @@ after --since, series in --series), idempotently:
                      --size-mult (base, bank and kept sizes; the cheap tiers multiply it),
                      so dropping a ticker from the file scales it back. X = 0 is OFF:
                      pinned at 0 a side (only a position's closing order rests). Unreadable: x1.
+  --tier-file PATH   PER-MARKET TIER REACH (Jack 2026-11-19, on the FX walls stepping past
+                     the 15c tier: "Up to 25c on cheap tier multiplier if needed"): PATH =
+                     {"to": C, "markets": {ticker: ...}}. A side of a market in it that no
+                     tier fits but costs <= C c a contract rests the LAST --cheap-tiers
+                     multiple (FX: x5) too. pvd_wave_pace's floor check writes it, only
+                     for a market its multiple alone can't take to the aim. Missing or
+                     unreadable: no reach.
   --fair-file PATH   FAIR LIMITS (Jack 2026-11-13, the after-economic-events FX + metals
                      wave: "Are there Fair value calculated on these markets?" -> "1",
                      stand down the wrong-side quotes and build a fair). PATH =
@@ -249,6 +256,9 @@ def main() -> int:
                     help="a side whose touch jumped this c+ toward the taker since the last run keeps its limit (0 = off)")
     ap.add_argument("--size-mult-file",
                     help="{ticker: X}: that market's sizes are --size-mult x X (applied once per entry)")
+    ap.add_argument("--tier-file",
+                    help='{"to": C, "markets": {ticker: ...}}: a side of a market in it that no tier fits but '
+                         "costs <= C c rests the last --cheap-tiers multiple (the floor check's per-market reach)")
     ap.add_argument("--fair-file",
                     help='{"fair": {ticker: cents}, "margin": {series: c}, "valid_until": ISO}: after the '
                          "re-anchor, bid limit <= fair - margin and ask limit >= fair + margin (see the docstring)")
@@ -324,6 +334,20 @@ def main() -> int:
         except (OSError, ValueError, TypeError, AttributeError) as ex:
             tmult_why = f"; size-mult file unreadable ({ex}): x1"
             tmult = {}
+    # PER-MARKET TIER REACH (--tier-file, Jack 2026-11-19: "Up to 25c on cheap tier multiplier if
+    # needed"): {ticker: C} -- that market's sides past every tier but costing <= C c rest the
+    # last tier's multiple. No file yet (nothing granted) = none
+    tier_ext, tier_why = {}, ""
+    if a.tier_file and os.path.exists(a.tier_file):
+        try:
+            with open(a.tier_file, encoding="utf-8") as fh:
+                _td = json.load(fh) or {}
+            _to = float(_td.get("to") or 0)
+            if _to > 0:
+                tier_ext = {str(k): _to for k in (_td.get("markets") or {})}
+        except (OSError, ValueError, TypeError, AttributeError) as ex:
+            tier_why = f"; tier file unreadable ({ex}): no reach"
+            tier_ext = {}
     # FAIR LIMITS (--fair-file): None = off; {} = on with no usable fair (floors only)
     fair_map, fair_base, fair_extra, fair_why = None, {}, {}, ""
     fair_floor = a.fair_floor
@@ -405,6 +429,7 @@ def main() -> int:
     try:
         cur = json.load(open(LIST, encoding="utf-8"))
         n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = n_cheap = n_follow = n_scaled = n_pin = n_capped = n_touch = n_wadd = 0
+        n_reach_sides, reach_mk = 0, set()
         n_pause = n_pause_off = n_pause_unw = 0
         n_fair = n_fair_none = 0
         # the bank sizes, set here too: a run with no unpinned live entry never reaches
@@ -724,7 +749,7 @@ def main() -> int:
                 yb, ya, _lp = touch[t]
                 sz = int(e.get("size") or 0)
                 cost = {"bid_size": yb if yb > 0 else None, "ask_size": 100 - ya if 0 < ya < 100 else None}
-                mult = {}
+                mult, reach = {}, set()
                 for k, c in cost.items():
                     if c is not None:
                         # a series' own tier first (--series-tier), then the general ones
@@ -732,6 +757,16 @@ def main() -> int:
                             if c <= cpx:
                                 mult[k] = cm
                                 break
+                        else:
+                            # ...then this market's own reach (--tier-file): the last general
+                            # tier's multiple out to its C (Jack 2026-11-19: "Up to 25c on
+                            # cheap tier multiplier if needed")
+                            if tiers and c <= tier_ext.get(t, 0.0):
+                                mult[k] = tiers[-1][1]
+                                reach.add(k)
+                if reach:
+                    reach_mk.add(t)
+                    n_reach_sides += len(reach)
                 # SIDE CAP (--side-cap SERIES:C:N, Jack 2026-11-07 on the House sweep: "its ok to
                 # quote if it's 5c of cash held but not if its 95c of cash held"): a side of SERIES
                 # whose fill ties up >= C c a contract rests N (0 = off since 1b58188). With
@@ -762,7 +797,9 @@ def main() -> int:
                     e["cheap"] = (f"{stamp}: touch {yb:g}x{ya:g} -> "
                                   + (", ".join(f"{k.split('_')[0]} {e.get(k, e.get('size'))} "
                                                + ((f"(cap: {capwhy[k]})" if k in capwhy else f"(cap: {cost[k]:g}c a contract)")
-                                                  if k in capk else f"(x{mult[k]:g})")
+                                                  if k in capk else
+                                                  f"(x{mult[k]:g}" + (f", tier to {tier_ext[t]:g}c" if k in reach else "")
+                                                  + ")")
                                                for k in sorted(now_c)) or "none cheap")
                                   + f" {a.note}").strip()
             # PAUSE AT (--pause-at SERIES:C, Jack 2026-11-07 on the House sweep: "fine to quote
@@ -834,6 +871,11 @@ def main() -> int:
             msg += (f"; cheap sides ({', '.join(f'<= {c:g}c x{m:g}' for c, m in tiers)}"
                     + "".join(f"; {ss} {sd.split('_')[0]} " + ", ".join(f"<= {c:g}c x{m:g}" for c, m in v)
                               for (ss, sd), v in sorted(stiers.items())) + f"): {n_cheap} re-sized")
+        if a.tier_file:
+            msg += (f"; tier reach (--tier-file): {len(tier_ext)} markets"
+                    + (f" out to {next(iter(tier_ext.values())):g}c" if tier_ext else "")
+                    + f", {n_reach_sides} side(s) of {len(reach_mk)} at x{tiers[-1][1]:g} by it" if tiers else
+                    "; tier reach (--tier-file): no --cheap-tiers to reach with") + tier_why
         if a.flip_through:
             msg += f"; flip-through: {n_flip} set"
         if a.wave_added:

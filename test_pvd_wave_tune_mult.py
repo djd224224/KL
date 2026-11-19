@@ -103,6 +103,82 @@ class TickerMultTests(unittest.TestCase):
         self.assertEqual(L[A]["size"], 200)
 
 
+class TierReachTests(unittest.TestCase):
+    """--tier-file (Jack 2026-11-19, the FX walls past the 15c tier: "Up to 25c on cheap tier
+    multiplier if needed"): a market in it rests the last tier's multiple out to its C."""
+    TIERS = ("--cheap-tiers", "2:10,5:5,15:5")
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.lst = os.path.join(self.d, "list.json")
+        ents = {}
+        for t in (A, B):
+            e = entry(size=300)
+            e.pop("bid_size")
+            ents[t] = e
+        json.dump({"markets": ents}, open(self.lst, "w"))
+        self.tf = os.path.join(self.d, "tier.json")
+        self.touch = {A: (21.0, 96.0, 0.0), B: (21.0, 96.0, 0.0)}
+
+    def tier(self, d):
+        with open(self.tf, "w") as fh:
+            fh.write(d if isinstance(d, str) else json.dumps(d))
+
+    def run_tune(self, extra=()):
+        mod = load()
+        mod.LIST, mod.LOCK = self.lst, os.path.join(self.d, "scan.lock")
+        mod.read_touches = lambda ts_: (dict(self.touch), 0)
+        old, sys.argv = sys.argv, ["x", "--series", "KXGOLDEVENT", "--since", "2026-11-13T17:30:00Z", "--write",
+                                   *self.TIERS, *extra]
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                self.assertEqual(mod.main(), 0)
+        finally:
+            sys.argv = old
+        with open(self.lst) as fh:
+            return json.load(fh)["markets"], buf.getvalue()
+
+    def test_only_a_market_in_the_file_reaches_past_the_last_tier(self):
+        self.tier({"to": 25, "markets": {A: {"why": "x"}}})
+        L, out = self.run_tune(("--tier-file", self.tf))
+        self.assertEqual((L[A]["bid_size"], L[A]["ask_size"]), (1500, 1500))     # 21c bid x5 by the reach
+        self.assertIn("bid 1500 (x5, tier to 25c)", L[A]["cheap"])
+        self.assertIn("ask 1500 (x5)", L[A]["cheap"])
+        self.assertEqual(L[B]["ask_size"], 1500)                                 # 4c ask: the 5c tier
+        self.assertNotIn("bid_size", L[B])                                       # 21c bid: the size, 300
+        self.assertIn("tier reach (--tier-file): 1 markets out to 25c, 1 side(s) of 1 at x5 by it", out)
+
+    def test_never_past_its_c_and_back_to_the_size_when_it_goes(self):
+        self.tier({"to": 25, "markets": {A: {}}})
+        self.touch[A] = (27.0, 96.0, 0.0)
+        L, _ = self.run_tune(("--tier-file", self.tf))
+        self.assertNotIn("bid_size", L[A])                                       # 27c: past the reach
+        self.touch[A] = (21.0, 96.0, 0.0)
+        L, _ = self.run_tune(("--tier-file", self.tf))
+        self.assertEqual(L[A]["bid_size"], 1500)
+        self.tier({"to": 25, "markets": {}})                                     # the reach went
+        L, _ = self.run_tune(("--tier-file", self.tf))
+        self.assertNotIn("bid_size", L[A])
+        self.assertEqual(L[A]["ask_size"], 1500)
+
+    def test_no_reach_without_the_flag_a_file_a_c_or_a_tier(self):
+        self.tier({"to": 25, "markets": {A: {}}})
+        L, _ = self.run_tune()                                                   # no --tier-file
+        self.assertNotIn("bid_size", L[A])
+        self.tier({"to": 0, "markets": {A: {}}})                                 # "to" 0: off
+        L, _ = self.run_tune(("--tier-file", self.tf))
+        self.assertNotIn("bid_size", L[A])
+        os.remove(self.tf)                                                       # nothing granted yet
+        L, out = self.run_tune(("--tier-file", self.tf))
+        self.assertNotIn("bid_size", L[A])
+        self.assertIn("tier reach (--tier-file): 0 markets", out)
+        self.tier("{not json")
+        L, out = self.run_tune(("--tier-file", self.tf))
+        self.assertNotIn("bid_size", L[A])
+        self.assertIn("tier file unreadable", out)
+
+
 
 if __name__ == "__main__":
     unittest.main()
