@@ -191,6 +191,14 @@ class Verdicts(unittest.TestCase):
         self.assertGreater(run(rows, FakeBot(allowed={"KXGOODS"},
                                              est={"KXGOODS-26DEC01-T1": 5.0}))["books"], 0)
 
+    def test_every_reload_is_a_bot_loader_and_the_writers_series_lists_load(self):
+        # 2026-11-20: KXSNOWTHANKSGIVING read "not allowlisted" here while the
+        # bot had it from the weekend writer's day_series
+        for name in up._RELOADS:
+            self.assertTrue(callable(getattr(imm, name, None)), name)
+        for name in ("load_rain_wknd", "load_snow_days", "load_resort_snow", "load_hight_fair"):
+            self.assertIn(name, up._RELOADS)
+
 
 class EmailSection(unittest.TestCase):
     def _ctx(self, upcoming):

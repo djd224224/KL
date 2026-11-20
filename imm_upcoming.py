@@ -100,7 +100,12 @@ _RELOADS = ("load_file_event_overrides", "load_extra_allow_series",
             "load_awards_extra_series", "load_graduate_auto_series",
             "load_mention_auto_series", "load_politics_auto_series",
             "load_election_dates_extra", "load_awards_dates_extra",
-            "load_family_verdicts")
+            "load_family_verdicts",
+            # the fair writers' files whose series lists are allowlists too
+            # (2026-11-20, KXSNOWTHANKSGIVING read "not allowlisted" here
+            # while the bot had it): the rain/snow day series, the auto
+            # snow-day counts, the mapped resorts, the KXHIGH cities
+            "load_rain_wknd", "load_snow_days", "load_resort_snow", "load_hight_fair")
 
 
 def hot_reload() -> None:
