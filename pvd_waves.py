@@ -71,6 +71,10 @@ PICK-OFF GATES (Jack 2026-11-08: "the pickoffs yesterday were unacceptable"; the
              registry-wave market (or a tripped series) at the wave's base size
              (Jack 11/07: "scale it down to base contract sizes") and re-tunes it
              now; legacy waves are reported for a hand edit. Exit 3 = new ones.
+             ROUND TRIPS (Jack 11/20): a wave market whose positions opened AND
+             closed inside 24 h net -$25 or worse (closes matched LIFO at our fill
+             prices) alerts too -- the losing leg is the closing fill, which the
+             mark above never sees (AZ Kelly). Alert only; --rt-usd 0 = off.
 """
 from __future__ import annotations
 
@@ -2141,6 +2145,107 @@ def pickoff_scan(a, reg: dict) -> dict:
             "params": {"min_c": a.min_c, "min_usd": a.min_usd, "series_trip": a.series_trip}}
 
 
+# ROUND TRIPS (Jack 2026-11-20: "Yes, add it" to "Also alert on a market's round-trip losses
+# ($25+ in 24h)?"). KXDPRESPRIMARY-28AZ-MKEL lost ~$79 in four round trips 11/19-11/20 and the
+# pick-off check above never flagged it: it marks only the ADDING fill (4.6c and ~$9 against
+# us, under its 5c / $25 bar) and the money went on the CLOSING fill (bought 750 @12, sold @5.2:
+# -$51). A round trip = a position opened AND closed again inside the window; each closing fill
+# is matched to the newest open lot (LIFO), at our own fill prices, and a lot held from before
+# the window never counts (closing old inventory at a loss is an unwind, not a round trip: the
+# House-night positions). A wave market whose round trips net -$25 or worse alerts (text and
+# email), again only once its loss grows by another $25 or a day later. It never acts: turning
+# a market off stays Jack's word. Off: --rt-usd 0 or PVD_RT_USD=0. Before fees (none logged).
+RT_HOURS = 24.0
+RT_USD = float(os.environ.get("PVD_RT_USD", "25") or 0)
+
+
+def roundtrip_legs(fills: list, t0: float) -> dict:
+    """{ticker: [leg]} from fills in the bot's log order (its position chain; a second's
+    fills can be logged out of ts order). Each closing fill is matched LIFO against the lots
+    that opened the position; a leg counts only when its lot opened at or after t0. What a
+    market held before its first fill here (pos_before, or a break in the chain) is a lot
+    from before the window. Prices are YES cents: a long lot gains (close - open)."""
+    lots: dict = {}
+    pos: dict = {}
+    out: dict = {}
+    for r in fills:
+        t = r.get("ticker") or ""
+        try:
+            pb, pa = float(r.get("pos_before") or 0), float(r.get("pos_after") or 0)
+            px = float(r.get("yes_price_cents"))
+            ts = float(r.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if t not in pos or abs(pos[t] - pb) > 1e-6:
+            lots[t] = [[pb, float(r.get("avg_before") or 0), float("-inf")]] if abs(pb) > 1e-9 else []
+        stack, rem = lots[t], pa - pb
+        while abs(rem) > 1e-9 and stack and stack[-1][0] * rem < 0:
+            q, opx, ots = stack[-1]
+            m = min(abs(q), abs(rem))
+            if ots >= t0:
+                out.setdefault(t, []).append({
+                    "dir": "long" if q > 0 else "short", "contracts": m, "open_c": round(opx, 2),
+                    "close_c": round(px, 2), "opened": ots, "closed": ts,
+                    "usd": round(((px - opx) if q > 0 else (opx - px)) * m / 100.0, 2)})
+            stack[-1][0] = q - m if q > 0 else q + m
+            rem = rem + m if rem < 0 else rem - m
+            if abs(stack[-1][0]) <= 1e-9:
+                stack.pop()
+        if abs(rem) > 1e-9:
+            stack.append([rem, px, ts])
+        pos[t] = pa
+    return out
+
+
+def roundtrip_scan(a, reg: dict) -> dict:
+    """Wave markets whose round trips in the last --rt-hours net -$--rt-usd or worse."""
+    now = datetime.now(timezone.utc)
+    hours = float(getattr(a, "rt_hours", RT_HOURS))
+    bar = float(getattr(a, "rt_usd", RT_USD))
+    t0 = now.timestamp() - hours * 3600.0
+    res = {"hours": hours, "min_usd": bar, "rows": [], "flagged": [], "flagged_usd": 0.0, "off": bar <= 0}
+    if bar <= 0:
+        return res
+    try:
+        with open(LIST, encoding="utf-8") as fh:
+            L = json.load(fh).get("markets") or {}
+    except (OSError, ValueError):
+        L = {}
+    legacy = legacy_series()
+    waves: dict = {}
+    fills = []
+    for r in fills_since(t0):
+        t = r.get("ticker") or ""
+        if t not in waves:
+            waves[t] = wave_of(t, reg, L, legacy)
+        wave = waves[t][0]
+        if wave is None or (a.name not in (None, "all") and wave != a.name):
+            continue
+        fills.append(r)
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            pos_now = (json.load(fh) or {}).get("own_pos") or {}
+    except (OSError, ValueError):
+        pos_now = {}
+
+    def iso(x):
+        return datetime.fromtimestamp(x, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for t, legs in sorted(roundtrip_legs(fills, t0).items()):
+        net = round(sum(g["usd"] for g in legs), 2)
+        for g in legs:
+            g["opened"], g["closed"] = iso(g["opened"]), iso(g["closed"])
+        row = {"ticker": t, "series": t.split("-")[0], "wave": waves[t][0], "registry": waves[t][1],
+               "net_usd": net, "lost_usd": round(sum(g["usd"] for g in legs if g["usd"] < 0), 2),
+               "legs": len(legs), "contracts": sum(g["contracts"] for g in legs),
+               "first": min(g["opened"] for g in legs), "last": max(g["closed"] for g in legs),
+               "pos_now": float(pos_now.get(t, 0.0)),
+               "worst": sorted(legs, key=lambda g: g["usd"])[:3], "flag": net <= -bar}
+        res["rows"].append(row)
+    res["flagged"] = [g for g in res["rows"] if g["flag"]]
+    res["flagged_usd"] = round(-sum(g["net_usd"] for g in res["flagged"]), 2)
+    return res
+
+
 def _base_size(w: dict, series: str) -> int:
     if series in (w.get("near") or []) and series not in (w.get("series") or []):
         return int((w.get("near_scan") or {}).get("live", 80))
@@ -2160,6 +2265,15 @@ def cmd_pickoffs(a) -> int:
     new = [g for g in res["flagged"] if f"{g['ticker']}|{g['side']}|{g['fill_ids'][0]}" not in alerted]
     res["new"] = new
     res["acted"] = []
+    # round trips: a market alerts once, then again when its net loss grows by another bar
+    # or its last alert is a window old (the legs it alerted on have left the window by then)
+    rt = roundtrip_scan(a, reg)
+    rt_alerted = st.get("rt_alerted") or {}
+    rt_cut = (datetime.now(timezone.utc) - timedelta(hours=rt["hours"])).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rt["new"] = [g for g in rt["flagged"]
+                 if g["ticker"] not in rt_alerted or rt_alerted[g["ticker"]]["at"] < rt_cut
+                 or g["net_usd"] <= float(rt_alerted[g["ticker"]]["usd"]) - rt["min_usd"]]
+    res["roundtrips"] = rt
     if a.act:
         touched, pending = set(), {}
         for g in new + res["flagged"]:
@@ -2235,6 +2349,22 @@ def cmd_pickoffs(a) -> int:
               f"{g['wave'][:28]}{'' if g['registry'] else ' [legacy]'}  {g['last'][11:16]}Z")
     for x in res["acted"]:
         print(f"  ACTED {x.get('ticker') or 'series ' + x['series']}: pinned at {x['pin']} a side in {x['wave']} ({x['why']})")
+    if rt["off"]:
+        print("round trips: off (--rt-usd 0 / PVD_RT_USD=0)")
+    else:
+        print(f"round trips (last {rt['hours']:g} h, both legs inside it, closes matched LIFO at our fill prices): "
+              f"{len(rt['rows'])} wave markets closed one, net ${sum(g['net_usd'] for g in rt['rows']):+,.0f}; "
+              f"{len(rt['flagged'])} flagged (net -${rt['min_usd']:g} or worse), -${rt['flagged_usd']:,.0f}; "
+              f"{len(rt['new'])} new")
+        for g in sorted(rt["rows"], key=lambda x: x["net_usd"])[:a.top]:
+            if g["net_usd"] >= 0 and not g["flag"]:
+                break
+            w0 = g["worst"][0]
+            print(f"  {'RTLOSS ' if g['flag'] else '       '} {g['ticker']:38} {g['legs']} closed, "
+                  f"{g['contracts']:>7,.0f} ct, net -${-g['net_usd']:,.0f}  worst: {w0['dir']} "
+                  f"{w0['contracts']:,.0f} @{w0['open_c']:g} -> {w0['close_c']:g} (-${-w0['usd']:,.0f}, "
+                  f"closed {w0['closed'][11:16]}Z)  held {g['pos_now']:+,.0f}  {g['wave'][:28]}"
+                  f"{'' if g['registry'] else ' [legacy]'}")
     legacy_flagged = [g for g in res["flagged"] if not g["registry"]]
     if legacy_flagged:
         print(f"  {len(legacy_flagged)} flagged market(s) on legacy waves: stand them down by hand "
@@ -2242,8 +2372,11 @@ def cmd_pickoffs(a) -> int:
     if a.update_state:
         for g in res["flagged"]:
             alerted.setdefault(f"{g['ticker']}|{g['side']}|{g['fill_ids'][0]}", res["at"])
+        for g in rt["new"]:
+            rt_alerted[g["ticker"]] = {"at": res["at"], "usd": g["net_usd"]}
         cut = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        st = {"alerted": {k: v for k, v in alerted.items() if v >= cut}, "acted": acted, "last": res["at"]}
+        st = {"alerted": {k: v for k, v in alerted.items() if v >= cut}, "acted": acted, "last": res["at"],
+              "rt_alerted": {k: v for k, v in rt_alerted.items() if v["at"] >= cut}}
         os.makedirs(os.path.dirname(PICK_STATE), exist_ok=True)
         with open(PICK_STATE + ".tmp", "w", encoding="utf-8") as fh:
             json.dump(st, fh, indent=1)
@@ -2251,7 +2384,7 @@ def cmd_pickoffs(a) -> int:
     if a.json:
         with open(a.json, "w", encoding="utf-8") as fh:
             json.dump(res, fh, indent=1)
-    return 3 if (new or res["acted"]) else 0
+    return 3 if (new or res["acted"] or rt["new"]) else 0
 
 
 # ---------------------------------------------------------------------------
@@ -2806,6 +2939,10 @@ def main() -> int:
                    help="a book wider than this (c) is marked at its outside touch facing the fill, not its mid")
     x.add_argument("--act", action="store_true",
                    help="pin each flagged registry-wave market (and tripped series) at the wave's base size, re-tune now")
+    x.add_argument("--rt-hours", type=float, default=RT_HOURS,
+                   help="round trips: both legs inside this window (default 24)")
+    x.add_argument("--rt-usd", type=float, default=RT_USD,
+                   help="round trips: a market netting this much lost alerts (default 25, PVD_RT_USD; 0 = off)")
     x.add_argument("--update-state", action="store_true")
     x.add_argument("--top", type=int, default=15)
     x.add_argument("--json")

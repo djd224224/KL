@@ -159,6 +159,47 @@ class PickoffAlertTests(unittest.TestCase):
              "series_trips": [], "flagged_usd": 439.19}
         self.assertIn("@40 filled 2:08-2:44 PM ET (last 17 min ago), mark", wa.pickoff_msg(r)[0])
 
+    RT = {"ticker": "KXDPRESPRIMARY-28AZ-MKEL", "wave": "w1111-elec2028", "registry": True, "net_usd": -61.2,
+          "legs": 2, "contracts": 950.0, "first": "2026-11-19T04:01:00Z", "last": "2026-11-19T05:32:17Z",
+          "pos_now": 0.0, "worst": [{"dir": "long", "contracts": 750.0, "open_c": 12.0, "close_c": 5.2, "usd": -51.0},
+                                    {"dir": "short", "contracts": 200.0, "open_c": 5.9, "close_c": 11.0, "usd": -10.2}]}
+
+    def test_round_trips_alone(self):
+        """Jack 2026-11-20 "Yes, add it": a market's round trips netting $25+ lost in 24 h
+        alert on their own, with the closing leg's prices; old pick-offs aren't re-listed."""
+        rt = {"hours": 24, "min_usd": 25, "flagged": [self.RT], "new": [self.RT], "flagged_usd": 61.2}
+        r = {"at": "2026-11-19T05:45:00Z", "hours": 6, "flagged": [self.ROW], "new": [], "acted": [],
+             "series_trips": [], "flagged_usd": 439.19, "roundtrips": rt}
+        text, push, subject, body, do_text = wa.pickoff_msg(r)
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "ROUND TRIPS: 1 wave mkt -$61 new (1 flagged, -$61 in 24h)")
+        self.assertIn("opened AND closed again inside 24h", lines[1])
+        self.assertIn("your word", lines[1])
+        self.assertIn("r1. KXDPRESPRIMARY-28AZ-MKEL net -$61 in 2 closed legs filled 11:01 PM-12:32 AM ET", text)
+        self.assertIn("worst bought 750 @12, sold @5.2 (-$51); sold 200 @5.9, bought back @11 (-$10)", text)
+        self.assertNotIn("x1.", text)                                  # the old pick-off isn't news
+        self.assertIn("turn off <TICKER>", body)
+        self.assertTrue(do_text)
+        self.assertLessEqual(len(text), wa.TEXT_CHARS)
+
+    def test_round_trips_with_a_pickoff(self):
+        rt = {"hours": 24, "min_usd": 25, "flagged": [self.RT], "new": [self.RT], "flagged_usd": 61.2}
+        r = {"at": "2026-11-08T05:10:00Z", "hours": 6, "flagged": [self.ROW], "new": [self.ROW], "acted": [],
+             "series_trips": [], "flagged_usd": 439.19, "roundtrips": rt}
+        text = wa.pickoff_msg(r)[0]
+        self.assertTrue(text.startswith("PICK-OFF: 1 wave mkt -$439 new"))
+        self.assertIn("\nROUND TRIPS: 1 wave mkt -$61 new (1 flagged, -$61 in 24h); why: positions opened", text)
+        self.assertIn("x1. KXHOUSERACE-IN04-28-D", text)
+        self.assertIn("r1. KXDPRESPRIMARY-28AZ-MKEL", text)
+
+    def test_small_round_trips_email_only(self):
+        row = dict(self.RT, net_usd=-20.0)
+        rt = {"hours": 24, "min_usd": 10, "flagged": [row], "new": [row], "flagged_usd": 20.0}
+        r = {"hours": 6, "flagged": [], "new": [], "acted": [], "series_trips": [], "flagged_usd": 0, "roundtrips": rt}
+        self.assertFalse(wa.pickoff_msg(r)[4])
+        r["roundtrips"] = dict(rt, new=[])                             # nothing new, nothing texted
+        self.assertFalse(wa.pickoff_msg(r)[4])
+
     def test_et_clock_summer_and_winter(self):
         from datetime import datetime, timezone
         self.assertEqual(wa.et_clock(datetime(2026, 7, 4, 16, 5, tzinfo=timezone.utc)), "12:05 PM")
