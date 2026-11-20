@@ -18528,14 +18528,39 @@ _rain_wknd_state: dict = {"mtime": 0.0, "markets": {}, "events": {},
 # while the weekend family has them, out of the size test, and its cutoff at
 # 00:00 ET of its window's first day as the writer read it from the rules.
 # IMM_RAIN_DAY_AUTO=0 keeps only the named RAIN_DAY_SERIES.
+# SNOW DAYS (Jack 2026-11-20: "KXSNOWTHANKSGIVING should quote"; 11/14:
+# "rain/snow markets generally should have fair value calculations and
+# auto-quoted when they come online"). The writer reads unclaimed snow series
+# too, and one on the snow contract -- a market per city, any new snow at a
+# named station over a named day, A TRACE COUNTING YES (KXSNOWTHANKSGIVING-
+# 26NOV26-DTW: "total new snowfall in Detroit (KDTW) on November 26, 2026 is
+# strictly greater than 0 inches, including a reported trace") -- lands in
+# "day_series" with kind "snow" and joins this family the same way, priced
+# on the writer's SNOW MODEL (the NBE's snow probabilities and PoPs, the cold
+# and the station's trace-or-more base rate). The writer's side switch is
+# IMM_SNOW_DAY_AUTO=0 (no snow series read; a joined one leaves the file at
+# its next discovery pass); the bot's skip keeps its own snow families out.
+# NO FAIR LEAD (SNOW_DAY_LEAD off): the snow model was scored on three winters
+# of station outcomes, never against a Kalshi book (the series' first year),
+# and a trace is a noisier outcome than 0.01 in of rain, so a snow day joins
+# the touch with the 10c band through its fair capping that side, and leads
+# nothing (no FAIR CLOSE either) until IMM_SNOW_DAY_LEAD=1.
 RAIN_DAY_AUTO = os.environ.get("IMM_RAIN_DAY_AUTO", "1") == "1"
+SNOW_DAY_LEAD = os.environ.get("IMM_SNOW_DAY_LEAD", "0") == "1"
 
 
 def rain_day_series(series: str) -> bool:
     """A one-day / span rain series: RAIN_DAY_SERIES by name, or one the
-    weekend writer found on its contract (AUTO DAY SERIES)."""
+    weekend writer found on its contract (AUTO DAY SERIES) -- a snow one
+    included (SNOW DAYS)."""
     return series in RAIN_DAY_SERIES or (
         RAIN_DAY_AUTO and series in _rain_wknd_state["day_series"])
+
+
+def snow_day_series(series: str) -> bool:
+    """A day series the weekend writer found on the snow contract (SNOW DAYS)."""
+    return rain_day_series(series) and (
+        _rain_wknd_state["day_series"].get(series) or {}).get("kind") == "snow"
 
 
 def rain_wknd_series(series: str) -> bool:
@@ -18564,8 +18589,8 @@ def _load_rain_day_meta() -> None:
     for s in sorted(set(auto) - set(_rain_wknd_state["day_series"])):
         if s not in SERIES_OVERRIDES and "KXRAINWKND" in SERIES_OVERRIDES:
             SERIES_OVERRIDES[s] = SERIES_OVERRIDES["KXRAINWKND"]
-        log(f"[IMM] rain day {s}: joins the weekend family on its contract "
-            f"(e.g. {auto[s].get('sample')})")
+        log(f"[IMM] {'snow' if auto[s].get('kind') == 'snow' else 'rain'} day {s}: "
+            f"joins the weekend family on its contract (e.g. {auto[s].get('sample')})")
     _rain_wknd_state["day_series"] = auto
     _rain_wknd_state["open_events"] = {
         str(ev): {"sat": e.get("sat"), "days": e.get("days")}
@@ -18577,6 +18602,7 @@ def rain_wknd_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                    ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
     s = ticker.split("-")[0]
     label = ("election-day rain" if s in RAIN_DAY_SERIES
+             else "snow-day" if snow_day_series(s)
              else "rain-day" if rain_day_series(s) else "weekend rain")
     return simple_fair_gate(_rain_wknd_state, ticker, now_ts, ext_bid, ext_ask,
                             tol=RAIN_WKND_TOL_CENTS, ttl_min=RAIN_WKND_TTL_MIN,
@@ -28397,7 +28423,8 @@ def in_fair_lead_series(series: str) -> bool:
     discovered Vercel series while the family's base leads, and the crypto
     event strikes (CRYPTO_EVENT_LEAD)."""
     return series in FAIR_LEAD_SERIES or (
-        "KXRAINWKND" in FAIR_LEAD_SERIES and rain_day_series(series)) \
+        "KXRAINWKND" in FAIR_LEAD_SERIES and rain_day_series(series)
+        and (SNOW_DAY_LEAD or not snow_day_series(series))) \
         or ca_array_lead_series(series) \
         or (HOME_AUTO_LEAD and home_auto_allowed(series)) \
         or (vercel_series(series) and any(s in FAIR_LEAD_SERIES for s in VERCEL_BASE_SERIES)) \
@@ -28463,6 +28490,7 @@ def fair_model_label(series: str) -> str:
     """How the logs name a fair-lead family's model."""
     if rain_wknd_series(series):
         return ("the election-day rain fair" if series in RAIN_DAY_SERIES
+                else "the snow-day fair" if snow_day_series(series)
                 else "the rain-day fair" if rain_day_series(series)
                 else "the weekend rain fair")
     if vercel_series(series):
@@ -48053,13 +48081,18 @@ class IncentiveMarketMaker:
                     delay = max(60, RAIN_WKND_REFRESH_SECS)
                     try:
                         # the bot's other rain families stay theirs (AUTO
-                        # DAY SERIES reads only the rain series none claims)
+                        # DAY SERIES reads only the rain series none claims),
+                        # and its snow families too (SNOW DAYS, 2026-11-20)
                         ok, miss = rain_wknd_fair.write_fair_file(
                             RAIN_WKND_FILE, get_json=kalshi_get,
                             skip=lambda s: (rain_daily_city_series(s)
                                             or rain_monthly_series(s)
                                             or rain_period_member(s)
-                                            or bool(_RAIN_MONTHLY_NAME_RE.fullmatch(s))))
+                                            or bool(_RAIN_MONTHLY_NAME_RE.fullmatch(s))
+                                            or snow_monthly_series(s)
+                                            or snow_days_series(s)
+                                            or resort_snow_candidate(s)
+                                            or bigsky_series(s)))
                         if last != (ok, miss):
                             log(f"{self.tag} rain-wknd refresh: {ok} markets "
                                 f"with a fair"

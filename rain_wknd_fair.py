@@ -62,6 +62,23 @@ Kalshi writes either way round). The file's "day_series" names it for the
 bot; a series that is not the contract waits DAY_RETRY_SECS before it is read
 again ("day_rejected", with why).
 
+SNOW DAYS (Jack 2026-11-20: "KXSNOWTHANKSGIVING should quote"; 11/14: "rain/
+snow markets generally should have fair value calculations and auto-quoted
+when they come online"). KXSNOWTHANKSGIVING-26NOV26-<CODE> ("If the total new
+snowfall in Detroit (KDTW) on November 26, 2026 is strictly greater than 0
+inches, including a reported trace, then the market resolves to Yes"; the
+same Weather Company source, the station's local reporting day) is this
+family's contract on snow: a series named for snow that no bot family claims
+joins the AUTO DAY SERIES when its markets are one per city, "total new
+snowfall", "strictly greater than 0 inches" and a trace counting YES, over a
+named day or a span of up to MAX_SPAN_DAYS. Its "day_series" row and its
+event carry kind "snow", so the bot quotes it with the rain-day kit (out at
+00:00 ET of the window's first day, the 10c fair band, fail closed). Its
+fair is SNOW MODEL below, not the rain one: the NBE's 12-hour snow
+probabilities (psn) and PoPs (p12), the coldest NBE temperature inside the
+window and the station's trace-or-more base rate, fit on three winters of
+ACIS outcomes.
+
 Writes RAIN_WKND_FILE for incentive_mm: markets {ticker: {p, event,
 fetched_at, ...}} (the loader's shape) plus per-event info.
 
@@ -211,8 +228,8 @@ DAY_DISCOVER_SECS = EVENTS_TTL_SECS
 DAY_RETRY_SECS = 6 * 3600
 # bump when classify_day_markets / rules_span learn new wording: every
 # rejection an older one wrote is re-read at the next pass (2 = 2026-11-14,
-# "on <day> is")
-DAY_CLASSIFY_VERSION = 2
+# "on <day> is"; 3 = 2026-11-20, the snow contract: SNOW DAYS)
+DAY_CLASSIFY_VERSION = 3
 MAX_SPAN_DAYS = 3
 HTTP_TIMEOUT = 30
 USER_AGENT = "KL-IMM-rain-wknd-fair/1.0"
@@ -227,6 +244,11 @@ _ICAO_RE = re.compile(r"\(K([A-Z]{3})\)")
 _DAY_RE = re.compile(r"\b(?:in|on) ([A-Z][a-z]+ \d{1,2}, \d{4}) is\b")
 _CITY_SEG_RE = re.compile(r"[A-Z]{2,5}")
 _ZERO_RE = re.compile(r"total precipitation\b.*\bstrictly greater than 0 inches", re.I)
+# SNOW DAYS (see the docstring): the snow contract, where a trace counts YES
+SNOW_DAY_ENABLE = os.environ.get("IMM_SNOW_DAY_AUTO", "1") == "1"
+_SNOW_ZERO_RE = re.compile(r"total new snowfall\b.*\bstrictly greater than 0 inches", re.I)
+_SNOW_TRACE_RE = re.compile(r"including a (?:reported )?trace|\btrace\)? counts as "
+                            r"(?:above|greater than|more than) 0", re.I)
 
 
 def _log(msg: str) -> None:
@@ -399,6 +421,156 @@ def fetch_clim(sid: str, first: date, days: int) -> Tuple[float, int]:
     return got
 
 
+# ----------------------------------------------------------------------------
+# SNOW MODEL (SNOW DAYS, 2026-11-20). Over the NBE's 12-hour periods
+# overlapping the window, with overlap fractions f_i:
+#     Ps   = 1 - exp(sum f_i ln(1 - psn_i))     (the snow probabilities)
+#     Pp   = 1 - exp(sum f_i ln(1 - p12_i))     (the PoPs: any precipitation)
+#     cold = clip((40 - Tmin) / 10, -2, 3)       (Tmin: the coldest tmp / txn
+#                                                 of those periods, F)
+#     clim = the station's share of days with new snow, a trace counting, in
+#            the CLIM_YEARS years before, +-CLIM_HALF_DAYS days (ACIS)
+#     early = 1 when the window starts in October or November, else 0
+#     P    = logistic(a + b_ps logit(Ps) + b_clim logit(clim) + b_pp logit(Pp)
+#                     + b_cold cold + b_early early), the coefficients by lead
+# A trace is the hard part: flurries leave a "T" with no measurable
+# precipitation, so psn alone (a >= 0.01 in type probability) runs low on the
+# lake-effect stations and the climatology and the cold carry it. THE FIT
+# (2026-11-20): the NBE's 01Z/13Z runs (IEM archive) for the 21 Thanksgiving
+# stations, October-March of the 2023-24, 2024-25 and 2025-26 winters, every
+# station-day 0-144 h ahead of its local-standard day (lead from the run + 3
+# h), against ACIS daily snowfall (a "T" is new snow): 126,104 forecasts,
+# base rate 20.8%. Brier, leave-one-winter-out (the station's base rate /
+# the model):
+#     lead  0-24h  0.140 / 0.076     24-48h  0.141 / 0.083
+#          48-72h  0.142 / 0.090     72-96h  0.142 / 0.094    96-144h  0.143 / 0.105
+# and on the 11/15-12/05 days alone 0.144 / 0.085 inside a day to 0.144 /
+# 0.113 at 4-6 days. Without the early term the model ran low every
+# November (8.1% against 10.9% seen at 2-3 days; 18% against 21% on the late
+# November days); with it 20.1% against 20.9%. Calibrated within ~3 points
+# in every bin from 5% to 85%. Fails closed: no climatology, short periods
+# or a stale run is no fair.
+SNOW_FIT = ("NBE 01Z/13Z x 21 stations x Oct-Mar 2023-26 vs ACIS snow (T = yes), "
+            "126,104 forecasts; LOWO Brier clim 0.140-0.143 vs model 0.076 (0-24h) .. "
+            "0.105 (96-144h); late Nov 0.144 vs 0.085 .. 0.113")
+# (lead upper bound, hours, a, b_ps, b_clim, b_pp, b_cold, b_early)
+SNOW_RECAL = ((24, -0.758, 0.4784, 0.218, 0.2958, 1.1323, 0.5675),
+              (48, -0.6663, 0.4463, 0.3296, 0.2678, 1.125, 0.6703),
+              (72, -0.5347, 0.427, 0.445, 0.2351, 0.9811, 0.7771),
+              (96, -0.2951, 0.4891, 0.4115, 0.207, 0.8206, 0.8055),
+              (1e9, -0.2042, 0.517, 0.3706, 0.1993, 0.6995, 0.7278))
+
+
+def snow_day_value(v) -> Optional[int]:
+    """An ACIS daily snowfall -> 1 for new snow (a trace counts), 0 for none,
+    None when missing ('M', 'S', an accumulated 'A' total, unreadable)."""
+    s = str(v if v is not None else "").strip()
+    if s in ("T", "t"):
+        return 1
+    try:
+        return 1 if float(s) > 0 else 0
+    except ValueError:
+        return None
+
+
+def snow_climatology(daily: Dict[str, Optional[int]], first: date, days: int,
+                     years: int = CLIM_YEARS, half: int = CLIM_HALF_DAYS
+                     ) -> Optional[Tuple[float, int]]:
+    """(share of windows with new snow on any day, windows) -- climatology()
+    on snow, a trace counting; None under CLIM_MIN_WINDOWS windows."""
+    yes = n = 0
+    for back in range(1, years + 1):
+        try:
+            base = first.replace(year=first.year - back)
+        except ValueError:                       # Feb 29 in a common year
+            base = date(first.year - back, 2, 28)
+        for o in range(-half, half + 1):
+            d0 = base + timedelta(days=o)
+            vals = [daily.get((d0 + timedelta(days=k)).isoformat()) for k in range(days)]
+            if any(v is None for v in vals):
+                continue
+            n += 1
+            yes += any(vals)
+    return (yes / n, n) if n >= CLIM_MIN_WINDOWS else None
+
+
+def fetch_snow_clim(sid: str, first: date, days: int) -> Tuple[float, int]:
+    """(p, windows) from ACIS daily snowfall at `sid` (SNOW MODEL)."""
+    s = date(first.year - CLIM_YEARS - 1, 1, 1)
+    e = min(date(first.year - 1, 12, 31) + timedelta(days=CLIM_HALF_DAYS + days + 1),
+            datetime.now(timezone.utc).date() - timedelta(days=1))
+    rsp = requests.post(ACIS_URL, json={"sid": sid, "sdate": s.isoformat(),
+                                        "edate": e.isoformat(), "elems": [{"name": "snow"}]},
+                        timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
+    rsp.raise_for_status()
+    js = rsp.json()
+    if js.get("error"):
+        raise RuntimeError(f"ACIS {sid}: {str(js['error'])[:120]}")
+    daily = {str(d): snow_day_value(v) for d, v in js.get("data") or []}
+    got = snow_climatology(daily, first, days)
+    if got is None:
+        raise RuntimeError(f"ACIS {sid}: under {CLIM_MIN_WINDOWS} complete snow windows")
+    return got
+
+
+SnowPeriods = List[Tuple[datetime, Dict[str, Optional[float]]]]
+SNOW_FIELDS = ("p12", "psn", "tmp", "txn")
+
+
+def snow_day_inputs(periods: SnowPeriods, ws: datetime, we: datetime) -> Optional[dict]:
+    """{'ps', 'pp', 'tmin', 'coverage'} over the 12-hour periods (ending at
+    00Z / 12Z) overlapping [ws, we), else None (short of the window, or a
+    period without its snow probability or PoP)."""
+    pers = []
+    for ft, v in periods:
+        if ft.minute or ft.hour not in (0, 12):
+            continue
+        ov = (min(ft, we) - max(ft - timedelta(hours=12), ws)).total_seconds() / 43200.0
+        if ov > 0:
+            if v.get("psn") is None or v.get("p12") is None:
+                return None
+            pers.append((ov, v))
+    cov = sum(f for f, _ in pers)
+    half_days = round((we - ws).total_seconds() / 43200.0)
+    if not pers or cov < MIN_COVERAGE - (4 - half_days):
+        return None
+    ls = sum(f * math.log(max(1.0 - min(v["psn"], 0.995), 1e-6)) for f, v in pers)
+    lp = sum(f * math.log(max(1.0 - min(v["p12"], 0.995), 1e-6)) for f, v in pers)
+    temps = [v[k] for _f, v in pers for k in ("tmp", "txn") if v.get(k) is not None]
+    return {"ps": 1.0 - math.exp(ls), "pp": 1.0 - math.exp(lp),
+            "tmin": min(temps) if temps else None, "coverage": cov}
+
+
+def snow_recalibrate(ps: float, pp: float, tmin: Optional[float], clim: float,
+                     lead_h: float, early: bool = False) -> float:
+    """SNOW MODEL's logistic on its inputs, the row for `lead_h`."""
+    cold = 0.0 if tmin is None else min(max((40.0 - tmin) / 10.0, -2.0), 3.0)
+    for hi, a, b_ps, b_clim, b_pp, b_cold, b_early in SNOW_RECAL:
+        if lead_h < hi:
+            z = (a + b_ps * _logit(ps) + b_clim * _logit(clim) + b_pp * _logit(pp)
+                 + b_cold * cold + b_early * (1.0 if early else 0.0))
+            return 1.0 / (1.0 + math.exp(-z))
+    return clim
+
+
+def snow_market_fair(periods: SnowPeriods, runtime: datetime, first: date, lst_hours: int,
+                     clim: float, days: int = 1, lag_hours: float = NBE_LAG_HOURS,
+                     max_lead: Optional[float] = None) -> Optional[dict]:
+    """market_fair on SNOW MODEL: {'p', 'p_raw' (Ps), 'p_precip', 'tmin',
+    'lead_h', 'coverage'} for one city's window, else None."""
+    ws, we = window(first, lst_hours, days)
+    lead = (ws - (runtime + timedelta(hours=lag_hours))).total_seconds() / 3600.0
+    if lead < 0 or lead > (MAX_LEAD_HOURS if max_lead is None else max_lead):
+        return None
+    x = snow_day_inputs(periods, ws, we)
+    if x is None:
+        return None
+    p = min(max(snow_recalibrate(x["ps"], x["pp"], x["tmin"], clim, lead,
+                                 early=first.month in (10, 11)), 0.01), 0.99)
+    return {"p": round(p, 4), "p_raw": round(x["ps"], 4), "p_precip": round(x["pp"], 4),
+            "tmin": x["tmin"], "lead_h": round(lead, 1), "coverage": round(x["coverage"], 2)}
+
+
 def _ts(s: str) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(str(s).replace("Z", "")).replace(tzinfo=timezone.utc)
@@ -449,6 +621,74 @@ def fetch_nbe(station: str) -> Tuple[Optional[datetime], List[Tuple[datetime, fl
 def fetch_nbs(station: str) -> Tuple[Optional[datetime], List[Tuple[datetime, float]]]:
     """The IEM's latest 6-hourly NBS run for `station` (THE COMPOSITE)."""
     return parse_nbe(_iem_mos(station, "NBS"))
+
+
+def _num(v) -> Optional[float]:
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_nbe_snow(payload: dict) -> Tuple[Optional[datetime], SnowPeriods]:
+    """(latest runtime, [(ftime, {'p12', 'psn' in 0..1, 'tmp', 'txn' in F})])
+    from IEM api/1/mos.json (SNOW MODEL's inputs)."""
+    rows = (payload or {}).get("data") or []
+    runs: Dict[datetime, SnowPeriods] = {}
+    for r in rows:
+        rt, ft = _ts(r.get("runtime") or ""), _ts(r.get("ftime") or "")
+        if rt is None or ft is None:
+            continue
+        v = {k: _num(r.get(k)) for k in SNOW_FIELDS}
+        for k in ("p12", "psn"):
+            if v[k] is not None:
+                v[k] /= 100.0
+        runs.setdefault(rt, []).append((ft, v))
+    if not runs:
+        return None, []
+    rt = max(runs)
+    return rt, sorted(runs[rt], key=lambda x: x[0])
+
+
+def fetch_nbe_snow(station: str) -> Tuple[Optional[datetime], SnowPeriods]:
+    return parse_nbe_snow(_iem_mos(station, "NBE"))
+
+
+def _cached_snow(c: dict) -> Tuple[Optional[datetime], SnowPeriods]:
+    """The file's copy of a station's snow run ({'run', 'periods': [[ftime,
+    p12, psn, tmp, txn]]})."""
+    rt = _ts(str(c.get("run") or ""))
+    per: SnowPeriods = []
+    for row in c.get("periods") or []:
+        try:
+            ft = _ts(str(row[0]))
+            v = {k: _num(x) for k, x in zip(SNOW_FIELDS, row[1:1 + len(SNOW_FIELDS)])}
+        except (IndexError, TypeError):
+            continue
+        if ft is not None:
+            per.append((ft, v))
+    return (rt, sorted(per, key=lambda x: x[0])) if rt is not None and per else (None, [])
+
+
+def snow_due_run(sid: str, cache: dict, fn: Callable, now: datetime
+                 ) -> Tuple[Tuple[Optional[datetime], SnowPeriods], Optional[str]]:
+    """due_run for the snow runs: the IEM asked only once a newer NBE run is
+    due, a failed or short read falling back to the file's copy."""
+    crt, cper = _cached_snow(cache.get(sid) or {})
+    if crt is not None and len(cper) >= MIN_PERIODS \
+            and now < crt + timedelta(hours=NBE_EVERY_HOURS + 1.0):
+        return (crt, cper), None
+    err = None
+    try:
+        rt, per = fn(sid)
+        if rt is None or len(per) < MIN_PERIODS:
+            raise ValueError(f"run {rt} with {len(per)} periods")
+    except Exception as ex:
+        rt, per = None, []
+        err = f"{type(ex).__name__}: {str(ex)[:80]}"
+    if crt is not None and (rt is None or crt > rt):
+        return (crt, cper), err
+    return (rt, per), err
 
 
 # (the bulletin pads a one-digit month or day with a space: " 9/24/2026")
@@ -686,18 +926,29 @@ def _signed_or_public(get_json: Optional[Callable], params: dict,
 def classify_day_markets(markets: List[dict]) -> Tuple[Optional[dict], str]:
     """({'events': {event: [first ISO day, days]}, 'sample': ticker}, '') when
     a series' open markets are the one-day / span contract (AUTO DAY
-    SERIES), else (None, why)."""
+    SERIES), plus 'kind': 'snow' on the snow contract (SNOW DAYS), else
+    (None, why)."""
     if not markets:
         return None, "no open market"
     events: Dict[str, list] = {}
+    kinds = set()
     for m in markets:
         t, ev = str(m.get("ticker") or ""), str(m.get("event_ticker") or "")
         rules = str(m.get("rules_primary") or "")
         if not ev or not t.startswith(ev + "-") \
                 or not _CITY_SEG_RE.fullmatch(t[len(ev) + 1:]):
             return None, f"{t}: not one market per city"
-        if not _ZERO_RE.search(rules):
+        if SNOW_DAY_ENABLE and _SNOW_ZERO_RE.search(rules):
+            if not _SNOW_TRACE_RE.search(rules):
+                return None, (f"{t}: a trace does not count YES (the snow model's "
+                              "outcome counts it)")
+            kinds.add("snow")
+        elif not _ZERO_RE.search(rules):
             return None, f"{t}: not 'total precipitation ... strictly greater than 0 inches'"
+        else:
+            kinds.add("rain")
+        if len(kinds) > 1:
+            return None, f"{t}: rain and snow markets in one series"
         span = rules_span(rules)
         if station_code(rules) is None or span is None:
             return None, f"{t}: its rules name no station or no day"
@@ -706,7 +957,10 @@ def classify_day_markets(markets: List[dict]) -> Tuple[Optional[dict], str]:
             return None, f"{t}: a {days}-day window"
         if events.setdefault(ev, [span[0].isoformat(), days]) != [span[0].isoformat(), days]:
             return None, f"{ev}: its markets name different windows"
-    return {"events": events, "sample": str(markets[0].get("ticker") or "")}, ""
+    got = {"events": events, "sample": str(markets[0].get("ticker") or "")}
+    if kinds == {"snow"}:
+        got["kind"] = "snow"
+    return got, ""
 
 
 def discover_day_series(old: dict, now_ts: float, get_json: Optional[Callable] = None,
@@ -733,7 +987,9 @@ def discover_day_series(old: dict, now_ts: float, get_json: Optional[Callable] =
     names = sorted({str(s.get("ticker") or "") for s in js.get("series") or []})
     out: Dict[str, dict] = {}
     for s in names:
-        if "RAIN" not in s or s in (SERIES, "KXRAIN") + DAY_SERIES or (skip and skip(s)):
+        # rain series, and since SNOW DAYS (2026-11-20) snow ones
+        if not ("RAIN" in s or (SNOW_DAY_ENABLE and "SNOW" in s)) \
+                or s in (SERIES, "KXRAIN") + DAY_SERIES or (skip and skip(s)):
             continue
         last = found.get(s) or rejected.get(s) or {}
         if last and now_ts - float(last.get("at") or 0.0) < DAY_RETRY_SECS and (
@@ -766,9 +1022,11 @@ def fetch_events(get_json: Optional[Callable] = None,
     day series' (`day_series`, AUTO DAY SERIES): event -> {'sat': the
     window's first day (ISO), 'days': its length, 'markets': {ticker:
     {'code': CLI code or None, 'span': [first, last] ISO days from the
-    rules, or None}}}. An auto series' window is its rules'."""
+    rules, or None}}}. An auto series' window is its rules'; a snow series'
+    event (SNOW DAYS) carries 'kind': 'snow'."""
     out: Dict[str, dict] = {}
     for series in (SERIES,) + DAY_SERIES + tuple(sorted(day_series or ())):
+        kind = ((day_series or {}).get(series) or {}).get("kind")
         js = _signed_or_public(get_json, {"series_ticker": series, "status": "open",
                                           "limit": 200})
         for m in js.get("markets") or []:
@@ -785,6 +1043,8 @@ def fetch_events(get_json: Optional[Callable] = None,
             if not ev.startswith(series + "-") or not t or first is None:
                 continue
             e = out.setdefault(ev, {"sat": first.isoformat(), "days": days, "markets": {}})
+            if kind == "snow":
+                e["kind"] = "snow"
             e["markets"][t] = {"code": station_code(rules),
                                "span": [d.isoformat() for d in span] if span else None}
     return out
@@ -807,7 +1067,9 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                     nbs_fn: Optional[Callable] = None,
                     nbs_hourly_fn: Optional[Callable] = None,
                     skip: Optional[Callable[[str], bool]] = None,
-                    clim_fn: Optional[Callable] = None) -> Tuple[int, int]:
+                    clim_fn: Optional[Callable] = None,
+                    snow_nbe_fn: Optional[Callable] = None,
+                    snow_clim_fn: Optional[Callable] = None) -> Tuple[int, int]:
     """Build and atomically write the weekend-rain fair file; returns
     (markets with a fair, open markets without one). Kalshi's open events
     are re-read hourly, and every pass while none is open (the Monday gap
@@ -821,7 +1083,10 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     family claims joins on its contract (AUTO DAY SERIES; `skip`: the
     bot's own rain families); a pass that lists the category re-reads the
     events. A window past the fit takes the station's climatology (LONG
-    LEADS; clim_fn, default fetch_clim)."""
+    LEADS; clim_fn, default fetch_clim). A snow event (SNOW DAYS) is priced
+    on SNOW MODEL instead: its stations' NBE snow runs (snow_nbe_fn, default
+    fetch_nbe_snow; their own copy in the file) and snow climatology
+    (snow_clim_fn, default fetch_snow_clim)."""
     now = now or datetime.now(timezone.utc)
     ts = now.timestamp()
     old = _read_json(path)
@@ -874,8 +1139,10 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     stamp = now.isoformat()
     markets: Dict[str, dict] = {}
     missing: Dict[str, str] = {}
-    # 1. the markets to price, and the stations they need
+    # 1. the markets to price, and the stations they need (a snow event's to
+    # snow_todo: SNOW DAYS)
     todo: List[Tuple[str, str, date, str, int, int]] = []
+    snow_todo: List[Tuple[str, str, date, str, int, int]] = []
     for ev, e in events.items():
         sat = date.fromisoformat(e["sat"])
         days = int(e.get("days") or 2)
@@ -896,7 +1163,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             if now >= window(sat, lst, days)[0]:
                 missing[t] = "weekend started" if days == 2 else "the day started"
                 continue
-            todo.append((t, ev, sat, sid, lst, days))
+            (snow_todo if e.get("kind") == "snow" else todo).append((t, ev, sat, sid, lst, days))
     sids = sorted({sid for _t, _e, _s, sid, _l, _d in todo})
     # 2. each source once per station: the NBE and the 6-hourly NBS from the
     # IEM when a newer run is due, the newest hourly NBS cycle from NOAA
@@ -1033,6 +1300,73 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         markets[t] = dict(f, event=ev, station=sid, run=f_rt.isoformat(),
                           fetched_at=stamp, src="+".join(k for k in ("H", "S", "E") if k in by),
                           runs={k: rt.isoformat() for k, rt, _lag, _p in srcs})
+    # 4. SNOW DAYS: each snow station's NBE snow run (once a newer one is due)
+    # and each window's snow climatology (a model input at every lead, kept
+    # CLIM_TTL_DAYS, a failure retried after AUTO_RETRY_SECS), then SNOW MODEL
+    snow_cache = old.get("nbe_snow") or {}
+    snow_runs: Dict[str, Tuple[Optional[datetime], SnowPeriods]] = {}
+    snow_failed: Dict[str, str] = {}
+    for sid in sorted({x[3] for x in snow_todo}):
+        snow_runs[sid], err = snow_due_run(sid, snow_cache, snow_nbe_fn or fetch_nbe_snow, now)
+        if err:
+            snow_failed[sid] = err
+    snow_clim: Dict[str, dict] = {k: v for k, v in (old.get("snow_clim") or {}).items()
+                                  if isinstance(v, dict)
+                                  and ts - float(v.get("at") or 0) < CLIM_TTL_DAYS * 86400}
+    s_reads = 0
+    for t, ev, first, sid, lst, days in snow_todo:
+        key = f"{sid}|{first.isoformat()}|{days}"
+        c = snow_clim.get(key) or {}
+        if c.get("p") is not None or s_reads >= CLIM_MAX_READS \
+                or (c.get("why") and ts - float(c.get("at") or 0) < AUTO_RETRY_SECS):
+            continue
+        s_reads += 1
+        try:
+            p, n = (snow_clim_fn or fetch_snow_clim)(sid, first, days)
+            snow_clim[key] = {"p": round(p, 4), "n": n, "at": ts}
+            _log(f"snow climatology {key}: {p:.1%} of {n} windows")
+        except Exception as ex:
+            snow_clim[key] = {"at": ts, "why": f"{type(ex).__name__}: {str(ex)[:160]}"}
+            _log(f"! snow climatology {key} failed: {snow_clim[key]['why']}")
+    for t, ev, first, sid, lst, days in snow_todo:
+        c = snow_clim.get(f"{sid}|{first.isoformat()}|{days}") or {}
+        if c.get("p") is None:
+            missing[t] = "no snow climatology" + (f" ({c['why']})" if c.get("why") else "")
+            continue
+        ws = window(first, lst, days)[0]
+        rt, per = snow_runs.get(sid) or (None, [])
+        if rt is not None and (ts - rt.timestamp()) / 3600.0 > NBE_MAX_AGE_HOURS:
+            rt, per = None, []
+        lead = ((ws - (rt + timedelta(hours=NBE_LAG_HOURS))).total_seconds() / 3600.0
+                if rt is not None else (ws - now).total_seconds() / 3600.0)
+        base = dict(event=ev, station=sid, fetched_at=stamp, kind="snow", clim=c["p"],
+                    clim_n=c.get("n"))
+        f = snow_market_fair(per, rt, first, lst, c["p"], days=days) if rt is not None else None
+        if f is not None:
+            markets[t] = dict(f, run=rt.isoformat(), src="E", runs={"E": rt.isoformat()}, **base)
+            continue
+        if not (CLIM_ENABLE and lead > MAX_LEAD_HOURS):
+            missing[t] = ("snow: no fresh NBE run" if rt is None
+                          else "snow: periods short of the day or a period without psn")
+            continue
+        # LONG LEADS on snow: the climatology, the model blended in toward the
+        # fit's edge where it reaches the window
+        fl = (snow_market_fair(per, rt, first, lst, c["p"], days=days, max_lead=CLIM_LEAD_HOURS)
+              if rt is not None else None)
+        w = (min(max((CLIM_LEAD_HOURS - lead) / (CLIM_LEAD_HOURS - MAX_LEAD_HOURS), 0.0), 1.0)
+             if fl is not None and CLIM_LEAD_HOURS > MAX_LEAD_HOURS else 0.0)
+        p = w * (fl["p"] if fl else 0.0) + (1.0 - w) * c["p"]
+        markets[t] = dict(p=round(min(max(p, 0.01), 0.99), 4),
+                          p_raw=fl["p_raw"] if fl else None, lead_h=round(lead, 1),
+                          coverage=fl["coverage"] if fl else None,
+                          run=rt.isoformat() if w > 0 else None,
+                          src="E+C" if w > 0 else "C",
+                          runs={"E": rt.isoformat()} if w > 0 else {},
+                          w_model=round(w, 3), p_model=fl["p"] if fl else None, **base)
+    if snow_failed:
+        sid, err = sorted(snow_failed.items())[0]
+        _log(f"NBE snow read failed for {len(snow_failed)} station(s) ({sid}: {err}); "
+             "the file's runs stand in while young enough")
     if failed:
         sid, err = sorted(failed.items())[0]
         _log(f"NBE read failed for {len(failed)} station(s) ({sid}: {err}); "
@@ -1055,7 +1389,13 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                "auto_stations": auto, "unmapped": unmapped,
                "day_series": day_series, "day_rejected": day_rejected,
                "day_discovered_at": day_at, "clim": clim,
+               "nbe_snow": {sid: {"run": rt.isoformat(),
+                                  "periods": [[ft.isoformat()] + [v.get(k) for k in SNOW_FIELDS]
+                                              for ft, v in per]}
+                            for sid, (rt, per) in sorted(snow_runs.items()) if rt is not None},
+               "snow_clim": snow_clim,
                "model": {"w": W, "recal": RECAL, "min_coverage": MIN_COVERAGE,
+                         "snow_recal": SNOW_RECAL, "snow_fit": SNOW_FIT,
                          "max_lead_h": MAX_LEAD_HOURS, "nbe_max_age_h": NBE_MAX_AGE_HOURS,
                          "clim": CLIM_ENABLE, "clim_lead_h": CLIM_LEAD_HOURS,
                          "clim_years": CLIM_YEARS, "clim_half_days": CLIM_HALF_DAYS,
@@ -1077,8 +1417,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     d = _read_json(args.out)
     _log(f"{ok} markets priced, {miss} without a fair")
     for t, m in sorted((d.get("markets") or {}).items()):
-        _log(f"  {t}: {m['p'] * 100:.0f}c (raw {m['p_raw'] * 100:.0f}, lead "
-             f"{m['lead_h']:.0f}h, {m['station']})")
+        raw = "-" if m.get("p_raw") is None else f"{m['p_raw'] * 100:.0f}"
+        _log(f"  {t}: {m['p'] * 100:.0f}c (raw {raw}, lead "
+             f"{m['lead_h']:.0f}h, {m['station']}, {m.get('src')}"
+             + (f", clim {m['clim'] * 100:.0f}" if m.get("clim") is not None else "") + ")")
     for t, why in sorted((d.get("missing") or {}).items()):
         _log(f"  {t}: no fair -- {why}")
     return 0

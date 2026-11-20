@@ -36686,6 +36686,51 @@ class TestRainDayFamily(unittest.TestCase):
                 self.assertFalse(imm.rain_day_series(s))
                 self.assertFalse(imm.in_fair_lead_series(s))
 
+    def test_a_snow_day_series_the_writer_found_joins_on_its_snow_fair(self):
+        # Jack 2026-11-20: "KXSNOWTHANKSGIVING should quote" (11/14: "rain/snow
+        # markets generally should have fair value calculations and
+        # auto-quoted when they come online")
+        s = "KXSNOWTHANKSGIVING"
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "rain_wknd_fair.json")
+        t = f"{s}-26NOV26-DTW"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"markets": {}, "day_series": {s: {"sample": t, "kind": "snow"}},
+                       "open_events": {f"{s}-26NOV26": {"sat": "2026-11-26", "days": 1,
+                                                        "kind": "snow"}}}, f)
+        self.addCleanup(imm.SERIES_OVERRIDES.pop, s, None)
+        with mock.patch.object(imm, "RAIN_WKND_FILE", path), \
+                mock.patch.dict(imm._rain_wknd_state, {"mtime": 0.0, "day_series": {},
+                                                       "open_events": {}, "markets": {}}):
+            self.assertFalse(imm.snow_day_series(s))                 # before the writer
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                imm.load_rain_wknd()
+            self.assertTrue(any(f"snow day {s}: joins" in x for x in lines), lines)
+            self.assertTrue(imm.snow_day_series(s) and imm.rain_day_series(s))
+            self.assertFalse(imm.snow_day_series("KXRAINWKND"))
+            self.assertIs(imm.SERIES_OVERRIDES[s], imm.SERIES_OVERRIDES["KXRAINWKND"])
+            self.assertTrue(imm.IncentiveMarketMaker._allowed(t))
+            self.assertTrue(imm.move_breaker_on(s))
+            self.assertIsNone(imm.size_test_arm(s))
+            self.assertEqual(imm.fair_model_label(s), "the snow-day fair")
+            # out at 00:00 ET of Thanksgiving, the writer's day
+            self.assertEqual(imm.parse_event_date(f"{s}-26NOV26"),
+                             datetime(2026, 11, 26, 5, tzinfo=timezone.utc))
+            # fail closed on the writer's fair, a 10c band through it capped
+            why, _inp, caps = imm.rain_wknd_gate(t, time.time(), 20, 30)
+            self.assertEqual((why, caps), ("no snow-day fair for this market", None))
+            imm._rain_wknd_state["markets"][t] = {"p": 0.25, "ts": time.time()}
+            self.assertEqual(imm.rain_wknd_gate(t, time.time(), 20, 30), ("", {}, None))
+            # no fair lead (nor FAIR CLOSE) until IMM_SNOW_DAY_LEAD=1; the
+            # rain days keep theirs
+            self.assertFalse(imm.in_fair_lead_series(s))
+            self.assertFalse(imm.fair_close_series(s))
+            self.assertIsNone(imm.fair_model_c(t, s, time.time()))
+            with mock.patch.object(imm, "SNOW_DAY_LEAD", True):
+                self.assertTrue(imm.in_fair_lead_series(s))
+                self.assertEqual(imm.fair_model_c(t, s, time.time()), 25.0)
+
 
 class TestOpenRouterFairLead(unittest.TestCase):
     """Jack 2026-10-30: "Yes, add it", on "Add the OpenRouter weekly ladder to

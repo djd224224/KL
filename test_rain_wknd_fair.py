@@ -368,14 +368,16 @@ class TestAutoDaySeries(unittest.TestCase):
               "KXRAINDNYC": [self.market("KXRAINDNYC-261126-0",
                                          self.ONE.format(name="NYC", code="NYC"))]}
         get = self.fake(by, calls)
-        skip = lambda s: s == "KXRAINATLM"                       # the bot's monthly
+        # the bot's rain and snow monthlies
+        skip = lambda s: s in ("KXRAINATLM", "KXSNOWNYCM")
         ts = self.NOW.timestamp()
         found, rej, at = r.discover_day_series({}, ts, get, skip)
         self.assertEqual(set(found), {"KXRAINTURKEY"})
         self.assertIn("per city", rej["KXRAINDNYC"]["why"])
         self.assertEqual(at, ts)
-        # the category, then only the unclaimed rain series: not the weekend,
-        # the named day series, the monthly the bot owns, or a snow one
+        # the category, then only the unclaimed rain (and snow: SNOW DAYS)
+        # series: not the weekend, the named day series, or the monthlies the
+        # bot owns
         self.assertEqual(calls, [("/series", "Climate and Weather"),
                                  ("/markets", "KXRAINDNYC"), ("/markets", "KXRAINTURKEY")])
         old = {"day_series": found, "day_rejected": rej, "day_discovered_at": at}
@@ -882,6 +884,171 @@ class TestLongLeads(unittest.TestCase):
         self.assertEqual(self.clim_calls, [])
         self.assertIn("lead past the fit",
                       self.read()["missing"]["KXRAINTHANKSGIVING-26NOV26-NYC"])
+
+
+def snow_periods(run: datetime, psn, p12=0.4, tmp=30.0):
+    """12-hour NBE periods ending at 00Z/12Z after `run`: psn in 0..1."""
+    return [(run + timedelta(hours=12 * (i + 1)),
+             {"p12": p12, "psn": p, "tmp": tmp, "txn": tmp + 2}) for i, p in enumerate(psn)]
+
+
+class TestSnowDays(unittest.TestCase):
+    """Jack 2026-11-20: "KXSNOWTHANKSGIVING should quote" (11/14: "rain/snow
+    markets generally should have fair value calculations and auto-quoted
+    when they come online")."""
+
+    SNOW = ("If the total new snowfall in {name} (K{code}) on November 26, 2026 is "
+            "strictly greater than 0 inches, including a reported trace, then the market "
+            "resolves to Yes.")
+    RAIN = TestLongLeads.TURKEY
+
+    def market(self, code, rules=None, series="KXSNOWTHANKSGIVING"):
+        return {"ticker": f"{series}-26NOV26-{code}", "event_ticker": f"{series}-26NOV26",
+                "rules_primary": rules or self.SNOW.format(name=code, code=code)}
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "rain_wknd_fair.json")
+        self.snow_calls, self.clim_calls = [], []
+
+    def read(self):
+        with open(self.path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_the_snow_contract_is_a_day_series_of_kind_snow(self):
+        got, why = r.classify_day_markets([self.market("DTW"), self.market("NYC")])
+        self.assertEqual((got, why), ({"events": {"KXSNOWTHANKSGIVING-26NOV26": ["2026-11-26", 1]},
+                                       "sample": "KXSNOWTHANKSGIVING-26NOV26-DTW",
+                                       "kind": "snow"}, ""))
+        self.assertEqual(r.station_code(self.SNOW.format(name="Detroit", code="DTW")), "DTW")
+        # a trace that does not count is another outcome than the model's; a
+        # threshold; rain and snow mixed
+        no_trace = self.SNOW.format(name="DTW", code="DTW").replace(
+            ", including a reported trace,", ", a trace counting as 0,")
+        for ms, bit in (([self.market("DTW", no_trace)], "trace does not count"),
+                        ([self.market("DTW", self.SNOW.format(name="DTW", code="DTW").replace(
+                            "than 0 inches", "than 1 inches"))], "total precipitation"),
+                        ([self.market("DTW"), self.market("NYC", self.RAIN)], "rain and snow")):
+            got, why = r.classify_day_markets(ms)
+            self.assertIsNone(got)
+            self.assertIn(bit, why)
+        with mock.patch.object(r, "SNOW_DAY_ENABLE", False):
+            self.assertIsNone(r.classify_day_markets([self.market("DTW")])[0])
+
+    def test_discovery_reads_unclaimed_snow_series_and_events_carry_the_kind(self):
+        calls = []
+
+        def get_json(path, params):
+            calls.append(params.get("series_ticker") or params.get("category"))
+            if path == "/series":
+                return {"series": [{"ticker": s} for s in
+                                   ("KXSNOWTHANKSGIVING", "KXSNOWDAYS", "KXCHISNOWM")]}
+            if params["series_ticker"] == "KXSNOWTHANKSGIVING":
+                return {"markets": [self.market("DTW"), self.market("SEA")]}
+            return {"markets": []}
+        skip = lambda s: s in ("KXSNOWDAYS", "KXCHISNOWM")       # the bot's snow families
+        ts = datetime(2026, 11, 20, 13, tzinfo=UTC).timestamp()
+        found, _rej, _at = r.discover_day_series({}, ts, get_json, skip)
+        self.assertEqual(list(found), ["KXSNOWTHANKSGIVING"])
+        self.assertEqual(found["KXSNOWTHANKSGIVING"]["kind"], "snow")
+        self.assertEqual(calls, ["Climate and Weather", "KXSNOWTHANKSGIVING"])
+        ev = r.fetch_events(get_json, found)
+        self.assertEqual(ev["KXSNOWTHANKSGIVING-26NOV26"]["kind"], "snow")
+        self.assertEqual(ev["KXSNOWTHANKSGIVING-26NOV26"]["sat"], "2026-11-26")
+        with mock.patch.object(r, "SNOW_DAY_ENABLE", False):
+            calls.clear()
+            self.assertEqual(r.discover_day_series({}, ts, get_json, skip)[0], {})
+            self.assertEqual(calls, ["Climate and Weather"])
+
+    def snow_nbe(self, run, psn):
+        def fn(sid):
+            self.snow_calls.append(sid)
+            return run, snow_periods(run, psn)
+        return fn
+
+    def clim(self, sid, first, days):
+        self.clim_calls.append((sid, first, days))
+        if sid == "KSEA":
+            raise RuntimeError("ACIS KSEA: under 150 complete snow windows")
+        return 0.2, 450
+
+    def events(self):
+        day = ["2026-11-26", "2026-11-26"]
+        return {
+            "KXSNOWTHANKSGIVING-26NOV26": {"sat": "2026-11-26", "days": 1, "kind": "snow",
+                                           "markets": {
+                "KXSNOWTHANKSGIVING-26NOV26-DTW": {"code": "DTW", "span": day},
+                "KXSNOWTHANKSGIVING-26NOV26-SEA": {"code": "SEA", "span": day}}},
+            "KXRAINTHANKSGIVING-26NOV26": {"sat": "2026-11-26", "days": 1, "markets": {
+                "KXRAINTHANKSGIVING-26NOV26-NYC": {"code": "NYC", "span": day}}}}
+
+    def test_a_snow_market_prices_on_the_snow_model_and_fails_closed(self):
+        run = datetime(2026, 11, 22, 12, tzinfo=UTC)
+        now = run + timedelta(hours=4)
+        rain_calls = []
+
+        def rain_nbe(sid):
+            rain_calls.append(sid)
+            return run, periods(run, [0.3] * 20)
+        ok, miss = r.write_fair_file(self.path, now=now, events=self.events(), nbe_fn=rain_nbe,
+                                     snow_nbe_fn=self.snow_nbe(run, [0.3] * 20),
+                                     snow_clim_fn=self.clim)
+        self.assertEqual((ok, miss), (2, 1))
+        d = self.read()
+        m = d["markets"]["KXSNOWTHANKSGIVING-26NOV26-DTW"]
+        want = r.snow_market_fair(snow_periods(run, [0.3] * 20), run, date(2026, 11, 26), 5, 0.2)
+        self.assertEqual((m["p"], m["kind"], m["station"], m["src"], m["clim"], m["coverage"]),
+                         (want["p"], "snow", "KDTW", "E", 0.2, 2.0))
+        # no snow climatology: no fair (a model input at every lead)
+        self.assertIn("no snow climatology", d["missing"]["KXSNOWTHANKSGIVING-26NOV26-SEA"])
+        # the rain market priced as before, and each source read for its own
+        # family only
+        self.assertIn("KXRAINTHANKSGIVING-26NOV26-NYC", d["markets"])
+        self.assertNotIn("kind", d["markets"]["KXRAINTHANKSGIVING-26NOV26-NYC"])
+        self.assertEqual((rain_calls, sorted(self.snow_calls)), (["KNYC"], ["KDTW", "KSEA"]))
+        # the next pass inside the run's 13 hours reads neither again
+        r.write_fair_file(self.path, now=now + timedelta(minutes=15), events=self.events(),
+                          nbe_fn=rain_nbe, snow_nbe_fn=self.snow_nbe(run, [0.3] * 20),
+                          snow_clim_fn=self.clim)
+        self.assertEqual((len(self.snow_calls), len(self.clim_calls)), (2, 2))
+        # out once the day starts: Detroit at 05:00Z
+        r.write_fair_file(self.path, now=datetime(2026, 11, 26, 5, 1, tzinfo=UTC),
+                          events=self.events(), nbe_fn=rain_nbe,
+                          snow_nbe_fn=self.snow_nbe(run, [0.3] * 20), snow_clim_fn=self.clim)
+        self.assertEqual(self.read()["missing"]["KXSNOWTHANKSGIVING-26NOV26-DTW"],
+                         "the day started")
+
+    def test_more_snow_in_the_guidance_is_a_dearer_fair(self):
+        run = datetime(2026, 11, 22, 12, tzinfo=UTC)
+        lo = r.snow_market_fair(snow_periods(run, [0.02] * 20), run, date(2026, 11, 26), 5, 0.2)
+        hi = r.snow_market_fair(snow_periods(run, [0.6] * 20), run, date(2026, 11, 26), 5, 0.2)
+        self.assertLess(lo["p"], hi["p"])
+        self.assertEqual((lo["coverage"], lo["lead_h"]), (2.0, 86.0))
+        # a period without its snow probability is no fair; nor a stale lead
+        gap = snow_periods(run, [0.3] * 20)
+        gap[7][1]["psn"] = None
+        self.assertIsNone(r.snow_market_fair(gap, run, date(2026, 11, 26), 5, 0.2))
+        self.assertIsNone(r.snow_market_fair(snow_periods(run, [0.3] * 30), run,
+                                             date(2026, 12, 20), 5, 0.2))
+
+    def test_snow_values_and_climatology_count_a_trace(self):
+        self.assertEqual([r.snow_day_value(v) for v in ("T", "0.0", "1.2", "M", "S")],
+                         [1, 0, 1, None, None])
+        daily = {}
+        for y in range(1996, 2026):
+            for k in range(-7, 8):
+                d = date(y, 11, 26) + timedelta(days=k)
+                daily[d.isoformat()] = 1 if k in (0, 3) else 0
+        p, n = r.snow_climatology(daily, date(2026, 11, 26), 1)
+        self.assertEqual((n, round(p, 4)), (450, round(60 / 450, 4)))
+        payload = {"data": [{"runtime": "2026-11-20 00:00", "ftime": "2026-11-26 12:00",
+                             "p12": 38, "psn": 12, "tmp": 33, "txn": 33},
+                            {"runtime": "2026-11-19 12:00", "ftime": "2026-11-26 12:00",
+                             "p12": 50, "psn": 50, "tmp": 30, "txn": 30}]}
+        rt, per = r.parse_nbe_snow(payload)
+        self.assertEqual(rt, datetime(2026, 11, 20, tzinfo=UTC))
+        self.assertEqual(per, [(datetime(2026, 11, 26, 12, tzinfo=UTC),
+                                {"p12": 0.38, "psn": 0.12, "tmp": 33.0, "txn": 33.0})])
 
 
 if __name__ == "__main__":
