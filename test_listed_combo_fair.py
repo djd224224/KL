@@ -3,7 +3,7 @@
 
 Fixtures: the 11/17 13:30Z reads -- KXUSAIRANAGREEMENT-27-28 26/27, KXPRESPARTY-2028 D 67/68 and
 R 32/33, Feb-2028 WTI (CLG28) $71.54 against an $86.86 front month -- and the grids' own cell
-titles as Kalshi lists them."""
+titles as Kalshi lists them; the two-yes/no-leg grids (TestPairGrids) on the 11/20 22:5xZ books."""
 
 import math
 import unittest
@@ -422,7 +422,10 @@ class FakeKalshiFull(FakeKalshi):
 
     @staticmethod
     def _cell(title):
-        """A long title as is; a (short title, legs) pair puts the legs in the cell's own rules."""
+        """A long title as is; a (short title, legs) pair puts the legs in the cell's own rules;
+        a dict is the cell's own fields."""
+        if isinstance(title, dict):
+            return dict(title)
         if isinstance(title, tuple):
             return {"yes_sub_title": title[0], "rules_primary":
                     f"If ALL of the following occur: {title[1]}, then the market resolves to Yes."}
@@ -585,6 +588,161 @@ class TestJobsGrids(unittest.TestCase):
         late = lcf._parse_iso("2028-12-15T00:00:00Z").timestamp()
         with self.assertRaisesRegex(ValueError, "under way"):
             lcf.auto_map("KXPAYROLLSPARTYCOMBO-30SEP", mk, k, late)
+
+
+# Two yes/no legs (Jack 2026-11-20: "Build it anyway"): the 11/20 22:5xZ cells as Kalshi lists
+# them (short titles; the legs in each cell's own rules) and their leg books
+FEIJOO, SANCHEZ = "Alberto Núñez Feijóo", "Pedro Sánchez"
+PSOE = "Spanish Socialist Workers' Party"
+
+
+def _bop(house, senate, title):
+    return {"yes_sub_title": title, "rules_primary":
+            f"If ALL of the following occur for Feb 2029: House Control: {house}, Senate Control: "
+            f"{senate}, then the market resolves to Yes."}
+
+
+PAIR_GRIDS = {
+    "KXBALANCEPOWERCOMBO-29FEB": {
+        "DD": _bop("Democratic", "Democratic", "Democrats sweep"),
+        "DR": _bop("Democratic", "Republican", "D-House, R-Senate"),
+        "RD": _bop("Republican", "Democratic", "R-House, D-Senate"),
+        "RR": _bop("Republican", "Republican", "Republicans sweep")},
+    "KXSPAINCOMBO-28AUG": {
+        f"{p}-{n}": (f"{p} wins, {short} becomes PM",
+                     f"Spanish general election winner: {party}, Next Prime Minister of Spain: {pm}")
+        for p, party in (("PP", "People's Party"), ("PSOE", PSOE))
+        for n, short, pm in (("FEIJOO", "Feijóo", FEIJOO), ("SANCHEZ", "Sánchez", SANCHEZ))},
+}
+PAIR_LEGS = {"CONTROLH-2028-D": (0.79, 0.80), "CONTROLH-2028-R": (0.20, 0.21),
+             "CONTROLS-2028-D": (0.88, 0.89), "CONTROLS-2028-R": (0.10, 0.12),
+             "KXSPAINPARLI-27-PP": (0.76, 0.77), "KXSPAINPARLI-27-PSOE": (0.22, 0.24),
+             "KXSPANISHPM-27AUG22-AFEI": (0.87, 0.88), "KXSPANISHPM-27AUG22-PSAN": (0.12, 0.13)}
+
+
+class TestPairGrids(unittest.TestCase):
+    """Two yes/no legs, no number: House x Senate control 2028 and the Spanish election winner
+    x the next PM, each cell a Gaussian-copula joint of its two outcomes' own markets."""
+
+    BOP, SPAIN = "KXBALANCEPOWERCOMBO-29FEB", "KXSPAINCOMBO-28AUG"
+
+    def _watch(self, grids=None, legs=None):
+        k = FakeKalshiFull(grids=grids or PAIR_GRIDS, rules={}, legs=legs or PAIR_LEGS)
+        return lcf.ListedComboWatch(k, lambda: [self.BOP, self.SPAIN], http=fake_yahoo({})), k
+
+    def test_the_bivariate_normal_matches_its_closed_forms(self):
+        for rho in (-0.9, -0.5, 0.0, 0.3, 0.7, 0.9):
+            self.assertAlmostEqual(lcf.bvn_cdf(0.0, 0.0, rho), 0.25 + math.asin(rho) / (2 * math.pi),
+                                   places=6, msg=rho)
+        for a, b in ((-1.2, 0.4), (0.8, 1.9), (-2.5, -0.3)):
+            self.assertAlmostEqual(lcf.bvn_cdf(a, b, 0.0), lcf._ncdf(a) * lcf._ncdf(b), places=6)
+        self.assertEqual(lcf.bvn_cdf(-math.inf, 0.3, 0.5), 0.0)
+        self.assertAlmostEqual(lcf.bvn_cdf(math.inf, 0.3, 0.5), lcf._ncdf(0.3), places=9)
+
+    def test_the_joint_runs_from_one_bound_to_the_other(self):
+        pa, pb = 0.3, 0.6
+        self.assertAlmostEqual(lcf.pair_joint(pa, pb, 0.0), pa * pb, places=6)
+        self.assertAlmostEqual(lcf.pair_joint(pa, pb, 0.995), min(pa, pb), delta=0.01)
+        self.assertAlmostEqual(lcf.pair_joint(pa, pb, -0.995), max(0.0, pa + pb - 1), delta=0.01)
+        js = [lcf.pair_joint(pa, pb, r) for r in (-0.9, -0.4, 0.0, 0.4, 0.9)]
+        self.assertEqual(js, sorted(js))
+        self.assertEqual(lcf.pair_joint(0.0, 0.5, 0.5), 0.0)
+        self.assertEqual(lcf.pair_joint(1.0, 0.5, 0.5), 0.5)
+
+    def test_balance_of_power_prices_off_the_four_control_markets(self):
+        w, _k = self._watch()
+        snap = w.refresh(NOW)
+        e = snap["events"][self.BOP]
+        self.assertEqual((e["mapping"], e["n"], e["n_priced"], e["err"]), ("hand", 4, 4, None))
+        self.assertEqual(e["legs"], ["CONTROLH-2028-D", "CONTROLH-2028-R", "CONTROLS-2028-D",
+                                     "CONTROLS-2028-R"])
+        self.assertEqual((e["rho"], e["rho_band"]), (0.6, [0.3, 0.85]))
+        self.assertAlmostEqual(e["sum_p"], 1.0, delta=0.01)
+        self.assertIn("KXBALANCEPOWERCOMBO", snap["priced_series"])
+        m = {t.rsplit("-", 1)[1]: v for t, v in snap["markets"].items() if v["event"] == self.BOP}
+        self.assertEqual((m["DD"]["outcome"], m["DD"]["bin"], m["DD"]["sign"]),
+                         ("Democratic", "Democratic", 1))
+        self.assertEqual((m["DR"]["outcome"], m["DR"]["bin"], m["DR"]["sign"]),
+                         ("Democratic", "Republican", -1))
+        # rho 0.6: the D sweep between the legs moving apart (0.795 x 0.885) and together (0.795)
+        self.assertGreater(m["DD"]["p"], 0.795 * 0.885 + 0.02)
+        self.assertLess(m["DD"]["p"], 0.795)
+        self.assertAlmostEqual(m["DD"]["p"] + m["DR"]["p"], 0.795, delta=0.01)
+        for code, v in m.items():
+            self.assertLess(v["p_lo"], v["p"], code)
+            self.assertLess(v["p"], v["p_hi"], code)
+            self.assertFalse(v["cut"], code)
+            self.assertEqual(v["ts"], NOW)
+
+    def test_spain_reads_the_names_from_the_cells_rules_and_keeps_to_the_bounds(self):
+        w, _k = self._watch()
+        snap = w.refresh(NOW)
+        e = snap["events"][self.SPAIN]
+        self.assertEqual((e["n_priced"], e["err"]), (4, None))
+        m = {t.split("-", 2)[2]: v for t, v in snap["markets"].items() if v["event"] == self.SPAIN}
+        self.assertEqual((m["PSOE-FEIJOO"]["outcome"], m["PSOE-FEIJOO"]["bin"]), (PSOE, FEIJOO))
+        self.assertEqual((m["PP-FEIJOO"]["sign"], m["PSOE-SANCHEZ"]["sign"],
+                          m["PP-SANCHEZ"]["sign"], m["PSOE-FEIJOO"]["sign"]), (1, 1, -1, -1))
+        # Feijoo (87/88) above PP (76/77): "PSOE wins, Feijoo PM" holds 9c+ at any rho
+        self.assertGreaterEqual(m["PSOE-FEIJOO"]["p_lo"], 0.87 + 0.22 - 1 - 1e-9)
+        self.assertGreater(m["PSOE-FEIJOO"]["p"], 0.875 + 0.23 - 1)
+        # "PSOE wins, Sanchez PM" is never above Sanchez's own ask
+        self.assertLessEqual(m["PSOE-SANCHEZ"]["p_hi"], 0.13 + 1e-9)
+        self.assertGreater(m["PP-FEIJOO"]["p"], 0.875 + 0.765 - 1)
+        self.assertLess(m["PP-FEIJOO"]["p"], 0.765)
+        for code, v in m.items():
+            self.assertLessEqual(v["p_lo"], v["p"], code)
+            self.assertLessEqual(v["p"], v["p_hi"], code)
+
+    def test_a_wider_rho_band_widens_the_band(self):
+        w, _k = self._watch()
+        wide = w.refresh(NOW)["markets"]
+        rows = {ev: dict(lcf.EVENTS[ev], rho_band=(lcf.EVENTS[ev]["rho"],) * 2)
+                for ev in (self.BOP, self.SPAIN)}
+        k = FakeKalshiFull(grids=PAIR_GRIDS, rules={}, legs=PAIR_LEGS)
+        tight = lcf.ListedComboWatch(k, lambda: sorted(rows), http=fake_yahoo({}),
+                                     event_map=rows).refresh(NOW)["markets"]
+        self.assertEqual(len(tight), 8)
+        for t, v in tight.items():
+            self.assertAlmostEqual(v["p"], wide[t]["p"], places=9)
+            self.assertGreater(wide[t]["p_hi"] - wide[t]["p_lo"], v["p_hi"] - v["p_lo"], t)
+
+    def test_the_spanish_vote_cuts_its_grid_a_day_ahead(self):
+        w, _k = self._watch()
+        late = lcf._parse_iso("2026-11-28T06:00:00Z").timestamp()
+        snap = w.refresh(late)
+        self.assertEqual(snap["events"][self.SPAIN]["cut_at"],
+                         lcf._parse_iso("2026-11-28T05:00:00Z").timestamp())
+        for v in snap["markets"].values():
+            self.assertEqual(v["cut"], v["event"] == self.SPAIN, v)
+
+    def test_a_leg_move_holds_its_grid_only(self):
+        w, k = self._watch()
+        w.refresh(NOW)
+        k.legs["CONTROLS-2028-D"] = (0.83, 0.84)                 # 5c in a minute
+        snap = w.refresh(NOW + 60)
+        self.assertEqual(snap["events"][self.BOP]["hold_until"], NOW + 60 + lcf.LEG_HOLD_S)
+        self.assertIsNone(snap["events"][self.SPAIN]["hold_until"])
+
+    def test_a_cell_off_the_legs_or_a_missing_cell_fails_the_grid(self):
+        extra = dict(PAIR_GRIDS[self.SPAIN], **{"VOX-ABASCAL": (
+            "Vox wins, Abascal becomes PM",
+            "Spanish general election winner: Vox, Next Prime Minister of Spain: Santiago Abascal")})
+        short = {c: v for c, v in PAIR_GRIDS[self.BOP].items() if c != "RR"}
+        w, _k = self._watch(grids={self.SPAIN: extra, self.BOP: short})
+        snap = w.refresh(NOW)
+        self.assertIn("legs not 'Spanish general election winner: ..., Next Prime Minister of "
+                      "Spain: ...'", snap["events"][self.SPAIN]["err"])
+        self.assertEqual(snap["events"][self.BOP]["err"], "grid has 3 cells, 4 expected")
+        self.assertEqual(snap["priced_series"], [])
+        self.assertFalse(any("p" in v for v in snap["markets"].values()))
+
+    def test_a_leg_never_read_fails_the_pair_closed(self):
+        legs = dict(PAIR_LEGS, **{"KXSPANISHPM-27AUG22-PSAN": ValueError("503")})
+        w, _k = self._watch(legs=legs)
+        snap = w.refresh(NOW)
+        self.assertEqual(snap["events"][self.SPAIN]["err"], "no read of KXSPANISHPM-27AUG22-PSAN")
+        self.assertEqual(snap["priced_series"], ["KXBALANCEPOWERCOMBO"])
 
 
 if __name__ == "__main__":

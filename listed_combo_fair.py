@@ -33,6 +33,13 @@ keeping it out, listed under "unmapped" with its reason; the bot emails both kin
 BAND per cell: each input moved alone to its low and its high -- the yes/no leg to its bid and
 ask, the number's centre and scale, DELTA -- and the moves combined in quadrature, up and down
 apart (independent errors: all four at an extreme at once would overstate it).
+TWO YES/NO LEGS (a "pair" row; Jack 2026-11-20: "Build it anyway", for House x Senate control
+and the Spanish election winner x the next PM): no number, and each outcome of each leg its own
+Kalshi market. A cell is P(A = a and B = b) under a Gaussian copula: RHO is how tightly the two
+legs move together, + for the outcomes that go together (a D House with a D Senate, PP with
+Feijoo), - for the rest. BAND: each leg to its bid and ask, RHO to its band's ends, in quadrature
+as above, then clipped to what no correlation can pass (max(0, a + b - 1) to min(a, b), at the
+legs' outer prices).
 HOLDS: a yes/no leg whose mid moves LEG_JUMP_C or more inside LEG_JUMP_WINDOW_S holds every combo
 on it LEG_HOLD_S -- the leg market is the headline feed (a deal headline reprices the agreement
 market first). A futures leg whose front month moves FUT_JUMP_PCT inside the window holds its
@@ -54,6 +61,7 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from datetime import datetime, timezone
+from statistics import NormalDist
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -183,6 +191,42 @@ EVENTS: Dict[str, dict] = {
                    "decides": "2027-04-16T20:00:00Z"},
         "delta": -1.5, "delta_band": (-3.0, 0.0),
     },
+    # TWO YES/NO LEGS ("pair" rows; Jack 2026-11-20: "Build it anyway").
+    # House control x Senate control after the 2028 elections (the party of the Speaker and of
+    # the President pro tempore on Feb 1, 2029, or the media call: the CONTROL rules, both legs),
+    # each outcome its own CONTROL market (D 79/80 and 88/89 on 11/20). RHO 0.6 (0.3-0.85): one
+    # national swing moves both chambers -- 3 of the 12 presidential years since 1980 split them,
+    # ~0.7 were each a coin flip; the 11/20 books price the D sweep near 0.3 and the R sweep
+    # near 0.55.
+    "KXBALANCEPOWERCOMBO-29FEB": {
+        "pair": [{"label": "House Control",
+                  "outcomes": {"Democratic": ("CONTROLH-2028-D", True),
+                               "Republican": ("CONTROLH-2028-R", True)}},
+                 {"label": "Senate Control",
+                  "outcomes": {"Democratic": ("CONTROLS-2028-D", True),
+                               "Republican": ("CONTROLS-2028-R", True)}}],
+        "together": [("Democratic", "Democratic"), ("Republican", "Republican")],
+        "rho": 0.6, "rho_band": (0.3, 0.85),
+        "decides": "2028-11-07T11:00:00Z",       # election day (06:00 ET), the cut's anchor
+    },
+    # The winner of the next Spanish general election (most seats in the Congress, PSC-PSOE's
+    # seats PSOE's; voting Nov 29, 2026) x the next PM (the first invested after it, before Aug
+    # 22, 2028): KXSPAINPARLI-27 and KXSPANISHPM-27AUG22, the combo's own rules (PP 76/77, PSOE
+    # 22/24, Feijoo 87/88, Sanchez 12/13 on 11/20). RHO 0.7 (0.4-0.9): the largest party's
+    # leader is usually invested, but not always (2023: PP the most seats, Sanchez invested).
+    # Feijoo priced above PP puts 10c+ on "PSOE wins, Feijoo PM" at any RHO.
+    "KXSPAINCOMBO-28AUG": {
+        "pair": [{"label": "Spanish general election winner",
+                  "outcomes": {"People's Party": ("KXSPAINPARLI-27-PP", True),
+                               "Spanish Socialist Workers' Party": ("KXSPAINPARLI-27-PSOE", True)}},
+                 {"label": "Next Prime Minister of Spain",
+                  "outcomes": {"Alberto Núñez Feijóo": ("KXSPANISHPM-27AUG22-AFEI", True),
+                               "Pedro Sánchez": ("KXSPANISHPM-27AUG22-PSAN", True)}}],
+        "together": [("People's Party", "Alberto Núñez Feijóo"),
+                     ("Spanish Socialist Workers' Party", "Pedro Sánchez")],
+        "rho": 0.7, "rho_band": (0.4, 0.9),
+        "decides": "2026-11-29T05:00:00Z",       # election day (06:00 CET), the cut's anchor
+    },
 }
 
 
@@ -203,8 +247,8 @@ def _parse_iso(s: Optional[str]) -> Optional[datetime]:
 # dates that pick its market or contract ("the 'Before Jan 1, 2028' market", "the February 2028
 # contract"). The yes/no resolvers find the leg's live Kalshi market; the number builders take
 # the same model and bands as the hand rows above. A hand row always wins; anything else -- an
-# unknown ruleset, two yes/no legs, a window already running, a grid that does not sum -- stays
-# unmapped with its reason, and the bot emails it.
+# unknown ruleset, two yes/no legs (a hand "pair" row prices those), a window already running, a
+# grid that does not sum -- stays unmapped with its reason, and the bot emails it.
 # ---------------------------------------------------------------------------------------------
 ET = ZoneInfo("America/New_York")
 _MON = {m: i + 1 for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug",
@@ -641,6 +685,77 @@ def grid_fair(cells: List[dict], binary: dict, legs: Dict[str, dict], num: dict,
     return out
 
 
+# ---- two yes/no legs ------------------------------------------------------------------------
+
+_N01 = NormalDist()
+
+
+def bvn_cdf(a: float, b: float, rho: float, n: int = 400) -> float:
+    """P(X < a, Y < b) for standard normals correlated rho: Simpson's rule over x below a of
+    phi(x) P(Y < b | x). |rho| is held to 0.995, far outside any band here."""
+    if a == -math.inf or b == -math.inf:
+        return 0.0
+    if a == math.inf:
+        return _ncdf(b)
+    if b == math.inf:
+        return _ncdf(a)
+    rho = max(-0.995, min(0.995, rho))
+    lo = -9.0
+    if a <= lo:
+        return 0.0
+    h, r = (a - lo) / n, math.sqrt(1.0 - rho * rho)
+    s = 0.0
+    for i in range(n + 1):
+        x = lo + i * h
+        f = math.exp(-0.5 * x * x) * _ncdf((b - rho * x) / r)
+        s += f * (1 if i in (0, n) else (4 if i % 2 else 2))
+    return max(0.0, min(1.0, s * h / 3.0 / math.sqrt(2.0 * math.pi)))
+
+
+def pair_joint(pa: float, pb: float, rho: float) -> float:
+    """P(A and B) for yes/no events of odds pa and pb whose latent normals correlate rho (a
+    Gaussian copula): rho 0 = pa x pb, rho -> 1 = min(pa, pb), rho -> -1 = max(0, pa + pb - 1)."""
+    if pa <= 0.0 or pb <= 0.0:
+        return 0.0
+    if pa >= 1.0 or pb >= 1.0:
+        return min(pa, pb, 1.0)
+    j = bvn_cdf(_N01.inv_cdf(pa), _N01.inv_cdf(pb), rho)
+    return min(max(j, pa + pb - 1.0, 0.0), pa, pb)
+
+
+def pair_fair(cells: List[dict], legs: Dict[str, dict], rho: float,
+              rho_band: Tuple[float, float]) -> Dict[str, dict]:
+    """{ticker: {p, p_lo, p_hi}} for a two-yes/no-leg grid. `cells`: {ticker, a, b, sign} -- a
+    and b each (leg market, is_yes), sign +1 where the two outcomes go together, -1 where they
+    pull apart. `legs`: the yes/no leg reads by market ticker ({bid, ask, mid})."""
+    def p_of(leg: Tuple[str, bool], which: str) -> float:
+        mk, is_yes = leg
+        r = legs[mk]
+        if is_yes:
+            return float(r[which])
+        return 1.0 - float(r[{"bid": "ask", "mid": "mid", "ask": "bid"}[which]])
+
+    out: Dict[str, dict] = {}
+    for c in cells:
+        s = float(c["sign"])
+        a_lo, a_mid, a_hi = (p_of(c["a"], w) for w in ("bid", "mid", "ask"))
+        b_lo, b_mid, b_hi = (p_of(c["b"], w) for w in ("bid", "mid", "ask"))
+
+        def at(pa=a_mid, pb=b_mid, r=rho) -> float:
+            return pair_joint(pa, pb, s * r)
+        fair = at()
+        # each input at its low and high with the rest at the fair's, in quadrature (grid_fair)
+        pairs = ((at(pa=a_lo), at(pa=a_hi)), (at(pb=b_lo), at(pb=b_hi)),
+                 (at(r=rho_band[0]), at(r=rho_band[1])))
+        up = math.sqrt(sum(max(0.0, max(x, y) - fair) ** 2 for x, y in pairs))
+        dn = math.sqrt(sum(max(0.0, fair - min(x, y)) ** 2 for x, y in pairs))
+        # no correlation passes these (the Frechet bounds), at the legs' outer prices
+        floor_, ceil_ = max(0.0, a_lo + b_lo - 1.0), min(a_hi, b_hi)
+        out[c["ticker"]] = {"p": round(fair, 5), "p_lo": round(max(floor_, fair - dn), 5),
+                            "p_hi": round(min(ceil_, fair + up), 5)}
+    return out
+
+
 def split_title(title: str, a: str, b: str) -> Optional[Tuple[str, str]]:
     """('<a>: x, <b>: y' or '<b>: y, <a>: x') -> (x, y), else None."""
     t = " ".join((title or "").split())
@@ -705,7 +820,8 @@ class ListedComboWatch:
     snap = {"checked_ts", "legs": {key: {kind, bid, ask, mid, ts, hold_until, err}},
     "events": {event: {legs, ts, hold_until, cut_at, n, n_priced, sum_p, err}},
     "markets": {ticker: {event, outcome, bin, p, p_lo, p_hi, ts, hold_until, cut} or
-    {event, err}}, "unmapped": [events], "errors", "model"}"""
+    {event, err}} (a pair grid's bin is its second leg's outcome, with the copula's sign),
+    "unmapped": [events], "errors", "model"}"""
 
     def __init__(self, get_json: Optional[Callable[[str, dict], dict]],
                  events: Callable[[], Iterable[str]] = lambda: sorted(EVENTS),
@@ -831,14 +947,15 @@ class ListedComboWatch:
         bins_needed = {}
         for ev in mapped:
             cfg = self.cfgs[ev]
-            for mk, _is_yes in set(cfg["binary"]["outcomes"].values()):
-                bins_needed[mk] = True
+            for leg in cfg["pair"] if "pair" in cfg else [cfg["binary"]]:
+                for mk, _is_yes in set(leg["outcomes"].values()):
+                    bins_needed[mk] = True
         for mk in sorted(bins_needed):
             self._read_binary(mk, now_ts, errors)
         if now_ts - self.fut_at >= FUT_REFRESH_S:
             for ev in mapped:
-                num = self.cfgs[ev]["number"]
-                if num["model"] == "lognormal":
+                num = self.cfgs[ev].get("number")
+                if num and num["model"] == "lognormal":
                     self._read_futures(num, f"fut {ev}", now_ts, errors)
             self.fut_at = now_ts
         legs_out = {k: dict(v, hold_until=self.hold_until.get(k)) for k, v in self.leg.items()}
@@ -882,17 +999,24 @@ class ListedComboWatch:
 
     def _price_event(self, ev: str, now_ts: float) -> Tuple[dict, Dict[str, dict]]:
         cfg = self.cfgs[ev]
-        binary, num = cfg["binary"], cfg["number"]
+        pair = cfg.get("pair")
+        if pair:                                      # two yes/no legs, every outcome a market
+            binary, num, fut_key = None, None, None
+            leg_keys = sorted({mk for leg in pair for mk, _y in leg["outcomes"].values()})
+            decides = [cfg.get("decides")] + [leg.get("decides") for leg in pair]
+        else:
+            binary, num = cfg["binary"], cfg["number"]
+            leg_keys = sorted({mk for mk, _y in binary["outcomes"].values()})
+            fut_key = f"fut {ev}" if num["model"] == "lognormal" else None
+            decides = [binary.get("decides"), num.get("decides")]
         markets = [m for m in self.markets.get(ev) or []
                    if m.get("status") in ("active", "open")]
-        leg_keys = sorted({mk for mk, _y in binary["outcomes"].values()})
-        fut_key = f"fut {ev}" if num["model"] == "lognormal" else None
         live_keys = leg_keys + ([fut_key] if fut_key else [])
         hold = max([self.hold_until.get(k, 0.0) for k in live_keys] + [0.0])
         ts_list = [(self.leg.get(k) or {}).get("ts") for k in live_keys]
         ts = None if any(t is None for t in ts_list) else min(ts_list)
         # cut: the earliest scheduled decision (or close), less CUTOFF_H
-        dec = [_parse_iso(x) for x in (binary.get("decides"), num.get("decides")) if x]
+        dec = [_parse_iso(x) for x in decides if x]
         closes = [_parse_iso(m.get("close_time")) for m in markets]
         anchors = [d.timestamp() for d in dec + closes if d is not None]
         cut_at = (min(anchors) - CUTOFF_H * 3600.0) if anchors else None
@@ -908,6 +1032,31 @@ class ListedComboWatch:
         bad = [k for k in live_keys if (self.leg.get(k) or {}).get("err") or not self.leg.get(k)]
         if bad and any((self.leg.get(k) or {}).get("ts") is None for k in bad):
             return fail("no read of " + ", ".join(bad))
+        cut = cut_at is not None and now_ts >= cut_at
+        if pair:
+            # every cell: an outcome of each leg ("House Control: Democratic, Senate Control:
+            # Republican"); its row's "outcome" is the first leg's, "bin" the second's
+            (la, lb), together = pair, {tuple(x) for x in cfg.get("together") or ()}
+            pcells = []
+            for m in markets:
+                t = str(m.get("ticker") or "")
+                sp = cell_split(m, la["label"], lb["label"])
+                if sp is None or sp[0] not in la["outcomes"] or sp[1] not in lb["outcomes"]:
+                    return fail(f"{t}: legs not '{la['label']}: ..., {lb['label']}: ...'")
+                pcells.append({"ticker": t, "outcome": sp[0], "bin": sp[1],
+                               "a": la["outcomes"][sp[0]], "b": lb["outcomes"][sp[1]],
+                               "sign": 1 if sp in together else -1})
+            want = len(la["outcomes"]) * len(lb["outcomes"])
+            if len(pcells) != want or len({(c["outcome"], c["bin"]) for c in pcells}) != want:
+                return fail(f"grid has {len(pcells)} cells, {want} expected")
+            priced = pair_fair(pcells, {k: self.leg[k] for k in leg_keys}, float(cfg["rho"]),
+                               tuple(cfg["rho_band"]))
+            out = {c["ticker"]: dict(priced[c["ticker"]], event=ev, outcome=c["outcome"],
+                                     bin=c["bin"], sign=c["sign"], ts=ts,
+                                     hold_until=hold or None, cut=cut) for c in pcells}
+            evrow.update(n_priced=len(out), sum_p=round(sum(r["p"] for r in out.values()), 4),
+                         rho=cfg["rho"], rho_band=list(cfg["rho_band"]))
+            return evrow, out
         # parse every cell: outcome x bin
         cells, bins = [], {}
         for m in markets:
@@ -940,7 +1089,6 @@ class ListedComboWatch:
             tot = sum(r["p"] for r in priced.values())
             if not 0.95 <= tot <= 1.05:
                 return fail(f"auto map prices the grid at {tot:.3f}, not ~1")
-        cut = cut_at is not None and now_ts >= cut_at
         out: Dict[str, dict] = {}
         for c in cells:
             row = priced[c["ticker"]]
