@@ -125,11 +125,19 @@ class PickoffAlertTests(unittest.TestCase):
         self.assertTrue(subject.startswith("market-wave pick-off: PICK-OFF"))
 
     def test_small_ones_email_only(self):
-        row = dict(self.ROW, adverse_usd=40.0, contracts=100.0)
-        r = {"hours": 6, "flagged": [row], "new": [row], "acted": [], "series_trips": [], "flagged_usd": 40.0}
+        """Jack 2026-11-20: "lower pick-off watch alert size to $25" (was $100): a $25+
+        new pick-off texts; under $25 (a manual --min-usd run) only emails."""
+        row = dict(self.ROW, adverse_usd=20.0, contracts=100.0)
+        r = {"hours": 6, "flagged": [row], "new": [row], "acted": [], "series_trips": [], "flagged_usd": 20.0}
         self.assertFalse(wa.pickoff_msg(r)[4])
         r["series_trips"] = [{"wave": "w", "series": "KXHOUSERACE", "markets": ["a", "b", "c"]}]
         self.assertTrue(wa.pickoff_msg(r)[4])                       # a series trip always texts
+
+    def test_twenty_five_dollars_texts(self):
+        for usd, texts in ((24.99, False), (25.0, True), (40.0, True)):
+            row = dict(self.ROW, adverse_usd=usd, contracts=100.0)
+            r = {"hours": 6, "flagged": [row], "new": [row], "acted": [], "series_trips": [], "flagged_usd": usd}
+            self.assertEqual(wa.pickoff_msg(r)[4], texts, usd)
 
     def test_old_fill_says_when_it_filled(self):
         """Jack 2026-11-12 "are they delayed?": the 3:08 PM sweep fill alerted at 7:02 PM,

@@ -15,7 +15,7 @@ it now runs this, so every alert reads the same:
     python wave_alert.py wave --detect ... --outcome not-live --why-not "shard-0 cash $3.2k < $5k" --send
     # a relight (relight_watch.py's --json)
     python wave_alert.py relight --relight run-logs/pvd-scan/relight_watch_last.json [--send]
-    # pick-offs on wave markets (pvd_waves.py pickoffs --json): texts at $100+ new,
+    # pick-offs on wave markets (pvd_waves.py pickoffs --json): texts at $25+ new,
     # a series trip or a stand-down; email whenever something new was flagged
     python wave_alert.py pickoff --pickoffs run-logs/pvd-scan/pickoffs_last.json [--send]
     # an UPCOMING wave (wave_detect.py --upcoming --json, the relight task's pass 11):
@@ -478,7 +478,10 @@ def relight_msg(r: dict):
     return text, short(head, 150), "market-wave relight: " + short(head, 150), "\n".join(body), big
 
 
-PICKOFF_TEXT_USD = 100.0      # text a pick-off alert at $100+ new, a series trip or a stand-down
+# text a pick-off alert at $25+ new, a series trip or a stand-down (Jack 2026-11-20: "lower
+# pick-off watch alert size to $25", was $100 -- the flag bar is $25 too, so every NEW flagged
+# pick-off now texts; a manual `pickoffs --min-usd` under $25 still emails only)
+PICKOFF_TEXT_USD = 25.0
 
 
 def pickoff_msg(r: dict):
@@ -929,7 +932,7 @@ def main() -> int:
     rl = sub.add_parser("relight")
     rl.add_argument("--relight", required=True)
     rl.add_argument("--send", action="store_true")
-    po = sub.add_parser("pickoff", help="from pvd_waves.py pickoffs --json: texts at $100+ new, a series trip or a stand-down")
+    po = sub.add_parser("pickoff", help="from pvd_waves.py pickoffs --json: texts at $25+ new, a series trip or a stand-down")
     po.add_argument("--pickoffs", required=True)
     po.add_argument("--send", action="store_true")
     dk = sub.add_parser("dark", help="from pvd_waves.py darkcheck --json: listed markets resting nothing")
