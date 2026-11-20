@@ -55,7 +55,9 @@ rem Every fill that opened or added to a position on a wave market in the last 6
 rem to the book with OUR orders taken out, flagged at 5c+ and $25+ against us; 3+ flagged
 rem markets in one series = a series trip. --act pins a flagged REGISTRY-wave market (or a
 rem tripped series) at the wave's base size and re-tunes it now (legacy waves: reported
-rem for a hand edit, Jack's word). Exit 3 = something new -> wave_alert.py texts at $25+
+rem for a hand edit, Jack's word). ROUND TRIPS (Jack 2026-11-20): a wave market whose positions
+rem opened and closed again inside 24 h net $25+ lost alerts too (alert only; --rt-usd 0 = off).
+rem Exit 3 = something new -> wave_alert.py texts at $25+
 rem new, a series trip or a stand-down, and emails. State: run-logs\pvd-scan\pickoff_state.json.
 echo ===== %date% %time% pass 8: pick-off watch >> "%LOG%"
 "%PY%" "%KL%\pvd_waves.py" pickoffs all --hours 6 --act --update-state --json "%KL%\run-logs\pvd-scan\pickoffs_last.json" >> "%LOG%" 2>&1

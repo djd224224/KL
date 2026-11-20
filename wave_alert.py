@@ -16,7 +16,9 @@ it now runs this, so every alert reads the same:
     # a relight (relight_watch.py's --json)
     python wave_alert.py relight --relight run-logs/pvd-scan/relight_watch_last.json [--send]
     # pick-offs on wave markets (pvd_waves.py pickoffs --json): texts at $25+ new,
-    # a series trip or a stand-down; email whenever something new was flagged
+    # a series trip or a stand-down; email whenever something new was flagged. The
+    # same alert carries ROUND TRIPS: a market whose positions opened and closed again
+    # inside 24 h netting $25+ lost (texts too)
     python wave_alert.py pickoff --pickoffs run-logs/pvd-scan/pickoffs_last.json [--send]
     # an UPCOMING wave (wave_detect.py --upcoming --json, the relight task's pass 11):
     # advance notice before its programs start; texts when a wave would be greenlit or a
@@ -490,12 +492,25 @@ def pickoff_msg(r: dict):
     new, flagged = r.get("new") or [], r.get("flagged") or []
     acted, trips = r.get("acted") or [], r.get("series_trips") or []
     new_usd = sum(float(g.get("adverse_usd") or 0) for g in new)
+    # ROUND TRIPS (Jack 2026-11-20: "Yes, add it"): a wave market whose positions opened and
+    # closed again inside 24 h net -$25 or worse -- the losing leg is the closing fill, which
+    # the pick-off mark never sees (AZ Kelly, ~$79 in four trips, never flagged)
+    rt = r.get("roundtrips") or {}
+    rt_new, rt_flagged = rt.get("new") or [], rt.get("flagged") or []
+    rt_new_usd = -sum(float(g.get("net_usd") or 0) for g in rt_new)
+    rt_head = (f"ROUND TRIPS: {plural(len(rt_new), 'wave mkt')} -${rt_new_usd:,.0f} new "
+               f"({len(rt_flagged)} flagged, -${float(rt.get('flagged_usd') or 0):,.0f} in {rt.get('hours', 24):g}h)")
+    pick = bool(new or acted)
     head = (f"PICK-OFF: {plural(len(new), 'wave mkt')} -${new_usd:,.0f} new "
             f"({len(flagged)} flagged, -${float(r.get('flagged_usd') or 0):,.0f} in {r.get('hours', 0):g}h)"
-            + (f"; {len(acted)} stood down at base" if acted else ""))
+            + (f"; {len(acted)} stood down at base" if acted else "")) if pick or not rt_new else rt_head
     p = r.get("params") or {}
-    whys = [f"Why: adding fills now {p.get('min_c', 5):g}c+ and ${p.get('min_usd', 25):g}+ against us, "
-            f"marked to the book with our orders out"]
+    whys = ([f"Why: adding fills now {p.get('min_c', 5):g}c+ and ${p.get('min_usd', 25):g}+ against us, "
+             f"marked to the book with our orders out"] if pick or not rt_new else [])
+    if rt_new:
+        whys.append((rt_head + "; why" if pick else "Why") + f": positions opened AND closed again inside "
+                    f"{rt.get('hours', 24):g}h netting ${rt.get('min_usd', 25):g}+ lost (closes matched to the newest "
+                    f"open, our fill prices). Alert only: turning a market off is your word")
     if trips:
         whys.append("Series trip: " + ", ".join(f"{t['series']} ({len(t['markets'])} mkts)" for t in trips)
                     + " -- stand the series down")
@@ -515,7 +530,9 @@ def pickoff_msg(r: dict):
         if t1 is None:
             return ""
         t0 = t0 or t1
-        span = et_clock(t0) if t1 - t0 < timedelta(minutes=1) else f"{et_clock(t0, ampm=False)}-{et_clock(t1)}"
+        same = et_clock(t0)[-2:] == et_clock(t1)[-2:]     # a round trip's span can cross AM / PM
+        span = (et_clock(t0) if t1 - t0 < timedelta(minutes=1)
+                else f"{et_clock(t0, ampm=not same)}-{et_clock(t1)}")
         mins = max(0, int((at - t1).total_seconds() // 60))
         ago = f"{mins} min" if mins < 60 else f"{mins // 60}h {mins % 60:02d}m"
         return f" filled {span} ET ({'last ' if t1 - t0 >= timedelta(minutes=1) else ''}{ago} ago)"
@@ -524,8 +541,18 @@ def pickoff_msg(r: dict):
         verb = "bought" if g["side"] == "bid" else "sold"
         return (f"{g['ticker']} {verb} {g['contracts']:,.0f} @{g['vwap_c']:g}{when(g)}, mark {g['mark_c']:.1f} "
                 f"(-${g['adverse_usd']:,.0f})")
-    rows = sorted(new or flagged, key=lambda g: float(g.get("adverse_usd") or 0), reverse=True)
+    def leg(x):
+        verb = ("bought {n} @{o:g}, sold @{c:g}" if x["dir"] == "long" else "sold {n} @{o:g}, bought back @{c:g}")
+        return verb.format(n=f"{x['contracts']:,.0f}", o=x["open_c"], c=x["close_c"]) + f" (-${-x['usd']:,.0f})"
+
+    def rt_one(g):
+        trips_ = plural(int(g.get("legs") or 0), "closed leg")
+        return (f"{g['ticker']} net -${-float(g['net_usd']):,.0f} in {trips_}{when(g)}; worst "
+                + "; ".join(leg(x) for x in (g.get("worst") or [])[:2] if float(x.get("usd") or 0) < 0))
+    rows = sorted(new or (flagged if not rt_new else []), key=lambda g: float(g.get("adverse_usd") or 0), reverse=True)
     lines = [head] + whys + [f"x{i}. {one(g)}" for i, g in enumerate(rows[:N_NAMES], 1)]
+    rt_rows = sorted(rt_new, key=lambda g: float(g.get("net_usd") or 0))
+    lines += [f"r{i}. {rt_one(g)}" for i, g in enumerate(rt_rows[:N_NAMES], 1)]
     lines += [f"DOWN {x.get('ticker') or 'series ' + x.get('series', '')} at {x['pin']} a side ({x['wave']})"
               for x in acted[:5]]
     text = "\n".join(lines)
@@ -534,10 +561,20 @@ def pickoff_msg(r: dict):
     body = [head] + whys + ["", "FLAGGED (marked to the book, our orders out):"]
     body += [f"  {'NEW ' if g in new else '    '}{one(g)}  [{g['wave']}{'' if g.get('registry') else ', legacy'}, "
              f"held {g.get('pos_now', 0):+,.0f}, last fill {str(g.get('last'))[:16]}Z]" for g in flagged]
+    if not flagged:
+        body += ["  (none)"]
+    if rt_flagged:
+        body += ["", f"ROUND TRIPS (opened and closed inside {rt.get('hours', 24):g}h, net ${rt.get('min_usd', 25):g}+ lost):"]
+        for g in sorted(rt_flagged, key=lambda g: float(g.get("net_usd") or 0)):
+            body += [f"  {'NEW ' if g in rt_new else '    '}{rt_one(g)}  [{g['wave']}"
+                     f"{'' if g.get('registry') else ', legacy'}, held {g.get('pos_now', 0):+,.0f}]"]
+        body += ["  Turn one off (your word): say \"turn off <TICKER>\" in a Claude session (a pin at 0: "
+                 "nothing new rests, a held position still closes)."]
     body += ["", "Stood down: " + (", ".join(f"{x.get('ticker') or x.get('series')} at {x['pin']}" for x in acted)
                                    or "nothing (legacy waves need your word; registry waves only with --act)")]
     body += ["", "Undo a stand-down: python pvd_waves.py setarg <WAVE> pin <TICKER>:<N> --unset ... or ask a Claude session."]
-    do_text = new_usd >= PICKOFF_TEXT_USD or bool(trips) or bool(acted)
+    do_text = (new_usd >= PICKOFF_TEXT_USD or bool(trips) or bool(acted)
+               or (bool(rt_new) and rt_new_usd >= PICKOFF_TEXT_USD))
     return text, short(head, 150), "market-wave pick-off: " + short(head, 150), "\n".join(body), do_text
 
 
@@ -932,7 +969,8 @@ def main() -> int:
     rl = sub.add_parser("relight")
     rl.add_argument("--relight", required=True)
     rl.add_argument("--send", action="store_true")
-    po = sub.add_parser("pickoff", help="from pvd_waves.py pickoffs --json: texts at $25+ new, a series trip or a stand-down")
+    po = sub.add_parser("pickoff", help="from pvd_waves.py pickoffs --json: texts at $25+ new (pick-offs or "
+                                        "round trips), a series trip or a stand-down")
     po.add_argument("--pickoffs", required=True)
     po.add_argument("--send", action="store_true")
     dk = sub.add_parser("dark", help="from pvd_waves.py darkcheck --json: listed markets resting nothing")

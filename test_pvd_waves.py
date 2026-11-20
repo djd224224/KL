@@ -407,6 +407,109 @@ class PickoffTests(unittest.TestCase):
         self.assertEqual(pw.adding_count({"pos_before": 300, "pos_after": 100}), 0)
 
 
+def rtf(t, d, px, pb, ts, avg=0.0):
+    """a fill moving the YES position by d at px (YES cents), at unix time ts"""
+    return {"ts": ts, "ticker": t, "yes_price_cents": px, "pos_before": pb, "pos_after": pb + d,
+            "avg_before": avg, "our_book_side": "bid" if d > 0 else "ask", "count": abs(d),
+            "fill_id": f"{t}-{ts}-{d}"}
+
+
+class RoundTripTests(unittest.TestCase):
+    """Jack 2026-11-20: "Yes, add it" -- alert on a wave market's round-trip losses ($25+
+    in 24 h). AZ Kelly lost ~$79 in four trips 11/19-11/20 with no pick-off flag: the
+    adding fills were under 5c / $25 against us and the loss was on the closing fill."""
+    T = "KXWAVE-RT-1"
+
+    def test_legs_lifo_both_in_window(self):
+        t0 = 1000.0
+        fills = [rtf(self.T, -200, 7.4, 200, 1100, avg=12.0),    # closes a lot from before t0: an unwind
+                 rtf(self.T, -200, 5.9, 0, 1200),                 # short 200 @5.9 ...
+                 rtf(self.T, 200, 11.0, -200, 1300),              # ... bought back @11: -$10.20
+                 rtf(self.T, 750, 12.0, 0, 1400),
+                 rtf(self.T, -750, 5.2, 750, 1500)]               # bought 750 @12, sold @5.2: -$51
+        legs = pw.roundtrip_legs(fills, t0)[self.T]
+        self.assertEqual([(g["dir"], g["contracts"], g["usd"]) for g in legs],
+                         [("short", 200, -10.2), ("long", 750, -51.0)])
+
+    def test_newest_lot_closes_first_and_old_inventory_never_counts(self):
+        fills = [rtf(self.T, 200, 12.0, 200, 1100, avg=30.0),    # held 200 from before; adds 200 @12
+                 rtf(self.T, -200, 7.0, 400, 1200),               # closes the NEW lot: -$10
+                 rtf(self.T, -200, 6.0, 200, 1300)]               # closes the old lot: not a round trip
+        legs = pw.roundtrip_legs(fills, 1000.0)[self.T]
+        self.assertEqual([(g["open_c"], g["close_c"], g["usd"]) for g in legs], [(12.0, 7.0, -10.0)])
+
+    def test_flip_and_log_order_and_chain_break(self):
+        fills = [rtf(self.T, 300, 10.0, 0, 1100),
+                 rtf(self.T, -500, 8.0, 300, 1200),               # closes 300 (-$6), opens short 200 @8
+                 rtf(self.T, 180, 9.0, -200, 1301),               # logged before the 20 with an EARLIER ts:
+                 rtf(self.T, 20, 9.0, -20, 1300),                 # the log order is the chain (-$2 together)
+                 rtf(self.T, -100, 50.0, 500, 1400)]              # a break (500, not 0): a lot from before
+        legs = pw.roundtrip_legs(fills, 1000.0)[self.T]
+        self.assertEqual([g["usd"] for g in legs], [-6.0, -1.8, -0.2])
+
+    def _write(self, fills):
+        day = datetime.now(timezone.utc).date().isoformat()
+        with open(os.path.join(INC, f"fills_{day}.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(f) for f in fills) + "\n")
+
+    def setUp(self):
+        write_bot(own_pos={})
+        reg = {"waves": {"wtest": {"series": ["KXWAVE"], "since": "2026-11-08T00:00:00Z", "go_live": "2026-11-08T00:00:00Z",
+                                   "port": 8790, "dir": "pvd-watch-wtest", "scan_size": 200, "budget": 0,
+                                   "stop_cap": None, "preset": "default", "tune": list(pw.PRESETS["default"]),
+                                   "near": [], "near_tune": list(pw.PRESETS["near"]), "enabled": True}}}
+        with open(os.environ["PVD_WAVES_REGISTRY"], "w", encoding="utf-8") as fh:
+            json.dump(reg, fh)
+        with open(pw.LIST, "w", encoding="utf-8") as fh:
+            json.dump({"markets": {}}, fh)
+        BOOKS.clear()
+        ORDERS[:] = []
+        if os.path.exists(os.environ["PVD_PICKOFF_STATE"]):
+            os.remove(os.environ["PVD_PICKOFF_STATE"])
+        now = time.time()
+        # 8-10 h ago: outside the 6 h pick-off window, inside the 24 h round-trip one
+        self.fills = [rtf(self.T, 750, 12.0, 0, now - 10 * 3600), rtf(self.T, -750, 5.2, 750, now - 9 * 3600),
+                      rtf("KXOTHER-X", 500, 50.0, 0, now - 9 * 3600), rtf("KXOTHER-X", -500, 10.0, 500, now - 8 * 3600)]
+        self._write(self.fills)
+
+    def args(self, **kw):
+        a = argparse.Namespace(name="all", hours=6.0, min_c=5.0, min_usd=25.0, series_trip=3, act=False,
+                               update_state=True, top=10, json=os.path.join(TMP, "rt.json"),
+                               rt_hours=24.0, rt_usd=25.0)
+        for k, v in kw.items():
+            setattr(a, k, v)
+        return a
+
+    def test_alerts_once_then_on_another_25(self):
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pw.cmd_pickoffs(self.args()), 3)
+        rt = json.load(open(os.path.join(TMP, "rt.json")))["roundtrips"]
+        self.assertEqual([g["ticker"] for g in rt["flagged"]], [self.T])     # not a wave market: left out
+        self.assertEqual((rt["new"][0]["net_usd"], rt["new"][0]["legs"]), (-51.0, 1))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pw.cmd_pickoffs(self.args()), 0)                 # remembered
+        now = time.time()
+        more = [rtf(self.T, -200, 5.0, 0, now - 7 * 3600), rtf(self.T, 200, 10.0, -200, now - 7 * 3600 + 60)]
+        self._write(self.fills + more)                                        # -$10 more: under another $25
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pw.cmd_pickoffs(self.args()), 0)
+        more += [rtf(self.T, 300, 10.0, 0, now - 7 * 3600 + 120), rtf(self.T, -300, 5.0, 300, now - 7 * 3600 + 180)]
+        self._write(self.fills + more)                                        # -$15 more: -$76, $25 past -$51
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pw.cmd_pickoffs(self.args()), 3)
+        rt = json.load(open(os.path.join(TMP, "rt.json")))["roundtrips"]
+        self.assertEqual(rt["new"][0]["net_usd"], -76.0)
+
+    def test_off_switch(self):
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pw.cmd_pickoffs(self.args(rt_usd=0.0)), 0)
+        self.assertTrue(json.load(open(os.path.join(TMP, "rt.json")))["roundtrips"]["off"])
+
+    def test_report_namespace_without_rt_args(self):
+        rt = pw.roundtrip_scan(argparse.Namespace(name="all"), pw.load())
+        self.assertEqual((rt["hours"], rt["min_usd"]), (24.0, 25.0))
+
+
 class SetargTests(unittest.TestCase):
     def test_unset_one_pin_of_several(self):
         with open(os.environ["PVD_WAVES_REGISTRY"], "w", encoding="utf-8") as fh:
