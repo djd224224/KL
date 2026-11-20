@@ -9,9 +9,12 @@ the same reason. (Not the RFQ multivariate combos: combo_maker.py.)
 
 THE SHAPE. Every listed grid Kalshi runs today crosses ONE yes/no leg that another Kalshi market
 prices (the 2028 party, Le Pen, the US-Iran deal, Hormuz traffic) with ONE binned number (WTI or
-the pump price on a date, the S&P 500's change over 2029, December 2029 CPI, 2029 GDP, EUR/USD
-across the French vote). A cell is
+the pump price on a date, the S&P 500's change over 2029, December 2029 CPI, 2029 GDP, the jobs
+added in 2029, the December 2029 unemployment rate, EUR/USD across the French vote). A cell is
 P(yes/no leg = its outcome) x P(number in its bin | that outcome).
+CELLS: each cell's legs from its title ("Iran deal: Agreed, WTI: $60 to $74.99") or, where the
+title is short ("Democrat, 0-500K": the party grids since 11/19), from the cell's own rules
+("If ALL of the following occur: Party: Democratic, Jobs added in 2029: 0 to 500,000, ...").
 
 LEGS (EVENTS, per combo event, by hand; any other event is AUTO-MAPPED from its own rules when
 both legs are of a kind priced here -- see auto_map -- and otherwise stays unpriced, the gate
@@ -20,7 +23,8 @@ keeping it out, listed under "unmapped" with its reason; the bot emails both kin
            a 'not' outcome is 1 - it. A book wider than LEG_MAX_SPREAD is no read.
   number   'lognormal' (a price on a date: the forward from the named futures contract, vol x
            sqrt(T)) or 'normal' (a % change or a print: mean, sd -- a prior). The bins come from
-           the cells' own titles ("Below $60", "$60 to $74.99", "2.0% to 2.9%", "20% or above");
+           the cells' legs ("Below $60", "$60 to $74.99", "2.0% to 2.9%", "20% or above",
+           "500,000 to 1 million");
            adjacent bins split at the midpoint of their facing edges (74.99 | 75 -> 74.995,
            1.9 | 2.0 -> 1.95, 0 | 0 -> 0), which honours each grid's inclusive wording.
   link     DELTA = the number's mean in the YES world minus its mean in the NO world (log units
@@ -141,6 +145,31 @@ EVENTS: Dict[str, dict] = {
                    "decides": "2030-01-30T13:30:00Z"},
         "delta": 0.0, "delta_band": (-0.5, 0.5),
     },
+    # Party x the jobs added in 2029: seasonally adjusted total nonfarm payrolls, December 2029
+    # minus December 2028, first print (before the Feb 2030 benchmark). Jack 2026-11-20: "Yes,
+    # map them". 11/20 anchor: November 2026 ~+90K (KXPAYROLLS-26NOV's median), a ~1.0M/yr
+    # pace; low immigration holds the trend near 50-90K a month by 2029, and a 2029 recession
+    # (~1 in 5) takes the year below 0. 550K (150K-950K), sd 850K (650K-1.1M). Party link 0
+    # (+-300K).
+    "KXPAYROLLSPARTYCOMBO-30SEP": {
+        "binary": PARTY_2028,
+        "number": {"label": "Jobs added in 2029", "model": "normal",
+                   "mean": 550000.0, "mean_band": (150000.0, 950000.0),
+                   "sd": 850000.0, "sd_band": (650000.0, 1100000.0),
+                   "decides": "2030-01-04T13:30:00Z"},
+        "delta": 0.0, "delta_band": (-300000.0, 300000.0),
+    },
+    # Party x the December 2029 U-3 unemployment rate (seasonally adjusted, first print, one
+    # decimal). 11/20 anchor: November 2026 ~4.1% (KXU3-26NOV); ~4.2-4.4% longer run, and the
+    # recession tail over three years lifts the mean. 4.5% (4.1-4.9), sd 0.8 (0.6-1.1). Party
+    # link 0 (+-0.3).
+    "KXU3PARTYCOMBO-30SEP": {
+        "binary": PARTY_2028,
+        "number": {"label": "Unemployment rate", "model": "normal",
+                   "mean": 4.5, "mean_band": (4.1, 4.9), "sd": 0.8, "sd_band": (0.6, 1.1),
+                   "decides": "2030-01-04T13:30:00Z"},
+        "delta": 0.0, "delta_band": (-0.3, 0.3),
+    },
     # French president 2027 (Le Pen) x EUR/USD's change from 4 PM ET Fri Apr 16 to 10 AM ET Mon
     # May 3, 2027 (Pyth, 16.75 days): EUR/USD ~7.5%/yr -> 1.6% over the window, 1.8% with the
     # vote (1.4-2.4). Link: a Le Pen win ~1.5 points weaker for the euro (0 to -3).
@@ -208,6 +237,16 @@ def _election_day(year: int) -> datetime:
     while d.weekday() != 0:
         d = d.replace(day=d.day + 1)
     return d.replace(day=d.day + 1).astimezone(timezone.utc)
+
+
+def _jobs_day(year: int, month: int) -> datetime:
+    """A month's Employment Situation: the first Friday of the next month, 8:30 AM ET (BLS
+    moves it a week when that Friday falls on the 1st-2nd; the market's close covers that)."""
+    y, mo = (year + 1, 1) if month == 12 else (year, month + 1)
+    d = datetime(y, mo, 1, 8, 30, tzinfo=ET)
+    while d.weekday() != 4:
+        d = d.replace(day=d.day + 1)
+    return d.astimezone(timezone.utc)
 
 
 def _fut(root: str, year: int, month: int) -> str:
@@ -358,6 +397,31 @@ def _number_leg(label: str, ruleset: str, rules: str, now_ts: float) -> dict:
         return {"label": label, "model": "normal", "kind": "GDPYEAR", "mean": 1.9,
                 "mean_band": (1.4, 2.4), "sd": 1.4, "sd_band": (1.1, 1.8),
                 "decides": _iso(datetime(yr + 1, 1, 30, 13, 30, tzinfo=timezone.utc))}
+    if ruleset == "PAYROLLS":
+        m = re.search(r"total nonfarm payroll employment from ([A-Z][a-z]+) (\d{4}) to "
+                      r"([A-Z][a-z]+) (\d{4})", rules)
+        if not m:
+            raise ValueError("payrolls: no window in the rules")
+        m0, y0 = _MON[m.group(1)[:3].lower()], int(m.group(2))
+        m1, y1 = _MON[m.group(3)[:3].lower()], int(m.group(4))
+        if (y1 - y0) * 12 + (m1 - m0) != 12:
+            raise ValueError("payrolls: not a 12-month change (the prior is a year's)")
+        if (y0 - now.year) * 12 + (m0 - now.month) < 1:
+            raise ValueError("payrolls: the window is under way (it needs the data so far, "
+                             "not the prior)")
+        return {"label": label, "model": "normal", "kind": "PAYROLLS", "mean": 550000.0,
+                "mean_band": (150000.0, 950000.0), "sd": 850000.0,
+                "sd_band": (650000.0, 1100000.0), "decides": _iso(_jobs_day(y1, m1))}
+    if ruleset == "ECONSTATB" and re.search(r"unemployment rate \(U-3\)", rules, re.I):
+        m = re.search(r"unemployment rate \(U-3\) for ([A-Z][a-z]+) (\d{4})", rules, re.I)
+        if not m:
+            raise ValueError("U-3: no month in the rules")
+        mo, yr = _MON[m.group(1)[:3].lower()], int(m.group(2))
+        if (yr - now.year) * 12 + (mo - now.month) < 12:
+            raise ValueError("U-3: under a year out (it needs a market read, not the prior)")
+        return {"label": label, "model": "normal", "kind": "U3", "mean": 4.5,
+                "mean_band": (4.1, 4.9), "sd": 0.8, "sd_band": (0.6, 1.1),
+                "decides": _iso(_jobs_day(yr, mo))}
     if ruleset == "FXEURUSD":
         m = re.search(r"the start time is " + _DATE + r" at (\d{1,2}:\d{2} [AP]M) ET and the end time is "
                       + _DATE + r" at (\d{1,2}:\d{2} [AP]M) ET", rules)
@@ -381,7 +445,9 @@ LINKS = {("AGREEMENT", "WTIDIR"): (-0.08, (-0.20, 0.0)),
          ("FRENCHPRES_RIGHT", "FXEURUSD"): (-1.5, (-3.0, 0.0)),
          ("PRESPARTY", "INX"): (0.0, (-4.0, 4.0)),
          ("PRESPARTY", "YOYCPI"): (0.0, (-0.5, 0.5)),
-         ("PRESPARTY", "GDPYEAR"): (0.0, (-0.5, 0.5))}
+         ("PRESPARTY", "GDPYEAR"): (0.0, (-0.5, 0.5)),
+         ("PRESPARTY", "PAYROLLS"): (0.0, (-300000.0, 300000.0)),
+         ("PRESPARTY", "U3"): (0.0, (-0.3, 0.3))}
 
 
 def auto_map(event: str, markets: List[dict], get_json, now_ts: float) -> dict:
@@ -394,17 +460,18 @@ def auto_map(event: str, markets: List[dict], get_json, now_ts: float) -> dict:
     if len(comps) != 2:
         raise ValueError("the rules name no two Kalshi rulesets")
     # the cells may label a leg more briefly than the rules ("Rate" for "Federal Funds Rate
-    # Decision"): then the titles' own labels, paired with the rulesets in order
-    t0 = " ".join(str(markets[0].get("yes_sub_title") or "").split())
-    if split_title(t0, comps[0][0], comps[1][0]) is None:
-        m = re.fullmatch(r"([^:,]+):\s*.+?,\s*([^:,]+):\s*.+", t0)
+    # Decision"): then the cells' own labels, paired with the rulesets in order
+    if cell_split(markets[0], comps[0][0], comps[1][0]) is None:
+        texts = cell_texts(markets[0])
+        m = next((x for x in (re.fullmatch(r"([^:,]+):\s*.+?,\s*([^:,]+):\s*.+", t)
+                              for t in texts) if x), None)
         if not m:
-            raise ValueError(f"cell '{t0}' is not '<leg>: ..., <leg>: ...'")
+            raise ValueError(f"cell '{texts[0] if texts else ''}' is not '<leg>: ..., <leg>: ...'")
         comps = [(m.group(1).strip(), comps[0][1]), (m.group(2).strip(), comps[1][1])]
     vals: Dict[str, set] = {}
     for (la, _ra), (lb, _rb) in [(comps[0], comps[1])]:
         for mk in markets:
-            sp = split_title(str(mk.get("yes_sub_title") or ""), la, lb)
+            sp = cell_split(mk, la, lb)
             if sp is None:
                 raise ValueError(f"cell '{mk.get('yes_sub_title')}' is not '{la}: ..., {lb}: ...'")
             vals.setdefault(la, set()).add(sp[0])
@@ -427,18 +494,23 @@ def auto_map(event: str, markets: List[dict], get_json, now_ts: float) -> dict:
 
 # ---- bins -----------------------------------------------------------------------------------
 
-_NUM = r"([+\-−]?\$?[+\-−]?[\d,]*\.?\d+)\s*%?"
+_NUM = r"([+\-−]?\$?[+\-−]?[\d,]*\.?\d+(?:\s*(?:thousand|million|billion|[kmb])\b)?)\s*%?"
+_SCALE = {"thousand": 1e3, "million": 1e6, "billion": 1e9, "k": 1e3, "m": 1e6, "b": 1e9}
 
 
 def _num(s: str) -> float:
-    s = s.replace("−", "-").replace("$", "").replace(",", "").replace("+", "").strip()
+    s = s.replace("−", "-").replace("$", "").replace(",", "").replace("+", "").strip().lower()
+    m = re.fullmatch(r"(.+?)\s*(thousand|million|billion|k|m|b)", s)
+    if m:
+        return float(m.group(1)) * _SCALE[m.group(2)]
     return float(s)
 
 
 def parse_bin(text: str) -> Optional[Tuple[Optional[float], Optional[float]]]:
     """(lo, hi) as written -- None for an open end -- or None if the text is no range:
     'Below $60' (None, 60), '$60 to $74.99' (60, 74.99), '$90 or above' (90, None),
-    '1.9% or below' (None, 1.9), '-10% to 0%' (-10, 0), 'Below -10%' (None, -10)."""
+    '1.9% or below' (None, 1.9), '-10% to 0%' (-10, 0), 'Below -10%' (None, -10),
+    '500,000 to 1 million' (500000, 1000000)."""
     t = " ".join((text or "").strip().split()).lower()
     m = re.fullmatch(r"(?:below|under|less than)\s+" + _NUM, t)
     if m:
@@ -577,6 +649,32 @@ def split_title(title: str, a: str, b: str) -> Optional[Tuple[str, str]]:
         if m:
             x, y = m.group(1).strip(), m.group(2).strip()
             return (y, x) if flip else (x, y)
+    return None
+
+
+_RULES_CELL = re.compile(r"If ALL of the following occur(?: for [^:]+)?:\s*(.+?),?\s+then the "
+                         r"market resolves to Yes", re.I)
+
+
+def cell_texts(m: dict) -> List[str]:
+    """A cell's '<leg>: x, <leg>: y' candidates: its title, then its own rules ("If ALL of the
+    following occur: Party: Democratic, Jobs added in 2029: 0 to 500,000, then the market
+    resolves to Yes."). Since 11/19 Kalshi titles the party grids' cells short ("Democrat,
+    0-500K"), and only the rules still name the legs."""
+    out = [" ".join(str(m.get("yes_sub_title") or "").split())]
+    r = _RULES_CELL.search(_norm(str(m.get("rules_primary") or "")))
+    if r:
+        out.append(r.group(1).strip())
+    return [t for t in out if t]
+
+
+def cell_split(m: dict, a: str, b: str) -> Optional[Tuple[str, str]]:
+    """(the a leg's value, the b leg's) from the first of the cell's texts that reads
+    '<a>: x, <b>: y' (either order), else None."""
+    for t in cell_texts(m):
+        sp = split_title(t, a, b)
+        if sp is not None:
+            return sp
     return None
 
 
@@ -814,7 +912,7 @@ class ListedComboWatch:
         cells, bins = [], {}
         for m in markets:
             t = str(m.get("ticker") or "")
-            sp = split_title(str(m.get("yes_sub_title") or ""), binary["label"], num["label"])
+            sp = cell_split(m, binary["label"], num["label"])
             if sp is None or sp[0] not in binary["outcomes"]:
                 return fail(f"{t}: legs not '{binary['label']}: ..., {num['label']}: ...'")
             b = parse_bin(sp[1])

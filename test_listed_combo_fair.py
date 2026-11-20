@@ -77,6 +77,12 @@ class TestBins(unittest.TestCase):
         self.assertEqual(lcf.parse_bin("−3% to −1%"), (-3.0, -1.0))     # a real minus
         self.assertEqual(lcf.parse_bin("3% or above"), (3.0, None))
         self.assertEqual(lcf.parse_bin("$3.40 to $3.79"), (3.4, 3.79))
+        self.assertEqual(lcf.parse_bin("Below 0"), (None, 0.0))                 # jobs added
+        self.assertEqual(lcf.parse_bin("0 to 500,000"), (0.0, 500000.0))
+        self.assertEqual(lcf.parse_bin("500,000 to 1 million"), (500000.0, 1000000.0))
+        self.assertEqual(lcf.parse_bin("1 million to 1.5 million"), (1000000.0, 1500000.0))
+        self.assertEqual(lcf.parse_bin("1.5 million or above"), (1500000.0, None))
+        self.assertEqual(lcf.parse_bin("4.1% to 4.5%"), (4.1, 4.5))
         self.assertIsNone(lcf.parse_bin("Marine Le Pen"))
         self.assertIsNone(lcf.parse_bin("10% to 0%"))             # backwards: no range
 
@@ -114,6 +120,26 @@ class TestBins(unittest.TestCase):
         self.assertEqual(lcf.split_title("WTI: Below $60, Iran deal: Not agreed", "Iran deal", "WTI"),
                          ("Not agreed", "Below $60"))
         self.assertIsNone(lcf.split_title("Agreed + Below $60", "Iran deal", "WTI"))
+
+    def test_a_short_title_reads_the_cells_own_rules(self):
+        """Since 11/19 Kalshi titles the party grids' cells short ("Democrat, 500K-1M"): the
+        legs come from the cell's own rules."""
+        m = {"yes_sub_title": "Democrat, 500K-1M",
+             "rules_primary": "If ALL of the following occur: Party: Democratic, Jobs added in "
+                              "2029: 500,000 to 1 million, then the market resolves to Yes."}
+        self.assertEqual(lcf.cell_split(m, "Party", "Jobs added in 2029"),
+                         ("Democratic", "500,000 to 1 million"))
+        fed = {"yes_sub_title": "No change, 0",
+               "rules_primary": "If ALL of the following occur for Dec 2026: Federal Funds Rate "
+                                "Decision: No change, Dissents: 0, then the market resolves to Yes."}
+        self.assertEqual(lcf.cell_split(fed, "Federal Funds Rate Decision", "Dissents"),
+                         ("No change", "0"))
+        # the title still goes first
+        self.assertEqual(lcf.cell_split({"yes_sub_title": "Iran deal: Agreed, WTI: Below $60",
+                                         "rules_primary": "?"}, "Iran deal", "WTI"),
+                         ("Agreed", "Below $60"))
+        self.assertIsNone(lcf.cell_split({"yes_sub_title": "Democrat, 0-500K"}, "Party",
+                                         "Jobs added in 2029"))
 
 
 class TestModel(unittest.TestCase):
@@ -322,24 +348,39 @@ def _grid(binary_label, outcomes, number_label, bins):
             for i, o in enumerate(outcomes) for j, b in enumerate(bins)}
 
 
+def _party_grid(number_label, bins):
+    """A party grid as Kalshi lists it since 11/19: a short title ("Democrat, 500K-1M") and the
+    legs only in each cell's own rules. bins: (short, as the rules write it)."""
+    return {f"{p[:3].upper()}{i}-{j}": (f"{short}, {s}", f"Party: {p}, {number_label}: {b}")
+            for i, (p, short) in enumerate((("Democratic", "Democrat"), ("Republican", "Republican")))
+            for j, (s, b) in enumerate(bins)}
+
+
 GRIDS = {
     "KXIRANWTICOMBO-28JAN": _grid("Iran deal", ("Agreed", "Not agreed"), "WTI",
                                   ("Below $60", "$60 to $74.99", "$75 to $89.99", "$90 or above")),
     "KXHORMUZGASCOMBO-27AUG": _grid("Hormuz traffic", ("Back to normal", "Not back to normal"),
                                     "Gas price", ("Below $3.40", "$3.40 to $3.79",
                                                   "$3.80 to $4.19", "$4.20 or above")),
-    "KXINXPARTYCOMBO-30JAN": _grid("Party", ("Democratic", "Republican"), "S&P 500 change",
-                                   ("Below -10%", "-10% to 0%", "0% to 10%", "10% to 20%",
-                                    "20% or above")),
-    "KXCPIPARTYCOMBO-30MAR": _grid("Party", ("Democratic", "Republican"), "CPI inflation",
-                                   ("1.9% or below", "2.0% to 2.9%", "3.0% to 3.9%",
-                                    "4.0% or above")),
-    "KXGDPPARTYCOMBO-30MAR": _grid("Party", ("Democratic", "Republican"), "GDP growth",
-                                   ("0.0% or below", "0.1% to 1.0%", "1.1% to 2.0%",
-                                    "2.1% to 2.5%", "2.6% to 3.0%", "3.1% or above")),
+    "KXINXPARTYCOMBO-30JAN": _party_grid("S&P 500 change", (
+        ("below -10%", "Below -10%"), ("-10% to 0%", "-10% to 0%"), ("0-10%", "0% to 10%"),
+        ("10-20%", "10% to 20%"), ("20% or above", "20% or above"))),
+    "KXCPIPARTYCOMBO-30MAR": _party_grid("CPI inflation", (
+        ("1.9% or below", "1.9% or below"), ("2.0-2.9%", "2.0% to 2.9%"),
+        ("3.0-3.9%", "3.0% to 3.9%"), ("4.0% or above", "4.0% or above"))),
+    "KXGDPPARTYCOMBO-30MAR": _party_grid("GDP growth", (
+        ("0.0% or below", "0.0% or below"), ("0.1-1.0%", "0.1% to 1.0%"),
+        ("1.1-2.0%", "1.1% to 2.0%"), ("2.1-2.5%", "2.1% to 2.5%"), ("2.6-3.0%", "2.6% to 3.0%"),
+        ("3.1% or above", "3.1% or above"))),
     "KXLEPENEURCOMBO-27JUN": _grid("French president", ("Marine Le Pen", "Not Marine Le Pen"),
                                    "EUR/USD change", ("Below -3%", "-3% to -1%", "-1% to 1%",
                                                       "1% to 3%", "3% or above")),
+    "KXPAYROLLSPARTYCOMBO-30SEP": _party_grid("Jobs added in 2029", (
+        ("below 0", "Below 0"), ("0-500K", "0 to 500,000"), ("500K-1M", "500,000 to 1 million"),
+        ("1M-1.5M", "1 million to 1.5 million"), ("1.5M or above", "1.5 million or above"))),
+    "KXU3PARTYCOMBO-30SEP": _party_grid("Unemployment rate", (
+        ("4.0% or below", "4.0% or below"), ("4.1-4.5%", "4.1% to 4.5%"),
+        ("4.6-5.0%", "4.6% to 5.0%"), ("5.1% or above", "5.1% or above"))),
 }
 LEG_LISTS = {
     ("event_ticker", "KXPRESPARTY-2028"): [("KXPRESPARTY-2028-D", "Democratic party"),
@@ -374,15 +415,23 @@ class FakeKalshiFull(FakeKalshi):
             ev = params.get("event_ticker")
             r = self.rules.get(ev) or {}
             return {"markets": [
-                {"ticker": f"{ev}-{k}", "event_ticker": ev, "yes_sub_title": title,
-                 "status": "active", "close_time": "2029-12-31T21:00:00Z", **r}
+                {"ticker": f"{ev}-{k}", "event_ticker": ev, "status": "active",
+                 "close_time": "2029-12-31T21:00:00Z", **r, **self._cell(title)}
                 for k, title in (self.grids.get(ev) or {}).items()]}
         return super().__call__(path, params)
+
+    @staticmethod
+    def _cell(title):
+        """A long title as is; a (short title, legs) pair puts the legs in the cell's own rules."""
+        if isinstance(title, tuple):
+            return {"yes_sub_title": title[0], "rules_primary":
+                    f"If ALL of the following occur: {title[1]}, then the market resolves to Yes."}
+        return {"yes_sub_title": title}
 
 
 class TestAutoMap(unittest.TestCase):
     """AUTO-MAPPING (Jack 2026-11-17: "Yes, build it"): a combo event with no hand row is mapped
-    from its own rules when both legs are kinds already priced; the six live grids, read with
+    from its own rules when both legs are kinds already priced; the eight live grids, read with
     no hand rows at all, map to exactly the hand rows' legs."""
 
     def test_every_live_grid_maps_to_the_hand_rows_legs(self):
@@ -483,6 +532,59 @@ class TestAutoMap(unittest.TestCase):
         n = len(k.calls)
         w.refresh(NOW + 30)
         self.assertFalse(any(p == "/markets" and q.get("series_ticker") for p, q in k.calls[n:]))
+
+
+class TestJobsGrids(unittest.TestCase):
+    """The payrolls and U-3 party grids (Jack 2026-11-20: "Yes, map them"): short titles, the
+    legs in each cell's own rules, bins in jobs ("500,000 to 1 million") or one-decimal rates."""
+
+    def _snap(self, ev):
+        w = lcf.ListedComboWatch(FakeKalshiFull(), lambda: [ev], http=fake_yahoo({}))
+        return w.refresh(NOW)
+
+    def _edges(self, got, want):
+        self.assertEqual([x is None for x in got], [x is None for x in want])
+        for g, x in zip(got, want):
+            if x is not None:
+                self.assertAlmostEqual(g, x, places=9)
+
+    def test_the_payrolls_grid_prices_off_the_cells_rules(self):
+        ev = "KXPAYROLLSPARTYCOMBO-30SEP"
+        snap = self._snap(ev)
+        e = snap["events"][ev]
+        self.assertEqual((e["mapping"], e["n"], e["n_priced"], e["err"]), ("hand", 10, 10, None))
+        self.assertAlmostEqual(e["sum_p"], 1.0, places=3)          # D 67.5 + R 32.5
+        self.assertEqual(snap["priced_series"], ["KXPAYROLLSPARTYCOMBO"])
+        m = {v["bin"]: v for v in snap["markets"].values() if v.get("outcome") == "Democratic"}
+        self.assertEqual(sorted(m), sorted(["Below 0", "0 to 500,000", "500,000 to 1 million",
+                                            "1 million to 1.5 million", "1.5 million or above"]))
+        self._edges(m["Below 0"]["edges"], [None, 0.0])
+        self._edges(m["500,000 to 1 million"]["edges"], [500000.0, 1000000.0])
+        self._edges(m["1.5 million or above"]["edges"], [1500000.0, None])
+        # P(D) x P(jobs < 0) under N(550K, 850K)
+        self.assertAlmostEqual(m["Below 0"]["p"], 0.675 * lcf._ncdf(-550000 / 850000), places=4)
+        self.assertAlmostEqual(sum(v["p"] for v in m.values()), 0.675, places=3)
+        for v in snap["markets"].values():
+            self.assertLess(v["p_lo"], v["p"])
+            self.assertLess(v["p"], v["p_hi"])
+
+    def test_the_u3_grid_splits_one_decimal_bins_at_the_half(self):
+        ev = "KXU3PARTYCOMBO-30SEP"
+        snap = self._snap(ev)
+        e = snap["events"][ev]
+        self.assertEqual((e["n"], e["n_priced"], e["err"]), (8, 8, None))
+        m = {v["bin"]: v for v in snap["markets"].values() if v.get("outcome") == "Republican"}
+        self._edges(m["4.0% or below"]["edges"], [None, 4.05])
+        self._edges(m["4.1% to 4.5%"]["edges"], [4.05, 4.55])
+        self._edges(m["5.1% or above"]["edges"], [5.05, None])
+        self.assertAlmostEqual(sum(v["p"] for v in m.values()), 0.325, places=3)
+
+    def test_a_payrolls_window_under_way_is_not_priced_off_the_prior(self):
+        k = FakeKalshiFull()
+        mk = k("/markets", {"event_ticker": "KXPAYROLLSPARTYCOMBO-30SEP"})["markets"]
+        late = lcf._parse_iso("2028-12-15T00:00:00Z").timestamp()
+        with self.assertRaisesRegex(ValueError, "under way"):
+            lcf.auto_map("KXPAYROLLSPARTYCOMBO-30SEP", mk, k, late)
 
 
 if __name__ == "__main__":
