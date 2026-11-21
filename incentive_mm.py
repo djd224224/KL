@@ -21112,7 +21112,8 @@ def far_sides(ticker: str, quotes, now_ts: float) -> set:
 #     otherwise it is "unmapped" in the status file and stands aside until a hand row
 #     (listed_combo_fair.EVENTS) maps it. Both are emailed once (NEW-COMBO NOTICES).
 #   GATE (listed_combo_gate): every bid at most p_lo - LISTED_COMBO_TOL_CENTS, every ask at
-#     least p_hi + it (mort_cap_quotes, LAST). STAND ASIDE (cancel, fail closed): any listed
+#     least p_hi + it (mort_cap_quotes, LAST); no pad more than a year out (FAR-DATED CELLS
+#     TAKE NO PAD). STAND ASIDE (cancel, fail closed): any listed
 #     combo series with no fair (no read, an unmapped event, a grid that does not parse), a
 #     leg read older than LISTED_COMBO_TTL_SECS, a LEG HOLD (a yes/no leg's mid moved 4c+
 #     inside 10 min: 15 min out -- the leg market is the headline feed; WTI's front month
@@ -21132,6 +21133,19 @@ LISTED_COMBO_FAIR = os.environ.get("IMM_LISTED_COMBO_FAIR", "1") == "1"
 LISTED_COMBO_LEAD = os.environ.get("IMM_LISTED_COMBO_LEAD", "0") == "1"
 LISTED_COMBO_TOL_CENTS = _env_int("IMM_LISTED_COMBO_TOL_CENTS", 2)
 LISTED_COMBO_BAND_TOL_CENTS = _env_int("IMM_LISTED_COMBO_BAND_TOL_CENTS", 5)
+# FAR-DATED CELLS TAKE NO PAD (Jack 2026-11-21: "For the future Anything more than 1 year out
+# doesn't need 2c edge pads, since it's not really knowable"). A cell whose event's first leg
+# decision -- or, with none scheduled, its earliest close -- is more than LISTED_COMBO_FAR_DAYS
+# away quotes at the band's own edges (pad LISTED_COMBO_FAR_TOL_CENTS, 0): every bid at most
+# p_lo, every ask at least p_hi (listed_combo_tol_cents). The stand-aside band, the leg holds
+# and the 24 h cut are unchanged. The 2c pad comes back by itself once the decision is inside a
+# year.
+#   On 11/21 that is the U-3, payrolls and balance-of-power grids (the 2028 election, 717 d)
+#   and Iran x WTI (its Jan 2028 close, 405 d). Spain (the 11/29 vote) and Hormuz gas (251 d)
+#   keep 2c.
+# IMM_LISTED_COMBO_FAR_DAYS=0 turns it off (2c everywhere).
+LISTED_COMBO_FAR_DAYS = _env_float("IMM_LISTED_COMBO_FAR_DAYS", 365.0)
+LISTED_COMBO_FAR_TOL_CENTS = max(0, _env_int("IMM_LISTED_COMBO_FAR_TOL_CENTS", 0))
 LISTED_COMBO_TTL_SECS = _env_int("IMM_LISTED_COMBO_TTL_SECS", 300)
 LISTED_COMBO_REFRESH_SECS = _env_int("IMM_LISTED_COMBO_REFRESH_SECS", 30)
 LISTED_COMBO_FAIR_FILE = os.environ.get(
@@ -21185,6 +21199,24 @@ def listed_combo_admitted(series: str) -> bool:
     return series in (snap.get("priced_series") or ())
 
 
+def listed_combo_tol_cents(snap: dict, event: Optional[str], now_ts: float) -> int:
+    """The gate's pad for `event`'s cells (FAR-DATED CELLS TAKE NO PAD).
+
+    It is LISTED_COMBO_FAR_TOL_CENTS while the event's first scheduled leg decision (or its
+    earliest close) is more than LISTED_COMBO_FAR_DAYS away, else LISTED_COMBO_TOL_CENTS. An
+    event with no date read keeps the pad."""
+    if LISTED_COMBO_FAR_DAYS <= 0 or not event:
+        return LISTED_COMBO_TOL_CENTS
+    cut = ((snap.get("events") or {}).get(event) or {}).get("cut_at")
+    if cut is None:
+        return LISTED_COMBO_TOL_CENTS
+    # cut_at is that decision less the refresher's cutoff_h (listed_combo_fair._price_event)
+    decide = float(cut) + float((snap.get("model") or {}).get("cutoff_h") or 0.0) * 3600.0
+    if decide - now_ts > LISTED_COMBO_FAR_DAYS * 86400.0:
+        return min(LISTED_COMBO_TOL_CENTS, LISTED_COMBO_FAR_TOL_CENTS)
+    return LISTED_COMBO_TOL_CENTS
+
+
 def listed_combo_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                       ext_ask: Optional[float]
                       ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
@@ -21217,8 +21249,9 @@ def listed_combo_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                 {"reason": "leg_hold", "left_s": round(hold - now_ts)}, None)
     fair = float(e["p"]) * 100.0
     lo_c, hi_c = float(e["p_lo"]) * 100.0, float(e["p_hi"]) * 100.0
+    tol = listed_combo_tol_cents(snap, e.get("event") or listed_combo_event(ticker), now_ts)
     inputs = {"fair": round(fair, 2), "band": [round(lo_c, 2), round(hi_c, 2)],
-              "outcome": e.get("outcome"), "bin": e.get("bin"), "tol": LISTED_COMBO_TOL_CENTS}
+              "outcome": e.get("outcome"), "bin": e.get("bin"), "tol": tol}
     bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, lo_c, LISTED_COMBO_BAND_TOL_CENTS, hi_c)
     if bid_bad or ask_bad:
         return (f"book {ext_bid}x{ext_ask} vs fair {fair:.1f}c (band {lo_c:.1f}-{hi_c:.1f}, "
@@ -21226,11 +21259,11 @@ def listed_combo_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                 dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad), None)
     # one rule on every path (EVERY OTHER PATH IS GATED TOO): a wave- or cheap-listed combo
     # takes the same caps as any other, not the crypto wave books' band edges
-    bid_cap = int(math.floor(lo_c - LISTED_COMBO_TOL_CENTS + 1e-9))
-    ask_floor = int(math.ceil(hi_c + LISTED_COMBO_TOL_CENTS - 1e-9))
+    bid_cap = int(math.floor(lo_c - tol + 1e-9))
+    ask_floor = int(math.ceil(hi_c + tol - 1e-9))
     caps = (bid_cap if bid_cap >= 1 else None, ask_floor if ask_floor <= 99 else None)
     if caps == (None, None):
-        return (f"no side {LISTED_COMBO_TOL_CENTS}c clear of the band {lo_c:.1f}-{hi_c:.1f}c",
+        return (f"no side {tol}c clear of the band {lo_c:.1f}-{hi_c:.1f}c",
                 dict(inputs, reason="decided"), None)
     return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
 
@@ -21265,9 +21298,13 @@ def listed_combo_notices(snap: dict, seen: dict, blocked: Callable[[str], bool],
             a = (snap.get("auto") or {}).get(ev) or {}
             num = a.get("number") or {}
             cells = sorted((t, v) for t, v in mk.items() if v.get("event") == ev and "p" in v)
+            pad = listed_combo_tol_cents(snap, ev, float(snap.get("checked_ts") or time.time()))
+            how = (f"bids at least {pad}c under the fair band, asks {pad}c over it"
+                   if pad >= LISTED_COMBO_TOL_CENTS else
+                   f"bids at most the fair band's low end, asks at least its high end -- no "
+                   f"{LISTED_COMBO_TOL_CENTS}c pad while its first leg decides more than a year out")
             lines = [f"{ev} was auto-mapped from its own rules and now quotes behind the combo "
-                     f"gate (bids at least {LISTED_COMBO_TOL_CENTS}c under the fair band, asks "
-                     f"{LISTED_COMBO_TOL_CENTS}c over it), sized like the other combos.", "",
+                     f"gate ({how}), sized like the other combos.", "",
                      f"Yes/no leg ({a.get('binary_label')}):"]
             lines += [f"  {o}: {t} ({'yes' if y else 'not'})"
                       for o, (t, y) in sorted((a.get("binary") or {}).items())]

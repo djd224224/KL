@@ -49114,6 +49114,42 @@ class TestListedComboFair(unittest.TestCase):
             self._snap()
             self.assertEqual(r(b=None, a=None), "decided")
 
+    def test_far_dated_cells_take_no_pad(self):
+        # Jack 2026-11-21: "For the future Anything more than 1 year out doesn't need 2c edge
+        # pads, since it's not really knowable"
+        now = time.time()
+        day = 86400.0
+
+        def caps(decide_in_days, cutoff_h=24.0):
+            self._snap()
+            snap = imm._listed_combo_state["snap"]
+            snap["events"][self.EV]["cut_at"] = now + decide_in_days * day - cutoff_h * 3600.0
+            snap["model"] = {"cutoff_h": cutoff_h}
+            why, inputs, c = imm.listed_combo_gate(self.T, now, 23, 63)
+            self.assertEqual(why, "")
+            return c, inputs["tol"]
+
+        self.assertEqual(caps(405), ((15, 23), 0))         # 15.3 / 22.8: the band's own edges
+        self.assertEqual(caps(365.5), ((15, 23), 0))
+        self.assertEqual(caps(364), ((13, 25), 2))         # inside a year: the 2c pad again
+        self.assertEqual(caps(7), ((13, 25), 2))           # Spain: the vote is a week out
+        self._snap()                                       # no date read: the pad stays
+        self.assertEqual(imm.listed_combo_gate(self.T, now, 23, 63)[2], (13, 25))
+        with mock.patch.object(imm, "LISTED_COMBO_FAR_DAYS", 0.0):   # the kill switch
+            self.assertEqual(caps(405), ((13, 25), 2))
+        # far out the stand-aside band is unchanged: a bid over 22.8 + 5 still stands aside
+        self._snap()
+        imm._listed_combo_state["snap"]["events"][self.EV]["cut_at"] = now + 700 * day
+        self.assertEqual(imm.listed_combo_gate(self.T, now, 28, 63)[1].get("reason"), "band")
+        self.assertEqual(imm.listed_combo_tol_cents(imm._listed_combo_state["snap"], self.EV, now), 0)
+        self.assertEqual(imm.listed_combo_tol_cents(imm._listed_combo_state["snap"], None, now), 2)
+        # a far long shot keeps a 1c bid once p_lo clears 1c; inside a year it is asks only
+        self._snap(p=0.03, lo=0.012, hi=0.05)
+        imm._listed_combo_state["snap"]["events"][self.EV]["cut_at"] = now + 700 * day
+        self.assertEqual(imm.listed_combo_gate(self.T, now, 1, 50)[2], (1, 5))
+        imm._listed_combo_state["snap"]["events"][self.EV]["cut_at"] = now + 100 * day
+        self.assertEqual(imm.listed_combo_gate(self.T, now, 1, 50)[2], (None, 7))
+
     def test_a_priced_combo_joins_the_family_and_the_blocklist_still_wins(self):
         self._snap()
         self.assertTrue(imm.listed_combo_admitted("KXIRANWTICOMBO"))
