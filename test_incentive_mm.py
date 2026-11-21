@@ -44255,6 +44255,66 @@ class TestOffUsualSize(unittest.TestCase):
         self.assertEqual(sorted((q.book_side, q.count) for q in out), [("ask", 5751), ("bid", 300)])
 
 
+class TestOffUsualRelativeLine(unittest.TestCase):
+    """Jack 2026-11-21: "Yes build it" (after "Isn't the issue that it got bought, not
+    that it unwound") -- a side is off its usual once it rests more than the smaller
+    of 3c and 40% of its cost at the usual price toward the taker.
+    KXDPRESPRIMARY-28NH-MKEL's bid walked 3 -> 5c at 7,692 (1.7c over a 3.3c usual,
+    under 3c) and a sweep sold it 6,652 @5; the unwind sold them @3.5 (-$100)."""
+    T = "KXDPRESPRIMARY-28NH-MKEL"
+
+    def test_default_and_knob(self):
+        self.assertEqual(imm.PVD_OFF_USUAL_FRAC, 0.40)
+        self.assertIn("PVD_OFF_USUAL_FRAC", imm._CONFIG_CODE_KNOBS)
+
+    def test_the_line_is_the_smaller_of_3c_and_40pct_of_the_cost(self):
+        line = imm.pvd_off_usual_line
+        self.assertAlmostEqual(line("bid", 3.3, 3.0, 0.4), 1.32)
+        self.assertEqual(line("bid", 7.5, 3.0, 0.4), 3.0)         # 3c from a 7.5c bid up
+        self.assertEqual(line("bid", 40.0, 3.0, 0.4), 3.0)
+        self.assertAlmostEqual(line("ask", 97.0, 3.0, 0.4), 1.2)  # an ask's cost is 100 - ask
+        self.assertEqual(line("ask", 60.0, 3.0, 0.4), 3.0)
+        self.assertEqual(line("bid", 3.3, 3.0, 0.0), 3.0)         # frac 0: the 3c line alone
+        self.assertEqual(line("bid", 0.0, 3.0, 0.4), 3.0)         # no cost to scale
+
+    def test_nh_kelly_5c_bid_over_a_3p3c_usual_rests_the_base(self):
+        Q, T = imm.Quote, self.T
+        qs = [Q(T, "bid", 5, 7692), Q(T, "ask", 8, 300)]
+        # the 3c line alone (as on 11/21): nothing cut
+        self.assertEqual(imm.pvd_off_usual_cut(qs, 3.3, 8.0, 450)[1], {})
+        # the 40% line: the bid keeps its base; the ask at its usual is untouched
+        out, cuts = imm.pvd_off_usual_cut(qs, 3.3, 8.0, 450, frac=0.4)
+        self.assertEqual(sorted((q.book_side, q.count) for q in out), [("ask", 300), ("bid", 450)])
+        self.assertEqual(cuts, {"bid": (7692, 450, 5.0, 3.3)})
+        # 4c over 3.3c is 0.7c: inside the 1.32c line, full size
+        self.assertEqual(imm.pvd_off_usual_cut([Q(T, "bid", 4, 8037)], 3.3, None, 450, frac=0.4)[1], {})
+        # sub-penny: 4.7c is 1.4c over 3.3c -- past 1.32c
+        q = [Q(T, "bid", 4, 8037, price_exact=4.7)]
+        self.assertEqual(imm.pvd_off_usual_cut(q, 3.3, None, 450, frac=0.4)[1]["bid"][:2], (8037, 450))
+        # the side that reduces a position keeps base + the position (flip-through):
+        # short 1,000, the closing bid at 5c keeps 450 + 1,000
+        out, _ = imm.pvd_off_usual_cut([Q(T, "bid", 5, 7692)], 3.3, None, 450, pos=-1000.0, frac=0.4)
+        self.assertEqual([q.count for q in out], [1450])
+
+    def test_a_cheap_ask_is_judged_on_its_no_cost(self):
+        Q, T = imm.Quote, self.T
+        # an ask at 95c over a 97c usual: 2c under it, past 40% of the 3c NO cost (1.2c)
+        out, cuts = imm.pvd_off_usual_cut([Q(T, "ask", 95, 2000)], None, 97.0, 300, frac=0.4)
+        self.assertEqual(cuts, {"ask": (2000, 300, 95.0, 97.0)})
+        # a mid-priced ask 2c under its usual keeps its size (the 3c line)
+        self.assertEqual(imm.pvd_off_usual_cut([Q(T, "ask", 58, 2000)], None, 60.0, 300, frac=0.4)[1], {})
+
+    def test_the_fx_and_crypto_ladders_keep_the_3c_line(self):
+        self.assertEqual(imm.pvd_off_usual_frac(self.T), 0.40)
+        with mock.patch.object(imm, "crypto_event_series", lambda s: s == "KXBTCEVENT"):
+            self.assertEqual(imm.pvd_off_usual_frac("KXBTCEVENT-25NOV2117-T95999.99"), 0.0)
+            self.assertEqual(imm.pvd_off_usual_frac(self.T), 0.40)
+        with mock.patch.object(imm, "fx_event_series", lambda s: s == "KXUSDJPYEVENT"):
+            self.assertEqual(imm.pvd_off_usual_frac("KXUSDJPYEVENT-25NOV261500-T16150"), 0.0)
+        with mock.patch.object(imm, "PVD_OFF_USUAL_FRAC", 0.0):
+            self.assertEqual(imm.pvd_off_usual_frac(self.T), 0.0)
+
+
 class TestOffUsualBigSides(unittest.TestCase):
     """Jack 2026-11-08: "Port for big sides" -- off the wave list, a side
     planning 1,000+ contracts that rests more than 3c nearer the taker than its

@@ -11693,6 +11693,21 @@ def full_earn_trim(quotes: List["Quote"], yes_levels: List[List[float]],
 # (logged, nothing cut), "off".
 PVD_OFF_USUAL_MODE = os.environ.get("IMM_PVD_OFF_USUAL", "on").strip().lower()
 PVD_OFF_USUAL_C = _env_float("IMM_PVD_OFF_USUAL_C", 3.0)
+# ...OR 40% OF A CHEAP SIDE'S COST (Jack 2026-11-21: "Yes build it", after "Isn't the
+# issue that it got bought, not that it unwound"). 3c is twice the price on a 3c book:
+# KXDPRESPRIMARY-28NH-MKEL's bid walked 3 -> 5c behind an outside 7c bid and rested 7,692
+# (the <=5c cheap tier x15) at 1.7c over its 3.3c usual, under the 3c line; a 7,000 sweep
+# sold it 6,652 @5 with Kelly's national nominee market at 3c, the unwind sold them back
+# @3.5 (-$100). A side is now off its usual once it rests more than the SMALLER of
+# PVD_OFF_USUAL_C and PVD_OFF_USUAL_FRAC x what one contract ties up at the usual price
+# (a bid: the usual bid; an ask: 100 - the usual ask) toward the taker -- 1.32c on a 3.3c
+# bid, 3c from a 7.5c bid up. Not on the FX / metals / crypto event ladders
+# (pvd_off_usual_frac): their cheap strikes move with spot and their live fair
+# (live_wave_fair_c) bounds every price, so they keep the 3c line. Replay on the 2028 wave's 23 adding fills from
+# 11/18 12:48Z to 11/21: it cuts exactly the two NH-MKEL buys (8,564 of 16,145 contracts);
+# the sides it would have cut held <= 0.49% of the wave's modelled reward.
+# IMM_PVD_OFF_USUAL_FRAC=0 turns it off (the 3c line alone).
+PVD_OFF_USUAL_FRAC = max(0.0, _env_float("IMM_PVD_OFF_USUAL_FRAC", 0.40))
 PVD_OFF_USUAL_HOURS = _env_float("IMM_PVD_OFF_USUAL_HOURS", 6.0)
 PVD_OFF_USUAL_MIN_N = int(_env_float("IMM_PVD_OFF_USUAL_MIN_N", 4))
 PVD_OFF_USUAL_SAMPLE_S = _env_float("IMM_PVD_OFF_USUAL_SAMPLE_S", 900.0)
@@ -11849,16 +11864,48 @@ def pvd_usual_load(raw) -> Dict[str, list]:
     return out
 
 
+def pvd_off_usual_line(side: str, usual: float, off_c: Optional[float] = None,
+                       frac: float = 0.0) -> float:
+    """How far (cents) a side may rest past its usual price toward the taker before
+    OFF-USUAL SIZE cuts it: `off_c` (PVD_OFF_USUAL_C, 3c), or with `frac` > 0 the
+    smaller of that and `frac` x what one contract ties up at the usual price (a
+    bid: `usual`; an ask: 100 - `usual`)."""
+    off_c = PVD_OFF_USUAL_C if off_c is None else float(off_c)
+    if frac and frac > 0:
+        cost = float(usual) if side == "bid" else 100.0 - float(usual)
+        if cost > 0:
+            return min(off_c, float(frac) * cost)
+    return off_c
+
+
+def pvd_off_usual_frac(ticker: str) -> float:
+    """PVD_OFF_USUAL_FRAC for a listed market outside the live-fair ladders; 0 (the 3c
+    line alone) on an FX / metals / crypto event strike, whose live fair
+    (live_wave_fair_c) bounds its prices and whose cheap strikes move with spot."""
+    if PVD_OFF_USUAL_FRAC <= 0:
+        return 0.0
+    s = series_of(ticker)
+    try:
+        if fx_event_series(s) or crypto_event_series(s):
+            return 0.0
+    except Exception:  # noqa: BLE001 -- the relative line, as for any book
+        pass
+    return PVD_OFF_USUAL_FRAC
+
+
 def pvd_off_usual_cut(quotes: List["Quote"], usual_bid: Optional[float],
                       usual_ask: Optional[float], base: int,
                       off_c: Optional[float] = None,
                       cold_sides: Tuple[str, ...] = (),
                       pos: float = 0.0,
-                      cold_cap: Optional[int] = None) -> Tuple[List["Quote"], Dict[str, tuple]]:
+                      cold_cap: Optional[int] = None,
+                      frac: float = 0.0) -> Tuple[List["Quote"], Dict[str, tuple]]:
     """(quotes, cuts): a side whose best rung rests more than `off_c` cents
     nearer the taker than its usual price (a bid over usual_bid + off_c, an ask
     under usual_ask - off_c) keeps at most `base` contracts, nearest-the-touch
-    rung first; a side in `cold_sides` (no usual price yet) keeps at most
+    rung first; with `frac` > 0 the line is the smaller of `off_c` and `frac` x
+    the side's cost at its usual price (a bid's usual bid, 100 - an ask's usual
+    ask: PVD_OFF_USUAL_FRAC); a side in `cold_sides` (no usual price yet) keeps at most
     `base` too, or `cold_cap` when given (CRYPTO WAVE COLD START). The side
     that reduces the position `pos` keeps base + |pos|,
     so one fill can still take it flat and no further (flip-through).
@@ -11883,7 +11930,8 @@ def pvd_off_usual_cut(quotes: List["Quote"], usual_bid: Optional[float],
         if usual is None:
             off = True                       # no usual price yet: the base
         else:
-            off = best > usual + off_c if side == "bid" else best < usual - off_c
+            line = pvd_off_usual_line(side, float(usual), off_c, frac)
+            off = best > usual + line if side == "bid" else best < usual - line
         planned = sum(int(out[i].count) for i in idx)
         cap = (max(base, int(cold_cap)) if usual is None and cold_cap else base) + (
             int(abs(pos)) if (side == "ask" and pos >= 1) or (side == "bid" and pos <= -1) else 0)
@@ -15338,7 +15386,7 @@ _CONFIG_CODE_KNOBS = (
     "JOIN_WAIT_ANCHOR_MIN", "JOIN_WAIT_MEMORY_MIN", "JOIN_WAIT_SUBPENNY",
     "JOIN_WAIT_REST_MEMORY_H",
     # off-usual size on listed markets (2026-11-08)
-    "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE", "PVD_ZERO_OFF", "PVD_CLOSE_CLAMP_C", "UNWIND_WAVES_EXEMPT_NEW",
+    "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_FRAC", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE", "PVD_ZERO_OFF", "PVD_CLOSE_CLAMP_C", "UNWIND_WAVES_EXEMPT_NEW",
     "UNWIND_WAVES_HELD",          # a newer wave's held markets unwind (2026-11-11)
     "UNWIND_WAVES_AT_COST",       # the waves' unwind at the close clamp's bound, not cost (2026-11-12)
     # the twin check in mutually exclusive events (2026-11-11)
@@ -41012,9 +41060,12 @@ class IncentiveMarketMaker:
                     f"usual price yet (under {PVD_OFF_USUAL_MIN_N} samples) -- "
                     f"{planned:,} -> {kept:,} (base size)")
                 continue
+            _rel = abs(px - usual) <= PVD_OFF_USUAL_C + 1e-9      # under 3c: the 40% line
             log(f"{self.tag} off-usual size{tag} {t} {side}: rests {px:g}c, "
-                f"{abs(px - usual):g}c nearer the taker than its {PVD_OFF_USUAL_HOURS:g}h "
-                f"usual {usual:g}c -- {planned:,} -> {kept:,} (base size)")
+                f"{round(abs(px - usual), 2):g}c nearer the taker than its {PVD_OFF_USUAL_HOURS:g}h "
+                f"usual {usual:g}c"
+                + (f" (over {PVD_OFF_USUAL_FRAC:.0%} of its cost)" if _rel else "")
+                + f" -- {planned:,} -> {kept:,} (base size)")
 
     def _off_usual_note(self, now_ts: float) -> None:
         """Every PVD_OFF_USUAL_LOG_S: one line on the sides OFF-USUAL SIZE cut."""
@@ -45467,7 +45518,9 @@ class IncentiveMarketMaker:
                                              if u is None and s not in _far) if PVD_OFF_USUAL_COLD else (),
                             pos=cap_pos,
                             cold_cap=(CRYPTO_WAVE_COLD_SIZE if crypto_event_series(meta.series)
-                                      else None))
+                                      else None),
+                            # ...or 40% of a cheap side's cost (2026-11-21; not the ladders)
+                            frac=pvd_off_usual_frac(t))
                         if _ou:
                             self._off_usual[t] = (now_ts, _ou)
                             self._off_usual_side_note(t, _ou)
@@ -50134,8 +50187,10 @@ class IncentiveMarketMaker:
                f"unchanged"
                if MARK_EXTERNAL else "P&L today reads last_mark (IMM_MARK_EXTERNAL=0)"))
         log(f"off-usual size (2026-11-08): {PVD_OFF_USUAL_MODE}"
-            + (f" -- a listed market's side resting more than {PVD_OFF_USUAL_C:g}c nearer "
-               f"the taker than its {PVD_OFF_USUAL_HOURS:g}h median touch (sampled every "
+            + (f" -- a listed market's side resting more than {PVD_OFF_USUAL_C:g}c"
+               + (f" (or {PVD_OFF_USUAL_FRAC:.0%} of its cost at the usual price, if smaller; "
+                  f"2026-11-21, not the FX / crypto event ladders)" if PVD_OFF_USUAL_FRAC > 0 else "")
+               + f" nearer the taker than its {PVD_OFF_USUAL_HOURS:g}h median touch (sampled every "
                f"{PVD_OFF_USUAL_SAMPLE_S / 60:g} min, at least {PVD_OFF_USUAL_MIN_N}) rests no "
                f"more than its base size" + ("; so does one with no usual price yet"
                                              if PVD_OFF_USUAL_COLD else "")
