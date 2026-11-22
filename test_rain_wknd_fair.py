@@ -117,6 +117,21 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(r.parse_nbe({}), (None, []))
 
 
+    def test_codes_outside_the_lower_48_read_as_written(self):
+        # Jack 2026-11-22: "Add" (Honolulu and Anchorage on Thanksgiving)
+        one = ("If the total precipitation at {name} ({code}) in {name} on November 26, "
+               "2026 is strictly greater than 0 inches, then the market resolves to Yes.")
+        for code in ("PHNL", "PANC", "PAFA", "TJSJ", "TIST"):
+            self.assertEqual(r.station_code(one.format(name="X", code=code)), code)
+        # the lower 48 as before, and a K code wins over any other parenthesis
+        self.assertEqual(r.station_code(one.format(name="New York City", code="KNYC")), "NYC")
+        self.assertEqual(r.station_code("per the Weather Company (PTWC) at Central Park "
+                                        "(KNYC) on"), "NYC")
+        # not a US station code: nothing read
+        for code in ("EGLL", "CYYZ", "MMMX", "PHN", "TXYZ"):
+            self.assertIsNone(r.station_code(one.format(name="X", code=code)), code)
+
+
 class TestModel(unittest.TestCase):
     RUN = datetime(2026, 10, 15, 0, tzinfo=UTC)
 
@@ -434,7 +449,8 @@ class TestStations(unittest.TestCase):
         for tz, h in (("America/New_York", 5), ("America/Indiana/Indianapolis", 5),
                       ("America/Detroit", 5), ("America/Chicago", 6),
                       ("America/Denver", 7), ("America/Phoenix", 7),
-                      ("America/Los_Angeles", 8), ("Pacific/Honolulu", 10)):
+                      ("America/Los_Angeles", 8), ("Pacific/Honolulu", 10),
+                      ("America/Anchorage", 9), ("America/Puerto_Rico", 4)):
             self.assertEqual((r.lst_hours(tz, summer), r.lst_hours(tz, winter)), (h, h), tz)
         for bad in ("Mars/Olympus", "America/St_Johns"):        # unknown / off the hour
             with self.assertRaises(RuntimeError):
@@ -472,6 +488,27 @@ class TestStations(unittest.TestCase):
         with self.assertRaises(ConnectionError):                 # the caller records it
             r.resolve_station("XYZ", self.NOW, get=self._get(nws=ConnectionError("down")),
                               nbe_fn=self.nbe)
+
+    def test_a_four_letter_code_resolves_as_written(self):
+        # 2026-11-22: there is no KPHNL; the IEM's CLI answers station=PHNL (and
+        # refuses station=HNL)
+        asked, seen = [], []
+
+        def get(url, params=None):
+            asked.append((url, (params or {}).get("station")))
+            if "weather.gov" in url:
+                return {"properties": {"timeZone": "Pacific/Honolulu",
+                                       "name": "Daniel K Inouye International Airport"}}
+            return {"results": [{"valid": "2026-10-14"}]}
+        row = r.resolve_station("PHNL", self.NOW, get=get,
+                                nbe_fn=lambda sid: seen.append(sid) or self.nbe(sid))
+        self.assertEqual((row["icao"], row["lst"], row["tz"]), ("PHNL", 10, "Pacific/Honolulu"))
+        self.assertEqual(asked, [(r.NWS_STATION_URL.format(sid="PHNL"), None),
+                                 (r.IEM_CLI_URL, "PHNL")])
+        self.assertEqual(seen, ["PHNL"])
+        # the lower 48 as before
+        self.assertEqual(r.resolve_station("XYZ", self.NOW, get=self._get(),
+                                           nbe_fn=self.nbe)["icao"], "KXYZ")
 
     def _events(self, code="XYZ"):
         span = ["2026-10-17", "2026-10-18"]
@@ -527,6 +564,36 @@ class TestStations(unittest.TestCase):
                                           "checked_at": now.isoformat()})
         self.assertEqual(ok, 2)
         self.assertEqual(self._read(path)["unmapped"], {})
+
+    def test_a_network_failure_is_tried_again_in_minutes_not_hours(self):
+        # 2026-11-22: the dry run's first PANC read was reset by the remote end
+        path = os.path.join(tempfile.mkdtemp(), "rain_wknd_fair.json")
+        tries = []
+
+        def reset(code, now):
+            tries.append(now)
+            raise r.requests.ConnectionError("('Connection aborted.', ConnectionResetError(10054))")
+        r.write_fair_file(path, now=self.NOW, events=self._events(), nbe_fn=self.nbe,
+                          resolve_fn=reset)
+        self.assertIs(self._read(path)["unmapped"]["XYZ"]["net"], True)
+        r.write_fair_file(path, now=self.NOW + timedelta(minutes=5), events=self._events(),
+                          nbe_fn=self.nbe, resolve_fn=reset)
+        self.assertEqual(len(tries), 1)                          # not inside the 10 minutes
+        ok, _ = r.write_fair_file(
+            path, now=self.NOW + timedelta(minutes=15), events=self._events(),
+            nbe_fn=self.nbe,
+            resolve_fn=lambda code, now: {"icao": "KXYZ", "lst": 5, "tz": "America/New_York",
+                                          "name": "Xyz", "auto": True,
+                                          "checked_at": now.isoformat()})
+        self.assertEqual(ok, 2)
+        self.assertEqual(self._read(path)["unmapped"], {})
+        # a 429 / 5xx is the network too; a 404 or a failed check is a verdict
+        for status, net in ((503, True), (429, True), (404, False), (422, False)):
+            ex = r.requests.HTTPError(str(status), response=mock.Mock(status_code=status))
+            self.assertIs(r._net_failure(ex), net, status)
+        self.assertTrue(r._net_failure(ConnectionResetError(10054, "reset")))
+        self.assertTrue(r._net_failure(r.requests.Timeout("read timed out")))
+        self.assertFalse(r._net_failure(RuntimeError("KXYZ: NWS gives no time zone")))
 
     def test_a_hand_row_wins_over_an_auto_row(self):
         path = os.path.join(tempfile.mkdtemp(), "rain_wknd_fair.json")
@@ -818,6 +885,9 @@ class TestLongLeads(unittest.TestCase):
 
     HNL = ("If the total precipitation at Honolulu (PHNL) in Honolulu on November 26, "
            "2026 is strictly greater than 0 inches, then the market resolves to Yes.")
+    # a code no reader here knows (a station outside the US)
+    ABROAD = ("If the total precipitation at London (EGLL) in London on November 26, "
+              "2026 is strictly greater than 0 inches, then the market resolves to Yes.")
 
     def _mk(self, code, rules):
         return {"ticker": f"KXRAINTHANKSGIVING-26NOV26-{code}",
@@ -825,22 +895,28 @@ class TestLongLeads(unittest.TestCase):
 
     def test_a_city_with_no_readable_station_stands_aside_alone(self):
         # 2026-11-22: Kalshi added HNL / ANC ("(PHNL)", "(PANC)") on 11/21 and
-        # the first city station_code couldn't read rejected all 51 cities
-        self.assertIsNone(r.station_code(self.HNL))
-        got, why = r.classify_day_markets([self._mk("HNL", self.HNL),
+        # the first city station_code couldn't read rejected all 51 cities.
+        # P codes read since version 5; a foreign code stands in for them here
+        self.assertIsNone(r.station_code(self.ABROAD))
+        got, why = r.classify_day_markets([self._mk("LON", self.ABROAD),
                                            self._mk("NYC", self.TURKEY)])
         self.assertEqual(why, "")
         self.assertEqual(got["events"], {"KXRAINTHANKSGIVING-26NOV26": ["2026-11-26", 1]})
         self.assertEqual(got["sample"], "KXRAINTHANKSGIVING-26NOV26-NYC")
-        self.assertEqual(list(got["skipped"]), ["KXRAINTHANKSGIVING-26NOV26-HNL"])
+        self.assertEqual(list(got["skipped"]), ["KXRAINTHANKSGIVING-26NOV26-LON"])
         # no skip, no key: the rows the file already holds read the same
         got, _ = r.classify_day_markets([self._mk("NYC", self.TURKEY)])
         self.assertNotIn("skipped", got)
+        # and Honolulu is a city like any other now
+        got, _ = r.classify_day_markets([self._mk("HNL", self.HNL),
+                                         self._mk("NYC", self.TURKEY)])
+        self.assertEqual(got["sample"], "KXRAINTHANKSGIVING-26NOV26-HNL")
+        self.assertNotIn("skipped", got)
 
     def test_no_city_readable_still_rejects_the_series(self):
-        got, why = r.classify_day_markets([self._mk("HNL", self.HNL)])
+        got, why = r.classify_day_markets([self._mk("LON", self.ABROAD)])
         self.assertIsNone(got)
-        self.assertEqual(why, "KXRAINTHANKSGIVING-26NOV26-HNL: its rules name no "
+        self.assertEqual(why, "KXRAINTHANKSGIVING-26NOV26-LON: its rules name no "
                               "station or no day")
         # a city with no day is still the series' problem, not the city's
         noday = self.TURKEY.replace(" on November 26, 2026 is", " is")
@@ -850,7 +926,9 @@ class TestLongLeads(unittest.TestCase):
         self.assertIn("SEA: its rules name no station or no day", why)
 
     def test_the_hnl_rejection_is_read_again_and_the_series_rejoins(self):
-        # the live file on 11/22: rejected at 13:13Z by version 3
+        # the live file on 11/22: rejected at 13:13Z by version 3. Since
+        # version 5 Honolulu itself reads, and is priced on its own station
+        # and its own day (Jack 2026-11-22: "Add")
         now = datetime(2026, 11, 22, 16, tzinfo=UTC).timestamp()
         old = {"day_discovered_at": now - 600, "day_series": {},
                "day_rejected": {"KXRAINTHANKSGIVING": {
@@ -864,26 +942,67 @@ class TestLongLeads(unittest.TestCase):
             return {"markets": [self._mk("HNL", self.HNL), self._mk("NYC", self.TURKEY)]}
         found, rejected, at = r.discover_day_series(old, now, get_json)
         self.assertEqual((list(found), rejected, at), (["KXRAINTHANKSGIVING"], {}, now))
-        self.assertEqual(list(found["KXRAINTHANKSGIVING"]["skipped"]),
-                         ["KXRAINTHANKSGIVING-26NOV26-HNL"])
-        # and its markets: NYC priced, HNL out with its reason in "missing"
+        self.assertNotIn("skipped", found["KXRAINTHANKSGIVING"])
+        # and its markets: both priced, Honolulu on PHNL's day (UTC-10)
         events = r.fetch_events(get_json=lambda path, params: {"markets": [
             self._mk("HNL", self.HNL), self._mk("NYC", self.TURKEY)]}, day_series=found)
         mk = events["KXRAINTHANKSGIVING-26NOV26"]["markets"]
         self.assertEqual((mk["KXRAINTHANKSGIVING-26NOV26-HNL"]["code"],
-                          mk["KXRAINTHANKSGIVING-26NOV26-NYC"]["code"]), (None, "NYC"))
+                          mk["KXRAINTHANKSGIVING-26NOV26-NYC"]["code"]), ("PHNL", "NYC"))
         run = datetime(2026, 11, 22, 12, tzinfo=UTC)
+        resolved = []
+
+        def resolve(code, now):
+            resolved.append(code)
+            return {"icao": code, "lst": 10, "tz": "Pacific/Honolulu", "name": "Honolulu",
+                    "auto": True, "checked_at": now.isoformat()}
 
         def down(*a, **k):
             raise RuntimeError("offline in the test")
         ok, miss = r.write_fair_file(self.path, now=datetime(2026, 11, 22, 16, tzinfo=UTC),
                                      events=events,
                                      nbe_fn=lambda sid: (run, periods(run, [0.4] * 21)),
+                                     resolve_fn=resolve,
                                      nbs_fn=down, nbs_hourly_fn=down, clim_fn=self.clim)
         d = self.read()
+        self.assertEqual((ok, miss, resolved), (2, 0, ["PHNL"]))
+        self.assertEqual(d["auto_stations"]["PHNL"]["lst"], 10)
+        hnl = d["markets"]["KXRAINTHANKSGIVING-26NOV26-HNL"]
+        one = r.market_fair(periods(run, [0.4] * 21), run, date(2026, 11, 26), 10, days=1)
+        self.assertEqual((hnl["station"], hnl["p"]), ("PHNL", one["p"]))
         self.assertIn("KXRAINTHANKSGIVING-26NOV26-NYC", d["markets"])
-        self.assertEqual(d["missing"]["KXRAINTHANKSGIVING-26NOV26-HNL"],
-                         "its rules name no station this writer reads")
+        self.assertNotIn("KXRAINTHANKSGIVING-26NOV26-HNL", d.get("missing") or {})
+
+    def test_an_older_classifiers_acceptance_is_read_again_at_once(self):
+        # the live file at 20:00Z 11/22: Thanksgiving accepted by version 4 at
+        # 16:17Z, its "skipped" naming Honolulu (rows before version 5 carry
+        # no "v"); waiting out the 6 hours would have left the note stale
+        now = datetime(2026, 11, 22, 21, tzinfo=UTC).timestamp()
+        row = {"events": {"KXRAINTHANKSGIVING-26NOV26": ["2026-11-26", 1]},
+               "sample": "KXRAINTHANKSGIVING-26NOV26-NYC", "at": now - 3600,
+               "skipped": {"KXRAINTHANKSGIVING-26NOV26-HNL":
+                           "its rules name no station this writer reads"}}
+        old = {"day_discovered_at": now - 600, "day_series": {"KXRAINTHANKSGIVING": row},
+               "day_rejected": {}}
+        calls = []
+
+        def get_json(path, params):
+            calls.append(path)
+            if path == "/series":
+                return {"series": [{"ticker": "KXRAINTHANKSGIVING"}]}
+            return {"markets": [self._mk("HNL", self.HNL), self._mk("NYC", self.TURKEY)]}
+        found, rejected, at = r.discover_day_series(old, now, get_json)
+        self.assertEqual((calls, at), (["/series", "/markets"], now))
+        got = found["KXRAINTHANKSGIVING"]
+        self.assertNotIn("skipped", got)
+        self.assertEqual((got["v"], got["at"]), (r.DAY_CLASSIFY_VERSION, now))
+        # read once: the current row waits out its hour, then its 6 hours
+        calls.clear()
+        again = {"day_discovered_at": at, "day_series": found, "day_rejected": rejected}
+        self.assertEqual(r.discover_day_series(again, now + 60, get_json)[0], found)
+        self.assertEqual(calls, [])
+        r.discover_day_series(again, now + r.DAY_DISCOVER_SECS + 1, get_json)
+        self.assertEqual(calls, ["/series"])
 
     def test_climatology_counts_wet_windows_and_drops_missing_ones(self):
         daily = {}

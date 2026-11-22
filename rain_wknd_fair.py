@@ -55,7 +55,8 @@ DAY_DISCOVER_SECS Kalshi's weather category is listed, and a series named for
 rain that no family claims (not SERIES, KXRAIN, a DAY_SERIES, or what the
 bot's `skip` owns) is read on its open markets. It joins the family when they
 are this contract (classify_day_markets): one market per city (a ticker
-ending in a city code), "total precipitation at <station> (Kxxx)" or "at
+ending in a city code), "total precipitation at <station> (Kxxx)" (or an
+Alaska / Hawaii / Puerto Rico code: AUTO-MAPPED STATIONS) or "at
 CLIxxx", "strictly greater than 0 inches", over a named day or a span of up to
 MAX_SPAN_DAYS. Its window comes from the rules, not the ticker (whose date
 Kalshi writes either way round). The file's "day_series" names it for the
@@ -144,10 +145,27 @@ STATIONS: Dict[str, Tuple[str, int]] = {
 # "auto_stations"; a failure goes to "unmapped" with what failed and is tried
 # again after AUTO_RETRY_SECS -- its markets get no fair meanwhile (the gate
 # stands them aside), never a guessed station. The hand rows always win.
+# OUTSIDE THE LOWER 48 (Jack 2026-11-22: "Add", Honolulu and Anchorage on
+# Thanksgiving): Alaska, Hawaii and the Pacific islands use P codes
+# ("(PHNL)", "(PANC)"), Puerto Rico and the Virgin Islands TJ / TI ("(TJSJ)").
+# Those are read as written -- station_code returns the four letters, and
+# resolve_station checks them as they are, not K + code -- through the same
+# three checks. A K code in the rules is always read first. Backtest at
+# the time (NBE alone, 507 runs, May 4 - Nov 21 2026, one-day windows,
+# Brier skill over the sample base rate by lead 0-24 / 24-48 / 48-72 /
+# 72-96 h): PANC +0.43 / +0.37 / +0.36 / +0.35 (Miami +0.39 / +0.32 / +0.32
+# / +0.28); PHNL +0.15 / +0.21 / +0.14 / +0.08, high in the dry months (mean
+# p 0.17 vs 0.11 observed) but even over Oct-Nov (0.19 vs 0.18); NYC and
+# Seattle +0.46 to +0.72.
 NWS_STATION_URL = "https://api.weather.gov/stations/{sid}"
 IEM_CLI_URL = "https://mesonet.agron.iastate.edu/json/cli.py"
 AUTO_CLI_MAX_AGE_DAYS = 10
 AUTO_RETRY_SECS = 6 * 3600
+# a network failure (a dropped connection, a timeout, a 429 / 5xx) is no verdict
+# on the station: it is tried again after AUTO_RETRY_NET_SECS (2026-11-22: the
+# dry run's first PANC read was reset by the remote end, and the 6-hour retry
+# would have kept Anchorage dark into the next day)
+AUTO_RETRY_NET_SECS = 600
 W = 0.85
 # (lead upper bound, hours) -> logistic recalibration (a, b)
 RECAL = ((24, -0.06, 1.12), (48, 0.01, 1.11), (72, 0.17, 1.12),
@@ -232,8 +250,10 @@ DAY_RETRY_SECS = 6 * 3600
 # bump when classify_day_markets / rules_span learn new wording: every
 # rejection an older one wrote is re-read at the next pass (2 = 2026-11-14,
 # "on <day> is"; 3 = 2026-11-20, the snow contract: SNOW DAYS; 4 = 2026-11-22,
-# a city with no readable station stands aside alone)
-DAY_CLASSIFY_VERSION = 4
+# a city with no readable station stands aside alone; 5 = 2026-11-22, P / TJ /
+# TI codes read as written -- an accepted series is re-read too, so its
+# "skipped" names only what is still unreadable)
+DAY_CLASSIFY_VERSION = 5
 MAX_SPAN_DAYS = 3
 HTTP_TIMEOUT = 30
 USER_AGENT = "KL-IMM-rain-wknd-fair/1.0"
@@ -242,6 +262,9 @@ _MON = {m: i + 1 for i, m in enumerate(
 _CODE_RE = re.compile(r"\bat (?:CLI)?([A-Z]{3})\b")
 _SPAN_RE = re.compile(r"within ([A-Z][a-z]+ \d{1,2}, \d{4}) through ([A-Z][a-z]+ \d{1,2}, \d{4})")
 _ICAO_RE = re.compile(r"\(K([A-Z]{3})\)")
+# Alaska / Hawaii / the Pacific (P...), Puerto Rico / the Virgin Islands (TJ.. /
+# TI..): the four letters as written (AUTO-MAPPED STATIONS, OUTSIDE THE LOWER 48)
+_ICAO_OUT_RE = re.compile(r"\(((?:P[A-Z]|T[IJ])[A-Z]{2})\)")
 # "in November 3, 2026 is" (Election Day) or "on November 26, 2026 is"
 # (Thanksgiving, 2026-11-14: the "in"-only form rejected all 48 cities as
 # "its rules name no station or no day")
@@ -262,8 +285,10 @@ def _log(msg: str) -> None:
 
 def station_code(rules: str) -> Optional[str]:
     """'... at CLIDJT in West Palm Beach ...' -> 'DJT'; 'at CLL' -> 'CLL';
-    a one-day market's 'at West Palm Beach (KDJT) ...' -> 'DJT'."""
-    m = _CODE_RE.search(rules or "") or _ICAO_RE.search(rules or "")
+    a one-day market's 'at West Palm Beach (KDJT) ...' -> 'DJT'; outside the
+    lower 48 the four letters: 'at Honolulu (PHNL) ...' -> 'PHNL'."""
+    s = rules or ""
+    m = _CODE_RE.search(s) or _ICAO_RE.search(s) or _ICAO_OUT_RE.search(s)
     return m.group(1) if m else None
 
 
@@ -879,12 +904,23 @@ def lst_hours(tz: str, now: datetime) -> int:
     return int(hours)
 
 
+def _net_failure(ex: BaseException) -> bool:
+    """A failure of the network, not of the station's checks (AUTO_RETRY_NET_SECS)."""
+    if isinstance(ex, (requests.ConnectionError, requests.Timeout, ConnectionError,
+                       TimeoutError)):
+        return True
+    status = getattr(getattr(ex, "response", None), "status_code", None)
+    return isinstance(ex, requests.HTTPError) and isinstance(status, int) \
+        and (status == 429 or status >= 500)
+
+
 def resolve_station(code: str, now: datetime, get: Callable = _get_json,
                     nbe_fn: Optional[Callable] = None) -> dict:
     """An auto row ({'icao', 'lst', 'tz', 'name', ...}) for the station the
     rules' `code` names, or RuntimeError saying which check failed (see
-    AUTO-MAPPED STATIONS)."""
-    sid = f"K{code}"
+    AUTO-MAPPED STATIONS). A four-letter code (PHNL) is the station as
+    written; a three-letter one is the lower 48's K + code."""
+    sid = code if len(code) == 4 else f"K{code}"
     props = get(NWS_STATION_URL.format(sid=sid)).get("properties") or {}
     tz = str(props.get("timeZone") or "")
     if not tz:
@@ -966,9 +1002,9 @@ def classify_day_markets(markets: List[dict]) -> Tuple[Optional[dict], str]:
             return None, f"{ev}: its markets name different windows"
         # ONE CITY, NOT THE SERIES (2026-11-22): Kalshi added Honolulu and
         # Anchorage to Thanksgiving ("at Honolulu (PHNL)"), P codes that
-        # station_code doesn't read, and rejecting the series on them took all
-        # 51 cities dark from 01:20Z. A city with no readable station stands
-        # aside alone (write_fair_file finds no station to price it on).
+        # station_code didn't read then, and rejecting the series on them took
+        # all 51 cities dark from 01:20Z. A city with no readable station
+        # stands aside alone (write_fair_file finds no station to price it on).
         if station_code(rules) is None:
             skipped[t] = "its rules name no station this writer reads"
             continue
@@ -998,9 +1034,12 @@ def discover_day_series(old: dict, now_ts: float, get_json: Optional[Callable] =
         return {}, rejected, at
     # a verdict from an older classifier is re-read at once (2026-11-14: the
     # parser learned Thanksgiving's "on <day> is" wording, and the 6-hour
-    # retry would have kept the old rejection past the program's start)
+    # retry would have kept the old rejection past the program's start); since
+    # version 5 an acceptance too (2026-11-22: its "skipped" named Honolulu
+    # and Anchorage, which now read)
     old_verdicts = any(int(v.get("v") or 1) != DAY_CLASSIFY_VERSION
-                       for v in rejected.values() if isinstance(v, dict))
+                       for v in list(rejected.values()) + list(found.values())
+                       if isinstance(v, dict))
     if now_ts - at < DAY_DISCOVER_SECS and not old_verdicts:
         return found, rejected, at
     js = _signed_or_public(get_json, {"category": SERIES_CATEGORY}, path="/series")
@@ -1012,8 +1051,8 @@ def discover_day_series(old: dict, now_ts: float, get_json: Optional[Callable] =
                 or s in (SERIES, "KXRAIN") + DAY_SERIES or (skip and skip(s)):
             continue
         last = found.get(s) or rejected.get(s) or {}
-        if last and now_ts - float(last.get("at") or 0.0) < DAY_RETRY_SECS and (
-                s in found or int(last.get("v") or 1) == DAY_CLASSIFY_VERSION):
+        if last and now_ts - float(last.get("at") or 0.0) < DAY_RETRY_SECS \
+                and int(last.get("v") or 1) == DAY_CLASSIFY_VERSION:
             if s in found:
                 out[s] = found[s]
             continue
@@ -1029,7 +1068,7 @@ def discover_day_series(old: dict, now_ts: float, get_json: Optional[Callable] =
             rejected[s] = {"at": now_ts, "why": why, "v": DAY_CLASSIFY_VERSION}
             continue
         rejected.pop(s, None)
-        out[s] = dict(got, at=now_ts)
+        out[s] = dict(got, at=now_ts, v=DAY_CLASSIFY_VERSION)
         if s not in found:
             _log(f"day series {s} joins the family: {len(got['events'])} event(s), "
                  f"e.g. {got['sample']}")
@@ -1145,7 +1184,9 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         if code in STATIONS or code in auto:
             unmapped.pop(code, None)
             continue
-        if ts - float((unmapped.get(code) or {}).get("at") or 0) < AUTO_RETRY_SECS:
+        last = unmapped.get(code) or {}
+        if ts - float(last.get("at") or 0) < (AUTO_RETRY_NET_SECS if last.get("net")
+                                              else AUTO_RETRY_SECS):
             continue
         try:
             auto[code] = resolve(code, now)
@@ -1154,8 +1195,12 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                  f"{auto[code]['tz']}, standard time UTC-{auto[code]['lst']})")
         except Exception as ex:
             unmapped[code] = {"at": ts, "why": f"{type(ex).__name__}: {str(ex)[:160]}"}
+            if _net_failure(ex):
+                unmapped[code]["net"] = True
             _log(f"! station {code} unmapped, its markets stand aside: "
-                 f"{unmapped[code]['why']}")
+                 f"{unmapped[code]['why']}"
+                 + (f" (a network failure: tried again in {AUTO_RETRY_NET_SECS // 60} min)"
+                    if unmapped[code].get("net") else ""))
     stamp = now.isoformat()
     markets: Dict[str, dict] = {}
     missing: Dict[str, str] = {}
@@ -1172,7 +1217,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             if st is None and code in auto:
                 st = (auto[code]["icao"], int(auto[code]["lst"]))
             if st is None and not code:
-                # a city classify_day_markets skipped (2026-11-22, PHNL / PANC)
+                # a city classify_day_markets skipped (2026-11-22: no code this
+                # writer reads, e.g. a station outside the US)
                 missing[t] = "its rules name no station this writer reads"
                 continue
             if st is None:
