@@ -60,7 +60,10 @@ CLIxxx", "strictly greater than 0 inches", over a named day or a span of up to
 MAX_SPAN_DAYS. Its window comes from the rules, not the ticker (whose date
 Kalshi writes either way round). The file's "day_series" names it for the
 bot; a series that is not the contract waits DAY_RETRY_SECS before it is read
-again ("day_rejected", with why).
+again ("day_rejected", with why). A city whose station the writer can't read
+stands aside alone, named in the row's "skipped" (2026-11-22: Honolulu's
+"(PHNL)" had rejected all 51 Thanksgiving cities); the series is rejected only
+when no city reads.
 
 SNOW DAYS (Jack 2026-11-20: "KXSNOWTHANKSGIVING should quote"; 11/14: "rain/
 snow markets generally should have fair value calculations and auto-quoted
@@ -228,8 +231,9 @@ DAY_DISCOVER_SECS = EVENTS_TTL_SECS
 DAY_RETRY_SECS = 6 * 3600
 # bump when classify_day_markets / rules_span learn new wording: every
 # rejection an older one wrote is re-read at the next pass (2 = 2026-11-14,
-# "on <day> is"; 3 = 2026-11-20, the snow contract: SNOW DAYS)
-DAY_CLASSIFY_VERSION = 3
+# "on <day> is"; 3 = 2026-11-20, the snow contract: SNOW DAYS; 4 = 2026-11-22,
+# a city with no readable station stands aside alone)
+DAY_CLASSIFY_VERSION = 4
 MAX_SPAN_DAYS = 3
 HTTP_TIMEOUT = 30
 USER_AGENT = "KL-IMM-rain-wknd-fair/1.0"
@@ -926,12 +930,15 @@ def _signed_or_public(get_json: Optional[Callable], params: dict,
 def classify_day_markets(markets: List[dict]) -> Tuple[Optional[dict], str]:
     """({'events': {event: [first ISO day, days]}, 'sample': ticker}, '') when
     a series' open markets are the one-day / span contract (AUTO DAY
-    SERIES), plus 'kind': 'snow' on the snow contract (SNOW DAYS), else
+    SERIES), plus 'kind': 'snow' on the snow contract (SNOW DAYS) and
+    'skipped': {ticker: why} for the cities with no readable station, else
     (None, why)."""
     if not markets:
         return None, "no open market"
     events: Dict[str, list] = {}
     kinds = set()
+    skipped: Dict[str, str] = {}
+    sample = ""
     for m in markets:
         t, ev = str(m.get("ticker") or ""), str(m.get("event_ticker") or "")
         rules = str(m.get("rules_primary") or "")
@@ -950,16 +957,29 @@ def classify_day_markets(markets: List[dict]) -> Tuple[Optional[dict], str]:
         if len(kinds) > 1:
             return None, f"{t}: rain and snow markets in one series"
         span = rules_span(rules)
-        if station_code(rules) is None or span is None:
+        if span is None:
             return None, f"{t}: its rules name no station or no day"
         days = (span[1] - span[0]).days + 1
         if not 1 <= days <= MAX_SPAN_DAYS:
             return None, f"{t}: a {days}-day window"
         if events.setdefault(ev, [span[0].isoformat(), days]) != [span[0].isoformat(), days]:
             return None, f"{ev}: its markets name different windows"
-    got = {"events": events, "sample": str(markets[0].get("ticker") or "")}
+        # ONE CITY, NOT THE SERIES (2026-11-22): Kalshi added Honolulu and
+        # Anchorage to Thanksgiving ("at Honolulu (PHNL)"), P codes that
+        # station_code doesn't read, and rejecting the series on them took all
+        # 51 cities dark from 01:20Z. A city with no readable station stands
+        # aside alone (write_fair_file finds no station to price it on).
+        if station_code(rules) is None:
+            skipped[t] = "its rules name no station this writer reads"
+            continue
+        sample = sample or t
+    if not sample:
+        return None, f"{next(iter(skipped))}: its rules name no station or no day"
+    got = {"events": events, "sample": sample}
     if kinds == {"snow"}:
         got["kind"] = "snow"
+    if skipped:
+        got["skipped"] = skipped
     return got, ""
 
 
@@ -1151,6 +1171,10 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             st = STATIONS.get(code or "")
             if st is None and code in auto:
                 st = (auto[code]["icao"], int(auto[code]["lst"]))
+            if st is None and not code:
+                # a city classify_day_markets skipped (2026-11-22, PHNL / PANC)
+                missing[t] = "its rules name no station this writer reads"
+                continue
             if st is None:
                 why = (unmapped.get(code or "") or {}).get("why")
                 missing[t] = f"unmapped station {code}" + (f" ({why})" if why else "")

@@ -816,6 +816,75 @@ class TestLongLeads(unittest.TestCase):
         self.assertEqual(r.discover_day_series(again, now + 60, get_json)[2], now)
         self.assertEqual(calls, [])
 
+    HNL = ("If the total precipitation at Honolulu (PHNL) in Honolulu on November 26, "
+           "2026 is strictly greater than 0 inches, then the market resolves to Yes.")
+
+    def _mk(self, code, rules):
+        return {"ticker": f"KXRAINTHANKSGIVING-26NOV26-{code}",
+                "event_ticker": "KXRAINTHANKSGIVING-26NOV26", "rules_primary": rules}
+
+    def test_a_city_with_no_readable_station_stands_aside_alone(self):
+        # 2026-11-22: Kalshi added HNL / ANC ("(PHNL)", "(PANC)") on 11/21 and
+        # the first city station_code couldn't read rejected all 51 cities
+        self.assertIsNone(r.station_code(self.HNL))
+        got, why = r.classify_day_markets([self._mk("HNL", self.HNL),
+                                           self._mk("NYC", self.TURKEY)])
+        self.assertEqual(why, "")
+        self.assertEqual(got["events"], {"KXRAINTHANKSGIVING-26NOV26": ["2026-11-26", 1]})
+        self.assertEqual(got["sample"], "KXRAINTHANKSGIVING-26NOV26-NYC")
+        self.assertEqual(list(got["skipped"]), ["KXRAINTHANKSGIVING-26NOV26-HNL"])
+        # no skip, no key: the rows the file already holds read the same
+        got, _ = r.classify_day_markets([self._mk("NYC", self.TURKEY)])
+        self.assertNotIn("skipped", got)
+
+    def test_no_city_readable_still_rejects_the_series(self):
+        got, why = r.classify_day_markets([self._mk("HNL", self.HNL)])
+        self.assertIsNone(got)
+        self.assertEqual(why, "KXRAINTHANKSGIVING-26NOV26-HNL: its rules name no "
+                              "station or no day")
+        # a city with no day is still the series' problem, not the city's
+        noday = self.TURKEY.replace(" on November 26, 2026 is", " is")
+        got, why = r.classify_day_markets([self._mk("NYC", self.TURKEY),
+                                           self._mk("SEA", noday)])
+        self.assertIsNone(got)
+        self.assertIn("SEA: its rules name no station or no day", why)
+
+    def test_the_hnl_rejection_is_read_again_and_the_series_rejoins(self):
+        # the live file on 11/22: rejected at 13:13Z by version 3
+        now = datetime(2026, 11, 22, 16, tzinfo=UTC).timestamp()
+        old = {"day_discovered_at": now - 600, "day_series": {},
+               "day_rejected": {"KXRAINTHANKSGIVING": {
+                   "at": now - 3 * 3600, "v": 3,
+                   "why": "KXRAINTHANKSGIVING-26NOV26-HNL: its rules name no station "
+                          "or no day"}}}
+
+        def get_json(path, params):
+            if path == "/series":
+                return {"series": [{"ticker": "KXRAINTHANKSGIVING"}]}
+            return {"markets": [self._mk("HNL", self.HNL), self._mk("NYC", self.TURKEY)]}
+        found, rejected, at = r.discover_day_series(old, now, get_json)
+        self.assertEqual((list(found), rejected, at), (["KXRAINTHANKSGIVING"], {}, now))
+        self.assertEqual(list(found["KXRAINTHANKSGIVING"]["skipped"]),
+                         ["KXRAINTHANKSGIVING-26NOV26-HNL"])
+        # and its markets: NYC priced, HNL out with its reason in "missing"
+        events = r.fetch_events(get_json=lambda path, params: {"markets": [
+            self._mk("HNL", self.HNL), self._mk("NYC", self.TURKEY)]}, day_series=found)
+        mk = events["KXRAINTHANKSGIVING-26NOV26"]["markets"]
+        self.assertEqual((mk["KXRAINTHANKSGIVING-26NOV26-HNL"]["code"],
+                          mk["KXRAINTHANKSGIVING-26NOV26-NYC"]["code"]), (None, "NYC"))
+        run = datetime(2026, 11, 22, 12, tzinfo=UTC)
+
+        def down(*a, **k):
+            raise RuntimeError("offline in the test")
+        ok, miss = r.write_fair_file(self.path, now=datetime(2026, 11, 22, 16, tzinfo=UTC),
+                                     events=events,
+                                     nbe_fn=lambda sid: (run, periods(run, [0.4] * 21)),
+                                     nbs_fn=down, nbs_hourly_fn=down, clim_fn=self.clim)
+        d = self.read()
+        self.assertIn("KXRAINTHANKSGIVING-26NOV26-NYC", d["markets"])
+        self.assertEqual(d["missing"]["KXRAINTHANKSGIVING-26NOV26-HNL"],
+                         "its rules name no station this writer reads")
+
     def test_climatology_counts_wet_windows_and_drops_missing_ones(self):
         daily = {}
         for y in range(1996, 2026):
