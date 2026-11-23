@@ -61,6 +61,19 @@ KATL_13Z = """\
  SLV  78 81 82 83 83 82 83 84 84 84 85 85 86 86 87 92 88 91 96 99 97100100
 """
 
+# KNYC's block of NOAA's 11/22 23Z bulletin: since the 11/03 12Z cycle the
+# header carries no version ("NBM  NBS GUIDANCE", once "NBM V5.0 NBS GUIDANCE")
+KNYC_23Z = """\
+ KNYC    NBM  NBS GUIDANCE    11/22/2026  2300 UTC
+ DT /NOV  23               /NOV  24                /NOV  25
+ UTC  03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21
+ FHR  04 07 10 13 16 19 22 25 28 31 34 37 40 43 46 49 52 55 58 61 64 67 70
+ TMP  59 58 57 56 62 67 63 56 51 48 45 42 46 48 47 43 40 38 36 35 41 46 46
+ P06     34     6     5    11     2     0     0     0     0     0     0
+ P12           37           5           2           0           0
+ SLV  95 84 76 80 72 79 82 66 47 25 19 12  7  7  8  2  0  0  0  0  0  2 11
+"""
+
 
 class TestParsing(unittest.TestCase):
     def test_station_and_window_from_the_rules(self):
@@ -628,13 +641,58 @@ class TestNbsBulletin(unittest.TestCase):
         self.assertEqual(r.parse_nbs_block("not a bulletin"), (None, []))
         self.assertEqual(r.parse_nbs_block(""), (None, []))
 
-    def _bulletin(self, cyc: datetime, stations=("KATL", "KSEA"), filler=3):
+    def test_the_header_without_a_version_reads_too(self):
+        # the header NOAA has written since the 11/03 12Z cycle: the pattern
+        # that wanted "V5.0" read no station from then to 11/22
+        rt, per = r.parse_nbs_block(KNYC_23Z)
+        self.assertEqual(rt, datetime(2026, 11, 22, 23, tzinfo=UTC))
+        self.assertEqual(per, [(datetime(2026, 11, 23, 12, tzinfo=UTC), 0.37),
+                               (datetime(2026, 11, 24, 0, tzinfo=UTC), 0.05),
+                               (datetime(2026, 11, 24, 12, tzinfo=UTC), 0.02),
+                               (datetime(2026, 11, 25, 0, tzinfo=UTC), 0.0),
+                               (datetime(2026, 11, 25, 12, tzinfo=UTC), 0.0)])
+        # a version token back in, of any spelling, reads the same; another
+        # bulletin (the NBE's) is no block
+        for tok in ("V5.0", "V5.1", "v5.2.1"):
+            got = r.parse_nbs_block(KNYC_23Z.replace("NBM  NBS", f"NBM {tok} NBS"))
+            self.assertEqual(got, (rt, per))
+        self.assertEqual(r.parse_nbs_block(KNYC_23Z.replace("NBS GUIDANCE", "NBE GUIDANCE")),
+                         (None, []))
+        # a whole bulletin of them: each station's block found where it sits
+        data = self._bulletin(datetime(2026, 11, 22, 23, tzinfo=UTC), stations=("KNYC", "PHNL"),
+                              tmpl=KNYC_23Z, sid="KNYC", stamp="11/22/2026  2300")
+        blocks = r.nbs_blocks(data, ["KNYC", "PHNL", "KZZZ"])
+        self.assertEqual(sorted(blocks), ["KNYC", "PHNL"])
+        for sid, (off, ln, txt) in blocks.items():
+            self.assertEqual(data[off:off + ln].decode("ascii"), txt)
+            self.assertTrue(txt.startswith(f" {sid}    NBM  NBS GUIDANCE"))
+
+    def test_a_bulletin_without_the_version_reads_whole_then_by_range(self):
+        now = datetime(2026, 11, 23, 0, 50, tzinfo=UTC)
+        c23, c00 = datetime(2026, 11, 22, 23, tzinfo=UTC), datetime(2026, 11, 23, 0, tzinfo=UTC)
+        new = dict(stations=("KNYC", "PHNL"), tmpl=KNYC_23Z, sid="KNYC", stamp="11/22/2026  2300")
+        http = self._Http({c23: self._bulletin(c23, **new)})
+        with mock.patch.object(r, "NBS_HOURLY_MAX_BPS", 0):
+            cyc, got, idx, how = REAL_FETCH_NBS_HOURLY(["KNYC", "PHNL"], now, {}, http=http)
+            self.assertEqual((cyc, sorted(got), http.wholes, http.ranges),
+                             (c23, ["KNYC", "PHNL"], 1, 0))
+            self.assertEqual(got["KNYC"][1][0], (datetime(2026, 11, 23, 12, tzinfo=UTC), 0.37))
+            self.assertEqual(idx["sizes"][str(len(http.files[c23]))]["absent"], [])
+            # the next cycle, same layout: by range
+            http.files[c00] = self._bulletin(c00, **new)
+            cyc, got, idx, how = REAL_FETCH_NBS_HOURLY(["KNYC", "PHNL"], now + timedelta(hours=1),
+                                                    idx, http=http)
+            self.assertEqual((cyc, how, http.wholes, http.ranges), (c00, "by range", 1, 2))
+            self.assertEqual(got["PHNL"][0], c00)
+
+    def _bulletin(self, cyc: datetime, stations=("KATL", "KSEA"), filler=3,
+                  tmpl=KATL_13Z, sid="KATL", stamp="10/29/2026  1300"):
         hh = f"{cyc:%m/%d/%Y  %H}00"
         out = [" 1\n", " " * 74 + "\n"]
         for i in range(filler):                                   # other stations
-            out.append(KATL_13Z.replace("KATL", f"X{i:03d}").replace("10/29/2026  1300", hh))
+            out.append(tmpl.replace(sid, f"X{i:03d}").replace(stamp, hh))
         for s in stations:
-            out.append(KATL_13Z.replace("KATL", s).replace("10/29/2026  1300", hh))
+            out.append(tmpl.replace(sid, s).replace(stamp, hh))
         return "".join(out).encode("ascii")
 
     class _Http:
@@ -814,6 +872,40 @@ class TestComposite(unittest.TestCase):
         # 01:01Z next day: the NBE's 00Z run (12Z + 12h, an hour on)
         self._write(now=datetime(2026, 10, 16, 1, 1, tzinfo=UTC))
         self.assertEqual(self.calls["E"], 2)
+
+    def test_an_hourly_cycle_the_old_parser_read_is_read_again_at_once(self):
+        # the file's 13Z cycle, every station searched and none read (the
+        # header pattern that wanted "V5.0"): read again on this pass, not when
+        # 14Z is due at 15:00Z
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"nbs_hourly": {"cycle": self.H_RUN.isoformat(), "runs": {},
+                                      "searched": ["KNYC"], "index": {"sizes": {
+                                          "29577695": {"offsets": {}, "absent": ["KNYC"]}}}}}, f)
+        d = self._write()
+        self.assertEqual(self.calls["H"], 1)
+        self.assertEqual((d["nbs_hourly"]["v"], d["markets"][self.T]["src"]),
+                         (r.NBS_HOURLY_PARSE_VERSION, "H+S+E"))
+        # this parser's own cycle is kept until the next one is due
+        self._write(now=self.NOW + timedelta(minutes=15))
+        self.assertEqual(self.calls["H"], 1)
+
+    def test_a_cycle_that_reads_no_station_is_flagged(self):
+        def none_read(sids, now, index):
+            return self.H_RUN, {}, {"sizes": {}}, "whole file (its layout indexed)"
+        with mock.patch.object(r, "_log") as log:
+            m = self._write(nbs_hourly_fn=none_read)["markets"][self.T]
+        said = [c.args[0] for c in log.call_args_list if "NBS hourly cycle" in c.args[0]]
+        self.assertEqual(len(said), 1)
+        self.assertTrue(said[0].startswith("! NBS hourly cycle 2026-10-15 13Z: 0 of 1 station(s)"))
+        self.assertIn("has NOAA changed the bulletin's format?", said[0])
+        self.assertEqual(m["src"], "S+E")
+        # a cycle that reads is not flagged
+        os.remove(self.path)
+        with mock.patch.object(r, "_log") as log:
+            self._write()
+        said = [c.args[0] for c in log.call_args_list if "NBS hourly cycle" in c.args[0]]
+        self.assertEqual(len(said), 1)
+        self.assertTrue(said[0].startswith("NBS hourly cycle 2026-10-15 13Z: 1 of 1 station(s)"))
 
 
 class TestLongLeads(unittest.TestCase):

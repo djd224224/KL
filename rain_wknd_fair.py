@@ -239,6 +239,9 @@ NBS_HOURLY_MAX_AGE_HOURS = 6.0
 NBS_MIN_PERIODS = 4          # NBS's ~72 hours hold 5-6 twelve-hour PoPs
 NBS_HOURLY_LOOKBACK = 4      # cycles back searched for the newest posted one
 NBS_HOURLY_SIZES = 6         # file layouts (by size) the byte-range index keeps
+NBS_HOURLY_PARSE_VERSION = 2  # the file's hourly cycle, runs and layouts from another
+#                               parser (2 = 2026-11-22, the header without "V5.0")
+#                               are read again at once
 NBS_HOURLY_MAX_BPS = float(os.environ.get("IMM_RAIN_WKND_NBS_MAX_BPS", "2000000"))
 NBE_EVERY_HOURS = 12.0       # how often a new run is due (from its last one)
 NBS_EVERY_HOURS = 6.0
@@ -720,8 +723,12 @@ def snow_due_run(sid: str, cache: dict, fn: Callable, now: datetime
     return (rt, per), err
 
 
-# (the bulletin pads a one-digit month or day with a space: " 9/24/2026")
-_NBS_HDR = r"^ (\S+)\s+NBM V[\d.]+ NBS GUIDANCE\s+(\d{1,2})/\s*(\d{1,2})/(\d{4})\s+(\d\d)00 UTC"
+# (the bulletin pads a one-digit month or day with a space: " 9/24/2026").
+# The version token is optional: NOAA dropped "V5.0" at the 11/03 12Z cycle
+# (" KNYC    NBM  NBS GUIDANCE    11/22/2026  2300 UTC"), and the pattern
+# that required it read no station for 20 days (Jack 2026-11-22: "Yes, fix it")
+_NBS_HDR = (r"^ (\S+)\s+NBM\s+(?:\S+\s+)?NBS GUIDANCE\s+(\d{1,2})/\s*(\d{1,2})/(\d{4})"
+            r"\s+(\d\d)00 UTC")
 _NBS_HDR_RE = re.compile(_NBS_HDR)
 _NBS_HDR_BYTES_RE = re.compile(_NBS_HDR.encode("ascii"), re.M)
 
@@ -1252,6 +1259,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             if err:
                 nbs_failed[sid] = err
     hourly_old = old.get("nbs_hourly") or {}
+    if int(hourly_old.get("v") or 1) != NBS_HOURLY_PARSE_VERSION:
+        hourly_old = {}
     h_cycle = _ts(str(hourly_old.get("cycle") or ""))
     h_index = hourly_old.get("index") or {}
     h_runs: Dict[str, Tuple[Optional[datetime], list]] = {
@@ -1266,8 +1275,12 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                                     or any(s not in h_runs for s in got)):
                 h_cycle, h_runs = cyc, got
                 h_searched = set(sids)
-                _log(f"NBS hourly cycle {cyc:%Y-%m-%d %H}Z: {len(got)} of {len(sids)} "
-                     f"station(s), {how}")
+                # none read is the bulletin's format, not the stations (11/03-11/22)
+                _log(("" if got else "! ")
+                     + f"NBS hourly cycle {cyc:%Y-%m-%d %H}Z: {len(got)} of {len(sids)} "
+                     f"station(s), {how}"
+                     + ("" if got else " -- no station's block read: has NOAA changed "
+                                       "the bulletin's format?"))
         except Exception as ex:
             _log(f"NBS hourly read failed ({type(ex).__name__}: {str(ex)[:120]}); "
                  f"the file's cycle stands in while young enough")
@@ -1453,7 +1466,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     payload = {"generated_at": stamp, "events_at": events_at, "open_events": events,
                "markets": markets, "missing": missing, "nbe": _runs(nbe),
                "nbs": _runs(nbs),
-               "nbs_hourly": {"cycle": h_cycle.isoformat() if h_cycle else None,
+               "nbs_hourly": {"v": NBS_HOURLY_PARSE_VERSION,
+                              "cycle": h_cycle.isoformat() if h_cycle else None,
                               "index": h_index, "runs": _runs(h_runs),
                               "searched": sorted(h_searched)},
                "auto_stations": auto, "unmapped": unmapped,
