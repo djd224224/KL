@@ -9304,7 +9304,7 @@ class TestRtLadderLean(unittest.TestCase):
     def test_the_defaults_and_the_split(self):
         self.assertTrue(imm.RT_LADDER_LEAN)
         self.assertEqual(imm.RT_LADDER_LOW_MULTS, (1.0, 1.0))
-        self.assertEqual(imm.RT_LADDER_UPPER_MULTS, (0.75, 3.0))
+        self.assertEqual(imm.RT_LADDER_UPPER_MULTS, (0.75, 2.25))
         for k in ("RT_LADDER_LEAN", "RT_LADDER_LOW_MULTS", "RT_LADDER_UPPER_MULTS"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
         f = imm.rt_ladder_third_of
@@ -9345,7 +9345,7 @@ class TestRtLadderLean(unittest.TestCase):
         for k in (45, 50, 55):
             self.assertEqual(m(f"{self.EV}-{k}"), (1.0, 1.0), k)
         for k in (60, 65, 70, 75, 80, 85):
-            self.assertEqual(m(f"{self.EV}-{k}"), (0.75, 3.0), k)
+            self.assertEqual(m(f"{self.EV}-{k}"), (0.75, 2.25), k)
         # a film or strike the feed does not list: the family lean
         self.assertEqual(m("KXRT-ZZQ-80"), (0.75, 1.5))
         self.assertEqual(m(f"{self.EV}-99"), (0.75, 1.5))
@@ -9354,7 +9354,7 @@ class TestRtLadderLean(unittest.TestCase):
         self.assertEqual(m("KXHIGHNY-26NOV24-T50"), (1.0, 1.0))
         # side_size_mults carries it (the estimator, the floor projection)
         now = utc(2026, 11, 23, 15, 0)
-        self.assertEqual(imm.side_size_mults(f"{self.EV}-80", now), (0.75, 3.0))
+        self.assertEqual(imm.side_size_mults(f"{self.EV}-80", now), (0.75, 2.25))
         self.assertEqual(imm.side_size_mults(f"{self.EV}-45", now), (1.0, 1.0))
 
     def test_the_switches(self):
@@ -9407,9 +9407,9 @@ class TestRtLadderLean(unittest.TestCase):
         before = self._rest(top, lean=False)          # the family lean: 0.75 / 1.5
         self.assertGreater(before["ask"], before["bid"])
         b, a = before["bid"] / 0.75, before["ask"] / 1.5     # the plain sides
-        # a top-third strike: bids as before, asks doubled (x1.5 -> x3) --
-        # and the placement guard lets the x3 ask rest
-        self.assertEqual(self._rest(top), {"bid": before["bid"], "ask": round(3 * a)})
+        # a top-third strike: bids as before, asks x1.5 -> x2.25 --
+        # and the placement guard lets the x2.25 ask rest
+        self.assertEqual(self._rest(top), {"bid": before["bid"], "ask": round(2.25 * a)})
         # a bottom-third strike rests flat
         self.assertEqual(self._rest(low), {"bid": round(b), "ask": round(a)})
 

@@ -20108,12 +20108,18 @@ def series_side_mults(series: str) -> Tuple[float, float]:
 #   the last 7 days' fills at marks: top asks +20.9c / bids -16.5c, middle
 #     +1.9c / -6.6c, bottom asks -3.6c / bids -7.0c (no bid edge yet).
 # So a KXRT strike in the MIDDLE or TOP third of its film's listed ladder rests
-# bids x0.75 and asks x3 (RT_LADDER_UPPER_MULTS: the family lean with its ask
-# doubled); one in the BOTTOM third rests flat, x1 a side
+# bids x0.75 and asks x2.25 (RT_LADDER_UPPER_MULTS: the family lean with its
+# ask x1.5 more); one in the BOTTOM third rests flat, x1 a side
 # (RT_LADDER_LOW_MULTS -- flat, not a bid lean, as the bid edge there has not
 # shown at marks). Modelled on the 11/23 books (the size-up model, a MODEL
 # not a measurement): rewards $114 -> $156/day, trading -$15..-41 -> +$59..+144/day,
-# against 2x everything's $211/day and -$30..-81. The thirds rank each strike
+# against 2x everything's $211/day and -$30..-81. It went live 11/23 at asks
+# x3; the 37-film re-score that evening (Hunger Games and I Play Rocky
+# settled) cut the middle+top ask edge to +7.4c a contract [-9.2, +23.0 90% CI]
+# -- +18.3c without I Play Rocky, a runaway film whose 200-600 lot ask fills
+# lost $3,025 -- so asks were softened to x2.25 (Jack 2026-11-23: "yes soften
+# to 2.25x"; modelled against the old lean +$104/day central, +$17 with the
+# upper asks at their 90% low, vs x3's +$164 / -$10). The thirds rank each strike
 # among its film's open strikes as rt_fair.py lists them (open_events, by
 # rt_ladder_third_of); a film or strike the feed does not list, or a film
 # with fewer than RT_LADDER_MIN_STRIKES strikes, keeps the family lean. Caps, the event cap, the release-week cutoff, the band, the
@@ -20132,7 +20138,7 @@ def _side_pair_env(name: str, default: Tuple[float, float]) -> Tuple[float, floa
 
 RT_LADDER_LEAN = os.environ.get("IMM_RT_LADDER_LEAN", "1") == "1"
 RT_LADDER_LOW_MULTS = _side_pair_env("IMM_RT_LADDER_LOW", (1.0, 1.0))
-RT_LADDER_UPPER_MULTS = _side_pair_env("IMM_RT_LADDER_UPPER", (0.75, 3.0))
+RT_LADDER_UPPER_MULTS = _side_pair_env("IMM_RT_LADDER_UPPER", (0.75, 2.25))
 RT_LADDER_MIN_STRIKES = 3
 
 
