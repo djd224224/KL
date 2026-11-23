@@ -24101,6 +24101,184 @@ class TestVercelPreDGate(unittest.TestCase):
             self.assertAlmostEqual(meta.est_frac, both, places=6)
 
 
+class TestVercelTailBids(unittest.TestCase):
+    """VERCEL TAIL BIDS OFF (Jack 2026-11-23: "Yes, build it", on "no YES bid
+    while a strike's mid is under 35c, with a kill switch"): on a
+    VERCEL_TAIL_BID_SERIES market whose external mid is under
+    VERCEL_TAIL_BID_MID_C the bid side rests no rung and the ask quotes alone
+    on the bid-only rule's terms. Fixture event KXOPENSOURCESHARE-68DEC06
+    (D = 2068-12-05), strike T67.5: the fixture sample about X_L 67.0 prices
+    it at 20c, about 67.3 at 40c."""
+
+    T = "KXOPENSOURCESHARE-68DEC06-T67.5"
+    EV = "KXOPENSOURCESHARE-68DEC06"
+    CLOSE = datetime(2068, 12, 6, 14, 0, tzinfo=timezone.utc)
+    TAIL = ("0.14", "0.15", "0.16", "0.17", "0.18"), ("0.74", "0.75", "0.76", "0.77", "0.78")
+    MID40 = ("0.34", "0.35", "0.36", "0.37", "0.38"), ("0.54", "0.55", "0.56", "0.57", "0.58")
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        try:
+            os.remove(imm.VERCEL_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+        # the fixture runs on the original series alone; the module's own
+        # default is checked apart (test_the_series_default)
+        self._default_series = imm.VERCEL_TAIL_BID_SERIES
+        p = mock.patch.object(imm, "VERCEL_TAIL_BID_SERIES", ("KXOPENSOURCESHARE",))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, x_l=67.0):
+        entry = {"x_l": x_l, "errs": [-1.0, -0.5, 0.0, 0.5, 1.0] * 12,
+                 "last": "2068-12-03", "d": "2068-12-05", "h": 2, "n": 60,
+                 "series": "KXOPENSOURCESHARE",
+                 "fetched_at": datetime.now(timezone.utc).isoformat()}
+        with open(imm.VERCEL_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {self.EV: entry}}, f)
+        os.utime(imm.VERCEL_FAIR_FILE, (time.time(), time.time() + 1000 + self._bump))
+        TestVercelTailBids._bump += 1
+        return imm.load_vercel_fair()
+
+    def _bot(self, book=None):
+        yes, no = book or self.TAIL
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": f"{yes[-1]}00",
+            "yes_ask_dollars": f"{1 - float(no[-1]):.4f}",
+            "volume_fp": "500.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [[p, "400"] for p in yes],
+            "no_dollars": [[p, "400"] for p in no]}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _sides(self, bot):
+        return {o["book_side"] for o in bot.state.sim_orders.values()
+                if o["ticker"] == self.T}
+
+    def test_armed_by_default_with_a_kill_switch(self):
+        self.assertTrue(imm.VERCEL_TAIL_BID)
+        self.assertEqual(imm.VERCEL_TAIL_BID_MID_C, 35.0)
+        for k in ("VERCEL_TAIL_BID", "VERCEL_TAIL_BID_MID_C", "VERCEL_TAIL_BID_SERIES"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS, k)
+
+    def test_the_series_default(self):
+        # the 11/23 family sweep: where the book's tail settles YES under its
+        # bid and our tail bids lost -- not the spend series
+        self.assertEqual(self._default_series, (
+            "KXANTHVREQ", "KXDEEPVREQ", "KXGOOGVREQ", "KXOPENSOURCESHARE", "KXOPENVREQ"))
+        for s in self._default_series:
+            self.assertIn(s, imm.VERCEL_BASE_SERIES, s)
+
+    def test_the_mid_test(self):
+        r = imm.vercel_tail_bid_reason
+        self.assertIn("mid 20c under 35c", r(self.T, 18, 22))
+        self.assertEqual(r(self.T, 38, 42), "")
+        self.assertTrue(r(self.T, 34, 35))                   # 34.5
+        self.assertEqual(r(self.T, 34, 36), "")              # 35: at the bar
+        # no YES offer reads 100c, no YES bid 0c; an empty book has no mid
+        self.assertEqual(r(self.T, 20, None), "")            # (20 + 100) / 2
+        self.assertTrue(r(self.T, None, 30))                 # (0 + 30) / 2
+        self.assertEqual(r(self.T, None, None), "")
+        # only the listed series
+        self.assertEqual(r("KXOPENVREQ-05DEC68-T20", 18, 22), "")
+        with mock.patch.object(imm, "VERCEL_TAIL_BID", False):
+            self.assertEqual(r(self.T, 18, 22), "")
+        with mock.patch.object(imm, "VERCEL_TAIL_BID_MID_C", 0.0):
+            self.assertEqual(r(self.T, 18, 22), "")
+        with mock.patch.object(imm, "VERCEL_TAIL_BID_MID_C", 15.0):
+            self.assertEqual(r(self.T, 18, 22), "")
+
+    def test_the_gate_takes_the_bids_out(self):
+        now = time.time()
+        g = lambda b, a: imm.vercel_gate(self.T, now, b, a, self.CLOSE)
+        so = lambda b, a: imm.vercel_side_out("KXOPENSOURCESHARE", self.T, now, b, a,
+                                              self.CLOSE)
+        self.assertEqual(self._write(), (1, 0))               # fair 20c
+        why, inp = g(18, 22)
+        self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "tail_bid"))
+        self.assertIn("no YES bid", inp["why"])
+        self.assertEqual(so(18, 22), "bid")
+        with mock.patch.object(imm, "VERCEL_TAIL_BID", False):
+            self.assertEqual(g(18, 22), ("", {}))
+            self.assertIsNone(so(18, 22))
+        self._write(x_l=67.3)                                 # fair 40c
+        self.assertEqual(g(38, 42), ("", {}))                 # mid 40: both sides
+        self.assertIsNone(so(38, 42))
+        # an ask breach (22 < 40 - 15) on a tail strike: nothing left to rest
+        why, inp = g(10, 22)
+        self.assertTrue(why)
+        self.assertEqual(inp["reason"], "tail_bid")
+        self.assertIn("ask side", why)
+        self.assertIn("no YES bid", why)
+        self.assertIsNone(so(10, 22))
+        with mock.patch.object(imm, "VERCEL_TAIL_BID", False):
+            why, inp = g(10, 22)
+            self.assertEqual((why, inp["side_out"]), ("", "ask"))
+        # an ask breach over the bar (48 < 80 - 15, mid 44): bid only, as before
+        self._write(x_l=68.3)                                 # fair 80c
+        why, inp = g(40, 48)
+        self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "ask", "band"))
+        self.assertEqual(so(40, 48), "ask")
+
+    def test_the_loop_rests_the_ask_alone(self):
+        bot = self._bot()
+        self._write()                                         # fair 20c, book 18x22
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot), {"ask"})
+        self.assertEqual(bot._vercel_bid_only.get(self.T), "bid")
+        self.assertNotIn(self.T, bot._vercel_stood)
+        # under the payout floor the ask alone stands aside at once
+        bot.state.hopeless_since[self.T] = time.time()
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot), set())
+        self.assertIn(self.T, bot._vercel_stood)
+        bot.state.hopeless_since.pop(self.T)
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot), {"ask"})
+        self.assertNotIn(self.T, bot._vercel_stood)
+        # the kill switch: both sides again
+        with mock.patch.object(imm, "VERCEL_TAIL_BID", False):
+            bot.run_cycle()
+            self.assertEqual(self._sides(bot), {"bid", "ask"})
+            self.assertNotIn(self.T, bot._vercel_bid_only)
+
+    def test_a_mid_over_the_bar_quotes_both_sides(self):
+        bot = self._bot(self.MID40)
+        self._write(x_l=67.3)                                 # fair 40c, book 38x42
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot), {"bid", "ask"})
+        self.assertNotIn(self.T, bot._vercel_bid_only)
+
+    def test_the_estimate_counts_the_ask_alone(self):
+        with mock.patch.object(imm, "FAMILY_SIDE_LEANS", {}):
+            bot = self._bot()
+            self._write()
+            with mock.patch.object(imm, "VERCEL_TAIL_BID", False):
+                bot.run_cycle()
+                meta = bot.state.selected[self.T]
+                bot._estimate_candidate_yield(meta, [])
+                both, floor_both = meta.est_frac, meta.floor_dollars_per_day
+            self.assertGreater(both, 0.0)
+            bot._estimate_candidate_yield(meta, [])
+            self.assertAlmostEqual(meta.est_frac, both / 2, places=6)
+            self.assertAlmostEqual(meta.floor_dollars_per_day, floor_both / 2, places=6)
+
 
 class TestYouTube2Pilot(unittest.TestCase):
     """The YouTube #2 top-video pilot (Jack 2026-10-05: "go ship the youtube
