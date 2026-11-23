@@ -9246,6 +9246,174 @@ class TestFamilySideLeans(unittest.TestCase):
             self.assertEqual(real("KXRT"), "")
 
 
+class TestRtLadderLean(unittest.TestCase):
+    """Jack 2026-11-23: "Yes, build it", on the RT double-down read. RT
+    LADDER LEAN: a KXRT strike in the middle or top third of its film's
+    listed ladder rests bids x0.75 / asks x3, one in the bottom third x1 a
+    side; a strike the RT feed does not list keeps the family lean (0.75 /
+    1.5). Fixture film KXRT-ZZL with nine strikes 45..85: 45-55 bottom,
+    60-70 middle, 75-85 top."""
+
+    EV = "KXRT-ZZL"
+    KS = (45, 50, 55, 60, 65, 70, 75, 80, 85)
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        saved = dict(imm._rt_fair_state)
+
+        def restore():
+            imm._rt_fair_state.clear()
+            imm._rt_fair_state.update(saved)
+        self.addCleanup(restore)
+        imm._rt_fair_state.update(mtime=0.0, markets={}, films={}, strikes={},
+                                  ladder_third={})
+        try:
+            os.remove(imm.RT_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+        self.addCleanup(lambda: os.path.exists(imm.RT_FAIR_FILE)
+                        and os.remove(imm.RT_FAIR_FILE))
+        imm._family_cache.clear()
+        self.addCleanup(imm._family_cache.clear)
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        for p in (mock.patch.object(imm, "FAMILY_SIDE_LEANS",
+                                    imm._family_lean_spec(imm._DEFAULT_FAMILY_SIDE_LEANS)),
+                  mock.patch.object(imm, "series_in_blackout", return_value=False),
+                  mock.patch.object(imm, "ADMIT_SUSTAIN_SECS", 0),
+                  mock.patch.object(imm, "RT_FLOOR_BOOST_MAX", 1.0),
+                  mock.patch.object(imm, "LEVELS", [(0, 20)])):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, strikes=None, extra=None):
+        ks = self.KS if strikes is None else strikes
+        oe = {self.EV: {"strikes": {f"{self.EV}-{k}": float(k) for k in ks},
+                        "close": "2026-12-28T15:00:00Z"}}
+        oe.update(extra or {})
+        with open(imm.RT_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"open_events": oe, "films": {}, "markets": {}}, f)
+        os.utime(imm.RT_FAIR_FILE, (time.time(), time.time() + 1000 + TestRtLadderLean._bump))
+        TestRtLadderLean._bump += 1
+        return imm.load_rt_fair()
+
+    def test_the_defaults_and_the_split(self):
+        self.assertTrue(imm.RT_LADDER_LEAN)
+        self.assertEqual(imm.RT_LADDER_LOW_MULTS, (1.0, 1.0))
+        self.assertEqual(imm.RT_LADDER_UPPER_MULTS, (0.75, 3.0))
+        for k in ("RT_LADDER_LEAN", "RT_LADDER_LOW_MULTS", "RT_LADDER_UPPER_MULTS"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        f = imm.rt_ladder_third_of
+        self.assertEqual([f(i, 9) for i in range(9)], [0, 0, 0, 1, 1, 1, 2, 2, 2])
+        self.assertEqual([f(i, 10) for i in range(10)], [0, 0, 0, 0, 1, 1, 1, 2, 2, 2])
+        # FUR's 16 strikes 11/23: 45-70 bottom, 72-82 middle, 85-95 top
+        self.assertEqual([f(i, 16) for i in range(16)],
+                         [0] * 6 + [1] * 5 + [2] * 5)
+        self.assertEqual(f(0, 0), 0)
+        with mock.patch.dict(os.environ, {"X_PAIR": "0.5:2"}):
+            self.assertEqual(imm._side_pair_env("X_PAIR", (1.0, 1.0)), (0.5, 2.0))
+        for bad in ("", "1", "a:b", "1:2:3"):
+            with mock.patch.dict(os.environ, {"X_PAIR": bad}):
+                self.assertEqual(imm._side_pair_env("X_PAIR", (1.0, 1.0)), (1.0, 1.0), bad)
+        with mock.patch.dict(os.environ, {"X_PAIR": "-1:2"}):
+            self.assertEqual(imm._side_pair_env("X_PAIR", (1.0, 1.0)), (0.0, 2.0))
+
+    def test_thirds_come_from_the_feed_ladder(self):
+        self._write(extra={"KXRT-ZZT": {"strikes": {"KXRT-ZZT-80": 80.0, "KXRT-ZZT-90": 90.0}}})
+        th = imm._rt_fair_state["ladder_third"]
+        self.assertEqual({k: th[f"{self.EV}-{k}"] for k in self.KS},
+                         {45: 0, 50: 0, 55: 0, 60: 1, 65: 1, 70: 1, 75: 2, 80: 2, 85: 2})
+        # a two-strike film has no thirds (RT_LADDER_MIN_STRIKES)
+        self.assertNotIn("KXRT-ZZT-80", th)
+        self.assertEqual(imm._rt_fair_state["strikes"]["KXRT-ZZT-90"], 90.0)
+        # a strike listed later re-ranks the ladder at the next load
+        self._write(strikes=self.KS + (72, 77))
+        th = imm._rt_fair_state["ladder_third"]
+        self.assertEqual(th[f"{self.EV}-70"], 1)
+        self.assertEqual(th[f"{self.EV}-72"], 1)
+        self.assertEqual(th[f"{self.EV}-75"], 1)          # 8th of 11: now middle
+        self.assertEqual(th[f"{self.EV}-77"], 2)
+        self.assertEqual(th[f"{self.EV}-60"], 0)          # 4th of 11: now bottom
+
+    def test_each_third_rests_its_lean(self):
+        self._write()
+        m = imm.market_side_mults
+        for k in (45, 50, 55):
+            self.assertEqual(m(f"{self.EV}-{k}"), (1.0, 1.0), k)
+        for k in (60, 65, 70, 75, 80, 85):
+            self.assertEqual(m(f"{self.EV}-{k}"), (0.75, 3.0), k)
+        # a film or strike the feed does not list: the family lean
+        self.assertEqual(m("KXRT-ZZQ-80"), (0.75, 1.5))
+        self.assertEqual(m(f"{self.EV}-99"), (0.75, 1.5))
+        # every other series: series_side_mults, unchanged
+        self.assertEqual(m("KXWCMENTION-26NOV30-X"), imm.series_side_mults("KXWCMENTION"))
+        self.assertEqual(m("KXHIGHNY-26NOV24-T50"), (1.0, 1.0))
+        # side_size_mults carries it (the estimator, the floor projection)
+        now = utc(2026, 11, 23, 15, 0)
+        self.assertEqual(imm.side_size_mults(f"{self.EV}-80", now), (0.75, 3.0))
+        self.assertEqual(imm.side_size_mults(f"{self.EV}-45", now), (1.0, 1.0))
+
+    def test_the_switches(self):
+        self._write()
+        t = f"{self.EV}-80"
+        with mock.patch.object(imm, "RT_LADDER_LEAN", False):
+            self.assertEqual(imm.market_side_mults(t), (0.75, 1.5))
+            self.assertEqual(imm.market_side_mults(f"{self.EV}-45"), (0.75, 1.5))
+        with mock.patch.object(imm, "RT_LADDER_UPPER_MULTS", (0.5, 2.0)):
+            self.assertEqual(imm.market_side_mults(t), (0.5, 2.0))
+        # a series' own SIDE_MULT_SERIES entry still wins
+        with mock.patch.dict(imm.SIDE_MULT_SERIES, {"KXRT": (0.25, 0.5)}):
+            self.assertEqual(imm.market_side_mults(t), (0.25, 0.5))
+
+    def _bot(self, t):
+        _clean_persist()
+        client = FakeClient()
+        close = (datetime.now(timezone.utc) + timedelta(days=30)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": t, "incentive_type": "liquidity",
+             "period_reward": 5000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[t] = {
+            "ticker": t, "event_ticker": self.EV, "status": "active",
+            "close_time": close, "yes_bid_dollars": "0.4900",
+            "yes_ask_dollars": "0.5100", "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[t] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _rest(self, t, lean=True):
+        bot = self._bot(t)
+        with mock.patch.object(imm, "RT_LADDER_LEAN", lean), \
+                mock.patch.object(imm, "floor_bar_dollars", lambda series, banked: 0.0):
+            bot.run_cycle()
+        self.assertIn(t, bot.state.selected)
+        out = {"bid": 0, "ask": 0}
+        for o in bot.state.sim_orders.values():
+            if o["ticker"] == t and 1 < o["yes_price"] < 99:
+                out[o["book_side"]] += int(o["remaining_count"])
+        return out
+
+    def test_the_quote_loop_rests_the_ladder_lean(self):
+        self._write()
+        top, low = f"{self.EV}-80", f"{self.EV}-50"
+        before = self._rest(top, lean=False)          # the family lean: 0.75 / 1.5
+        self.assertGreater(before["ask"], before["bid"])
+        b, a = before["bid"] / 0.75, before["ask"] / 1.5     # the plain sides
+        # a top-third strike: bids as before, asks doubled (x1.5 -> x3) --
+        # and the placement guard lets the x3 ask rest
+        self.assertEqual(self._rest(top), {"bid": before["bid"], "ask": round(3 * a)})
+        # a bottom-third strike rests flat
+        self.assertEqual(self._rest(low), {"bid": round(b), "ask": round(a)})
+
+
 class TestEventLongshotCut(unittest.TestCase):
     """Jack 2026-10-22: "1, and give me email report" -- in the event
     families the side that buys the cheap contract rests at 0.75x."""

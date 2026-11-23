@@ -15039,6 +15039,8 @@ _CONFIG_CODE_KNOBS = (
     "PAD_RELEASE_HOLD_SECS",                     # ...held 10 min (2026-10-25)
     "SIDE_MULT_SERIES",                          # Trump mentions side sizes (2026-10-22/27/29)
     "FAMILY_SIDE_LEANS",                         # family 1.5x / 0.75x side leans (2026-10-22)
+    "RT_LADDER_LEAN", "RT_LADDER_LOW_MULTS",     # the RT ladder lean (2026-11-23)
+    "RT_LADDER_UPPER_MULTS",
     "LONGSHOT_MULT", "LONGSHOT_BID_BELOW",       # the event long-shot cut (2026-10-22)
     "LONGSHOT_ASK_FROM", "LONGSHOT_FAMILIES",
     "SIZE_TEST_MULT", "SIZE_TEST_FROM", "SIZE_TEST_DAYS",   # base size split test (2026-10-26)
@@ -18705,7 +18707,8 @@ RT_FAIR_MIN_REVIEWS_DEFAULT = 10      # rt_fair.MIN_REVIEWS, when the file has n
 RT_FAIR_FILE = os.environ.get(
     "IMM_RT_FAIR_FILE", os.path.join(STATUS_DIR, "rt_fair.json"))
 _rt_fair_state: dict = {"mtime": 0.0, "markets": {}, "films": {}, "strikes": {},
-                        "closes": {}, "min_reviews": RT_FAIR_MIN_REVIEWS_DEFAULT}
+                        "closes": {}, "min_reviews": RT_FAIR_MIN_REVIEWS_DEFAULT,
+                        "ladder_third": {}}
 
 
 def rt_fair_series(series: str) -> bool:
@@ -18715,8 +18718,9 @@ def rt_fair_series(series: str) -> bool:
 def load_rt_fair() -> int:
     """Hot-reload RT_FAIR_FILE by mtime: markets {ticker: {p (None without
     a price), event, n, ts, jump_ts}}, films {event: {n, score}}, strikes
-    {ticker: strike} (RT SETTLED STRIKES) and closes {event: ts} (RT LOCKED
-    SIZE); the market count, else -1."""
+    {ticker: strike} (RT SETTLED STRIKES), closes {event: ts} (RT LOCKED
+    SIZE) and ladder_third {ticker: 0 / 1 / 2} (RT LADDER LEAN); the market
+    count, else -1."""
     try:
         mtime = os.path.getmtime(RT_FAIR_FILE)
     except OSError:
@@ -18754,17 +18758,25 @@ def load_rt_fair() -> int:
             continue
     strikes: Dict[str, float] = {}
     closes: Dict[str, float] = {}       # event -> its close (RT LOCKED SIZE)
+    thirds: Dict[str, int] = {}         # ticker -> its film's ladder third (RT LADDER LEAN)
     for ev, oe in (data.get("open_events") or {}).items():
+        ks: Dict[str, float] = {}
         for t, k in ((oe or {}).get("strikes") or {}).items():
             try:
-                strikes[str(t)] = float(k)
+                ks[str(t)] = float(k)
             except (TypeError, ValueError):
                 continue
+        strikes.update(ks)
+        lad = sorted(set(ks.values()))
+        if len(lad) >= RT_LADDER_MIN_STRIKES:      # (a ladder has thirds)
+            for t, k in ks.items():
+                thirds[t] = rt_ladder_third_of(lad.index(k), len(lad))
         c = parse_iso_utc(str((oe or {}).get("close") or ""))
         if c is not None:
             closes[str(ev)] = c.timestamp()
     _rt_fair_state["films"], _rt_fair_state["strikes"] = films, strikes
     _rt_fair_state["closes"] = closes
+    _rt_fair_state["ladder_third"] = thirds
     try:   # the feed's own pricing bar (rt_fair.MIN_REVIEWS), for the few-reviews hold
         mr = int((data.get("model") or {}).get("min_reviews") or 0)
     except (TypeError, ValueError, AttributeError):
@@ -20080,6 +20092,72 @@ def series_side_mults(series: str) -> Tuple[float, float]:
     return (1.0, 1.0)
 
 
+# RT LADDER LEAN (Jack 2026-11-23: "Yes, build it", on "what's the best way
+# to double down on rotten tomatoes given performance?"). The Rotten Tomatoes
+# family lean (bids x0.75 / asks x1.5 on every strike, 2026-10-22) put the
+# book against the ladder: short 4,049 YES on films' bottom-third strikes,
+# long 2,107 on the top third (11/23). What wins depends on the strike's
+# place in its film's ladder -- the favourite-longshot shape:
+#   settled fills, 35 films (11/17, film-clustered 90% CIs all clear of 0):
+#     bottom third asks -21.8c a contract, bids +23.8c; middle and top asks
+#     +15.9c, bids -17.7c;
+#   Kalshi candles, 67 films 2026-01..09: top third YES -14.0c rich, bottom
+#     third +7.7c cheap, middle -4.8c (mixed);
+#   the last 7 days' fills at marks: top asks +20.9c / bids -16.5c, middle
+#     +1.9c / -6.6c, bottom asks -3.6c / bids -7.0c (no bid edge yet).
+# So a KXRT strike in the MIDDLE or TOP third of its film's listed ladder rests
+# bids x0.75 and asks x3 (RT_LADDER_UPPER_MULTS: the family lean with its ask
+# doubled); one in the BOTTOM third rests flat, x1 a side
+# (RT_LADDER_LOW_MULTS -- flat, not a bid lean, as the bid edge there has not
+# shown at marks). Modelled on the 11/23 books (the size-up model, a MODEL
+# not a measurement): rewards $114 -> $156/day, trading -$15..-41 -> +$59..+144/day,
+# against 2x everything's $211/day and -$30..-81. The thirds rank each strike
+# among its film's open strikes as rt_fair.py lists them (open_events, by
+# rt_ladder_third_of); a film or strike the feed does not list, or a film
+# with fewer than RT_LADDER_MIN_STRIKES strikes, keeps the family lean. Caps, the event cap, the release-week cutoff, the band, the
+# floor boost and the settled / locked strike rules are unchanged, so the
+# short-YES position cap still bounds each ask. IMM_RT_LADDER_LEAN=0 turns it
+# off (the family lean everywhere again); IMM_RT_LADDER_LOW / _UPPER = "bid:ask"
+# set the multipliers.
+def _side_pair_env(name: str, default: Tuple[float, float]) -> Tuple[float, float]:
+    """A "bid:ask" pair of non-negative multipliers from the environment."""
+    try:
+        b, a = (float(x) for x in os.environ.get(name, "").split(":"))
+    except ValueError:
+        return default
+    return (max(0.0, b), max(0.0, a))
+
+
+RT_LADDER_LEAN = os.environ.get("IMM_RT_LADDER_LEAN", "1") == "1"
+RT_LADDER_LOW_MULTS = _side_pair_env("IMM_RT_LADDER_LOW", (1.0, 1.0))
+RT_LADDER_UPPER_MULTS = _side_pair_env("IMM_RT_LADDER_UPPER", (0.75, 3.0))
+RT_LADDER_MIN_STRIKES = 3
+
+
+def rt_ladder_third_of(rank: int, n: int) -> int:
+    """0 / 1 / 2 = the bottom / middle / top third of a ladder of `n` strikes
+    for the strike at `rank` (0 = the lowest) -- rt_sizeup's split."""
+    return min(2, int(3 * rank / n)) if n > 0 else 0
+
+
+def rt_ladder_third(ticker: str) -> Optional[int]:
+    """A KXRT strike's third of its film's listed ladder, None when the RT
+    feed does not list it."""
+    return _rt_fair_state.get("ladder_third", {}).get(ticker)
+
+
+def market_side_mults(ticker: str) -> Tuple[float, float]:
+    """(bid_mult, ask_mult) of this market's side sizes: series_side_mults,
+    with a KXRT strike's ladder lean (RT LADDER LEAN) in place of the family
+    lean. A series' own SIDE_MULT_SERIES entry still wins."""
+    series = series_of(ticker)
+    if RT_LADDER_LEAN and series in RT_FAIR_SERIES and series not in SIDE_MULT_SERIES:
+        third = rt_ladder_third(ticker)
+        if third is not None:
+            return RT_LADDER_LOW_MULTS if third == 0 else RT_LADDER_UPPER_MULTS
+    return series_side_mults(series)
+
+
 # EVENT LONG-SHOT CUT (Jack 2026-10-22: "1, and give me email report", after
 # the price deep-dive of that day). In the event families -- sports & awards,
 # politics & approval, elections, weather & quakes -- the side that BUYS THE
@@ -20128,12 +20206,13 @@ def side_size_mults(ticker: str, now_utc: datetime,
                     yes_mid: Optional[float] = None) -> Tuple[float, float]:
     """(bid_mult, ask_mult) on this market's ladder right now: the Carbon Arc
     late-month rule times the series' own side sizes (SIDE_MULT_SERIES, else
-    its family's lean) and, given the YES mid, the event long-shot cut, with
+    its family's lean, else a KXRT strike's ladder lean: market_side_mults)
+    and, given the YES mid, the event long-shot cut, with
     asks zeroed for a bid-only family (a quake ask strike keeps its ask side;
     quake_cap_quotes sizes and floors it) and bids zeroed for a NO-side-only
     market (no_side_only)."""
     bm, am = ca_late_month_mults(ticker, now_utc)
-    sb, sa = series_side_mults(series_of(ticker))
+    sb, sa = market_side_mults(ticker)
     lb, la = longshot_side_mults(series_of(ticker), yes_mid)
     bm, am = bm * sb * lb, am * sa * la
     if series_bid_only(series_of(ticker)) and not quake_ask_strike(ticker):
@@ -41438,7 +41517,7 @@ class IncentiveMarketMaker:
             # late-month cut; the unwinding side keeps the non-toxic size
             _uw_lift = _uw is not None and (sbm if _uw == "bid" else sam) <= 0
             if _uw_lift:
-                _um = (CA_LATE_SIZE_MULT * series_side_mults(meta.series)[_uw_i]
+                _um = (CA_LATE_SIZE_MULT * market_side_mults(meta.ticker)[_uw_i]
                        * longshot_side_mults(meta.series, _uw_mid)[_uw_i])
                 sbm, sam = (_um, sam) if _uw == "bid" else (sbm, _um)
             lvb, lva = scale_levels(lv, sbm), scale_levels(lv, sam)
@@ -44749,9 +44828,10 @@ class IncentiveMarketMaker:
                 elif own_pos < 0 and ca_bm <= 0:
                     ca_bm = ca_unwind_late_mult(t, now_utc)
             # ...times the series' own side sizes (SIDE_MULT_SERIES, Trump B;
-            # else the family's lean) and the event long-shot cut at this
+            # else the family's lean; a KXRT strike's ladder lean,
+            # market_side_mults) and the event long-shot cut at this
             # book's mid (LONGSHOT_MULT)
-            ss_bm, ss_am = series_side_mults(meta.series)
+            ss_bm, ss_am = market_side_mults(t)
             ls_bm, ls_am = longshot_side_mults(meta.series, touch_mid(ext_bid, ext_ask))
             lv_bid = scale_levels(lv, ca_bm * ss_bm * ls_bm)
             lv_ask = scale_levels(lv, ca_am * ss_am * ls_am)
@@ -46944,7 +47024,8 @@ class IncentiveMarketMaker:
             # lean is 67.5 -> 68 there, x3 = 204, against 45 x 3 x 1.5 = 202.5
             # here, so KXRIRESPOWER-27FEB28-T29.0's bid was refused every
             # cycle from 6 PM ET (679 side_cap alerts on 10/30)
-            _ssm = max(1.0, series_side_mults(series)[0 if q.book_side == "bid" else 1])
+            # (and a KXRT strike's ladder lean: market_side_mults, x3 asks)
+            _ssm = max(1.0, market_side_mults(q.ticker)[0 if q.book_side == "bid" else 1])
             lv_side = scale_levels(lv_now, _ssm)
             side_cap = sum(s for _t, s in lv_side) * cap_mult
             # atref collapses the side's WHOLE ladder to one price level by
@@ -50378,6 +50459,12 @@ class IncentiveMarketMaker:
                             for f, (b, a) in sorted(FAMILY_SIDE_LEANS.items()))
                 + " -- families by imm_dashboard.family_of; a series' own side sizes "
                   "win; report email 2026-11-05")
+        if RT_LADDER_LEAN:
+            (_rlb, _rla), (_rub, _rua) = RT_LADDER_LOW_MULTS, RT_LADDER_UPPER_MULTS
+            log(f"RT ladder lean (2026-11-23): KXRT bottom-third strikes bids x{_rlb:g} / "
+                f"asks x{_rla:g}, middle and top thirds bids x{_rub:g} / asks x{_rua:g} "
+                f"(thirds of each film's ladder in rt_fair.json; a strike it does not "
+                f"list keeps the family lean); caps unchanged")
         if LONGSHOT_MULT != 1.0 and LONGSHOT_FAMILIES:
             log(f"event long-shot cut (2026-10-22): {', '.join(sorted(LONGSHOT_FAMILIES))} -- "
                 f"bids x{LONGSHOT_MULT:g} while the YES mid is under {LONGSHOT_BID_BELOW:g}c, "
