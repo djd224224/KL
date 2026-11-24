@@ -964,7 +964,10 @@ function lineChart(host, series, o) {
 }
 function timeTicks(x0, x1) {
   const span = x1 - x0, out = [];
-  const step = span <= 30 * 3600 ? (span <= 14 * 3600 ? 2 * 3600 : 4 * 3600) : span > 45 * 86400 ? 7 * 86400 : 86400;
+  // about 8 day labels at most: whole days up to 45 days (30 days: every 4th), whole weeks beyond
+  const nd = span / 86400;
+  const step = span <= 30 * 3600 ? (span <= 14 * 3600 ? 2 * 3600 : 4 * 3600)
+    : nd <= 10 ? 86400 : nd <= 45 ? Math.ceil(nd / 8) * 86400 : Math.ceil(nd / 56) * 7 * 86400;
   // align to ET boundaries via the ET offset of x0
   const off = (new Date(x0 * 1000).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit" }) | 0);
   let t = x0 - ((off % (step / 3600)) * 3600) - (x0 % 3600);

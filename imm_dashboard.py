@@ -3490,10 +3490,19 @@ class Builder:
             log(f"! day archive write failed ({e!r})")
         w30 = self.windows["30d"]
         first30 = datetime.fromtimestamp(w30["start"], ET).date().isoformat()
-        base = inception_base(first30)
-        if base is None:
+        # the history's own full days before the 30-day window come from
+        # memory: their files are still rewritten build to build, and the
+        # cached sums keep only the days that no longer change
+        hist = sorted(iso for iso, d in days.items() if iso < first30 and full_day(iso, d))
+        base = inception_base(hist[0] if hist else first30)
+        sums, dtot = base if base else ({}, {})
+        for iso in hist:
+            d = days[iso]
+            r, p = _inc_add_day(sums, {"s": d["s"], "e": d["e"], "f": list(DAY_FIELDS),
+                                       "fx": list(FX_KEYS), "m": d["m"]})
+            dtot[iso] = [round(r, 4), round(p, 4), bool(d.get("ok")), _f(d["s"]), _f(d["e"])]
+        if not dtot:
             return None
-        sums, dtot = base
         # no button until the saved days reach the first cycle log (the
         # backfill has run); a day missing in between is named in the desc
         logs = sorted(d for d, _p in day_files("cycle_log", "csv", "0000-00-00"))

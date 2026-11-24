@@ -1302,6 +1302,26 @@ class DayArchiveTests(unittest.TestCase):
         self.assertNotIn("KXOLD-1", sums)
         self.assertIsNone(dash.inception_base("2026-07-01"))
 
+    def test_history_days_before_the_window_come_from_memory(self):
+        # a day the 10-minute build still rewrites must not churn the cached
+        # sums: it is added from the build's own rows, not its file
+        from datetime import date
+        _archive_day(self.root, "2026-07-12", {"KXA-1": _day_row(rew=1.0)})
+        s0, e0 = dash.et_midnight(date(2026, 8, 29)), dash.et_midnight(date(2026, 8, 30))
+        days = {"2026-08-29": {"s": s0, "e": e0, "ok": True, "m": {"KXA-1": _day_row(rew=5.0, pnl=2.0)}}}
+        b = dash.Builder(_ts("2026-09-28T20:00:00Z"), api=False, api_force=False)
+        b.now = _ts("2026-09-28T20:00:00Z")
+        with mock.patch.object(dash, "day_files", return_value=[("2026-07-11", "x")]):
+            meta, mk, dtot = b.inception_window(days, {})
+        self.assertEqual(sorted(dtot), ["2026-07-12", "2026-08-29"])
+        self.assertAlmostEqual(mk["KXA-1"]["rew"], 6.0)
+        self.assertAlmostEqual(mk["KXA-1"]["pnl"], 2.0)
+        with open(os.path.join(dash.CACHE_DIR, dash.INC_CACHE), "rb") as fh:
+            import pickle
+            self.assertEqual([k[0] for k in pickle.load(fh)["k"]], ["2026-07-12"])
+        self.assertIn("2026-08-29.json", os.listdir(self.root))     # still saved
+        self.assertIn("47 days not saved", meta["desc"])           # Jul 13 - Aug 28
+
     def test_backfill_plan(self):
         from datetime import date
         cyc = [f"2026-07-{d:02d}" for d in range(11, 25)] + ["2026-07-27", "2026-07-28"]
