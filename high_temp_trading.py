@@ -2269,9 +2269,19 @@ _band_tilt_lo = (BAND_TILT_LO_CENTS_EVENING if RUN_SLOT == "evening"
 # the test (arm "off", their slot base). Read it out in $ per market-day
 # against control, with filled per ordered contract and c/ct, after about
 # 3 weeks. SIZE_EXP_ENABLED=false ends it.
+#
+# ENDED AT 25 (Jack 2026-11-23: "Yes, end at 25"). Readout on 11/02-11/21
+# fills, each valued at the market's NO mid at 10:15 CT (the settlement
+# outcome is too noisy; that mid matched settlement within ~1c here):
+# control (25) +$132 on 5,668 contracts (+2.3c/ct), treatment (40) +$10
+# on 8,655 (+0.1c/ct), 107 vs 103 markets. The extra contracts added no
+# expected profit, only swings. (Valued at settlement it read the other
+# way, 40 +$261 vs 25 -$394, which was noise.) Every morning market now
+# rungs at the slot base, arm "off". Repo variable KXHIGH_SIZE_EXP_ENABLED
+# =true restarts the same sticky split without a deploy.
 # =====================================================================
 SIZE_EXP_NAME = "morning_25_vs_40"
-SIZE_EXP_ENABLED = os.environ.get("SIZE_EXP_ENABLED", "true").lower() == "true"
+SIZE_EXP_ENABLED = os.environ.get("SIZE_EXP_ENABLED", "false").strip().lower() == "true"
 SIZE_EXP_SLOTS = ("morning",)
 SIZE_EXP_TREATMENT_CONTRACTS = int(os.environ.get("SIZE_EXP_TREATMENT_CONTRACTS", "40"))
 SIZE_EXP_PROPORTION = float(os.environ.get("SIZE_EXP_PROPORTION", "0.5"))
