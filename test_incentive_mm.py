@@ -2770,6 +2770,19 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
             self.assertEqual(imm.applied_mention_mult("KXGTEMP"), 3.0)
         self.assertIn("GTEMP_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
 
+    def test_controls_rests_at_three_times_the_election_family_size(self):
+        # Jack 2026-11-24: "Yes, x3" for CONTROLS-2028 under the $1 bar --
+        # size_mult 6 in place of the family x2, on the election guard set;
+        # CONTROLH keeps the family's clone
+        fam = imm.SERIES_OVERRIDES[imm.ELECTION_ARCHETYPE]
+        ov = imm.SERIES_OVERRIDES["CONTROLS"]
+        self.assertEqual(ov, imm.replace(fam, size_mult=6.0))
+        self.assertEqual(ov.size_mult, 3 * imm.ELECTION_SIZE_MULT)
+        with mock.patch.object(imm, "size_test_mult", return_value=1.0):
+            self.assertEqual(imm.applied_mention_mult("CONTROLS"), 6.0)
+        self.assertNotIn("CONTROLH", imm.SERIES_OVERRIDES)
+        self.assertIn("CONTROLS_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
+
     def test_mlbplayoffs_26_event_blocked(self):
         # Jack 2026-09-26: "blocklist KXMLBPLAYOFFS-26". Every market of
         # the 2026 event and the event ticker are frozen; the series (the

@@ -10502,6 +10502,28 @@ GENMOV_SIZE_MULT = _env_float("IMM_GENMOV_SIZE_MULT", 3.0)
 SERIES_OVERRIDES[GENMOV_SERIES] = replace(SERIES_OVERRIDES[ELECTION_ARCHETYPE],
                                           size_mult=GENMOV_SIZE_MULT)
 
+# CONTROLS (Jack 2026-11-24: "Yes, x3", on "Size CONTROLS-2028 up to clear the
+# $1 bar?"). "2028 Senate winner", D and R, an election-family member dated
+# to Nov 7 2028 (ELECTION_DATES). A new program lit 16:11Z 11/24, $14.54/day
+# a leg to 12/01 05:00Z, on books ~10-25k deep at each touch: the D leg
+# rested 40 bid @ 87c / 38 ask @ 89c for 41 min, earned $0.002, and the
+# estimate fell to a 0.36% share -- $0.90 projected against the $1.00 bar,
+# dark (hopeless) from 16:52Z; R projected $0.64 against $1.10. The 10/21-
+# 11/11 weeks paid $3.9-11.9 across the two legs.
+#   * x3 OF THE FAMILY SIZE = size_mult 6 IN PLACE OF the family x2, as
+#     KXPRESRUN's x6: the election guard set (1-99c band, no safe-join), so
+#     rungs 40 -> 120 by day (360 overnight), the per-market cap 300 -> 900
+#     and the per-event cap 2,000 -> 6,000; the floor projection walks the
+#     tripled ladder (D ~$2.69, R ~$1.93 if the share scales with size: a
+#     model). The size test ended 11/09, so nothing stacks on top.
+#   * CONTROLS only: CONTROLH (2028 House) stays on the family x2.
+# IMM_CONTROLS_SIZE_MULT=2 puts it back on the family size (env => task-level
+# restart).
+CONTROLS_SERIES = "CONTROLS"
+CONTROLS_SIZE_MULT = _env_float("IMM_CONTROLS_SIZE_MULT", 6.0)
+SERIES_OVERRIDES[CONTROLS_SERIES] = replace(SERIES_OVERRIDES[ELECTION_ARCHETYPE],
+                                            size_mult=CONTROLS_SIZE_MULT)
+
 # KXGOPSIXSENATE (Jack 2026-11-02: "2x it and quote it", on "Leave
 # KXGOPSIXSENATE dark?"). "Will Republicans win 5+ of AK, IA, KS, MI, OH, TX
 # Senate?", one market (AL5), listed with a $52.62/day program at 19:00Z
@@ -15348,6 +15370,7 @@ _CONFIG_CODE_KNOBS = (
     "APRPOTUS_SIZE_MULT",         # the weekly RCP approval x5 (2026-10-25)
     "TRUMPVH_SIZE_MULT",          # the weekly VoteHub approval x3 (2026-10-31)
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
+    "CONTROLS_SIZE_MULT",         # CONTROLS (2028 Senate) x6 (2026-11-24)
     "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
     "SPRLVLDATE_SIZE_MULT",       # KXSPRLVLDATE x2 (2026-11-10)
     "GTEMP_SIZE_MULT",            # KXGTEMP x3 (2026-11-24)
