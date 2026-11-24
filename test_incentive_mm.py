@@ -23884,6 +23884,11 @@ class TestVercelPreDGate(unittest.TestCase):
             os.remove(imm.VERCEL_FAIR_FILE)
         except FileNotFoundError:
             pass
+        # the fixture book (49x51 against a 40c fair) bids over the fair's
+        # edge; VERCEL BIDS UNDER THE FAIR is tested apart (TestVercelBidEdge)
+        p = mock.patch.object(imm, "VERCEL_BID_EDGE", False)
+        p.start()
+        self.addCleanup(p.stop)
 
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
@@ -24284,6 +24289,187 @@ class TestVercelTailBids(unittest.TestCase):
             bot = self._bot()
             self._write()
             with mock.patch.object(imm, "VERCEL_TAIL_BID", False):
+                bot.run_cycle()
+                meta = bot.state.selected[self.T]
+                bot._estimate_candidate_yield(meta, [])
+                both, floor_both = meta.est_frac, meta.floor_dollars_per_day
+            self.assertGreater(both, 0.0)
+            bot._estimate_candidate_yield(meta, [])
+            self.assertAlmostEqual(meta.est_frac, both / 2, places=6)
+            self.assertAlmostEqual(meta.floor_dollars_per_day, floor_both / 2, places=6)
+
+
+class TestVercelBidEdge(unittest.TestCase):
+    """VERCEL BIDS UNDER THE FAIR (Jack 2026-11-23: "Yes, build it", on "no
+    YES bid while the book's best bid is above our fair minus 3c" on the lab
+    series, with a kill switch): on a lab-series market whose external touch
+    bid sits over its Vercel fair less VERCEL_BID_EDGE_C the bid side rests
+    no rung and the ask quotes alone on the bid-only rule's terms. Fixture:
+    TestVercelPreDGate's KXOPENVREQ-05DEC68-T20 and its 49x51 book; the
+    sample about X_L 20.0 prices it at 40c, 20.2 at 60c, 19.5 at 20c, 21.0
+    at 80c."""
+
+    T = "KXOPENVREQ-05DEC68-T20"
+    EV = "KXOPENVREQ-05DEC68"
+    CLOSE = datetime(2068, 12, 6, 3, 59, tzinfo=timezone.utc)
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        try:
+            os.remove(imm.VERCEL_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, x_l=20.0):
+        entry = {"x_l": x_l, "errs": [-1.0, -0.5, 0.0, 0.5, 1.0] * 12,
+                 "last": "2068-12-03", "d": "2068-12-05", "h": 2, "n": 60,
+                 "series": "KXOPENVREQ",
+                 "fetched_at": datetime.now(timezone.utc).isoformat()}
+        with open(imm.VERCEL_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {self.EV: entry}}, f)
+        os.utime(imm.VERCEL_FAIR_FILE, (time.time(), time.time() + 2000 + self._bump))
+        TestVercelBidEdge._bump += 1
+        return imm.load_vercel_fair()
+
+    def _bot(self):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv,
+                                                 "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _sides(self, bot):
+        return {o["book_side"] for o in bot.state.sim_orders.values()
+                if o["ticker"] == self.T}
+
+    def test_armed_by_default_with_a_kill_switch(self):
+        self.assertTrue(imm.VERCEL_BID_EDGE)
+        self.assertEqual(imm.VERCEL_BID_EDGE_C, 3.0)
+        for k in ("VERCEL_BID_EDGE", "VERCEL_BID_EDGE_C"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS, k)
+
+    def test_the_lab_series(self):
+        # every lab share of the base list; not the open-weights share
+        for s in ("KXOPENVSPEND", "KXMOONVSPEND", "KXANTHVSPEND", "KXGOOGVREQ",
+                  "KXOPENVREQ", "KXDEEPVREQ", "KXANTHVREQ"):
+            self.assertTrue(imm.vercel_lab_series(s), s)
+        self.assertFalse(imm.vercel_lab_series("KXOPENSOURCESHARE"))
+        self.assertFalse(imm.vercel_lab_series("KXFOO"))
+        with mock.patch.object(imm, "VERCEL_ENABLE", False):
+            self.assertFalse(imm.vercel_lab_series("KXOPENVREQ"))
+
+    def test_the_bar(self):
+        r = lambda b, fair=60.0, t=self.T: imm.vercel_bid_edge_reason(
+            t, time.time(), b, fair)
+        self.assertEqual(r(57), "")                           # at fair - 3c: it rests
+        self.assertIn("no YES bid", r(58))
+        self.assertIn("touch bid 57.5c over the 60.0c fair less 3c (57.0c)", r(57.5))
+        self.assertEqual(r(None), "")                         # no touch bid: nothing to judge
+        self.assertEqual(r(58, t="KXOPENSOURCESHARE-68DEC06-T67.5"), "")
+        self.assertEqual(r(58, t="KXFOO-68DEC06-T20"), "")
+        with mock.patch.object(imm, "VERCEL_BID_EDGE", False):
+            self.assertEqual(r(58), "")
+        with mock.patch.object(imm, "VERCEL_BID_EDGE_C", 0.0):
+            self.assertEqual(r(58), "")                       # under the fair itself
+            self.assertTrue(r(61))
+        # no fair passed: read as FAIR LEAD reads it -- none yet, nothing
+        self.assertEqual(r(58, fair=None), "")
+        self._write()                                         # fair 40c
+        self.assertTrue(r(38, fair=None))
+        self.assertEqual(r(37, fair=None), "")
+
+    def test_the_gate_takes_the_bids_out(self):
+        now = time.time()
+        g = lambda b, a: imm.vercel_gate(self.T, now, b, a, self.CLOSE)
+        so = lambda b, a: imm.vercel_side_out("KXOPENVREQ", self.T, now, b, a,
+                                              self.CLOSE)
+        self.assertEqual(self._write(), (1, 0))               # fair 40c
+        why, inp = g(49, 51)                                  # 49 > 40 - 3
+        self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "bid_edge"))
+        self.assertIn("over the 40.0c fair", inp["why"])
+        self.assertEqual(so(49, 51), "bid")
+        self.assertEqual(g(37, 51), ("", {}))                 # at the edge: both sides
+        self.assertIsNone(so(37, 51))
+        # no YES bid: nothing to judge (an 80c offer keeps the tail rule's
+        # mid, (0 + 80) / 2, over its 35c bar)
+        self.assertEqual(g(None, 80), ("", {}))
+        with mock.patch.object(imm, "VERCEL_BID_EDGE", False):
+            self.assertEqual(g(49, 51), ("", {}))
+            self.assertIsNone(so(49, 51))
+        self._write(x_l=20.2)                                 # fair 60c
+        self.assertEqual(g(49, 51), ("", {}))
+        self.assertIsNone(so(49, 51))
+        # a tail strike's bids go out on the tail rule first
+        self._write(x_l=19.5)                                 # fair 20c
+        why, inp = g(18, 22)
+        self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "tail_bid"))
+        with mock.patch.object(imm, "VERCEL_TAIL_BID", False):
+            why, inp = g(18, 22)                              # 18 > 20 - 3
+            self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "bid_edge"))
+        # an ask breach keeps the bid alone: its touch sits far under the fair
+        self._write(x_l=21.0)                                 # fair 80c: ask 51 < 65
+        why, inp = g(49, 51)
+        self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "ask", "band"))
+        # ...and were the bids out as well, nothing would be left to rest
+        with mock.patch.object(imm, "vercel_bid_edge_reason", return_value="edge out"):
+            why, inp = g(49, 51)
+        self.assertIn("ask side", why)
+        self.assertIn("edge out", why)
+        self.assertEqual((inp["reason"], inp["edge"]), ("bid_edge", "edge out"))
+        self.assertNotIn("side_out", inp)
+
+    def test_the_loop_rests_the_ask_alone(self):
+        bot = self._bot()
+        self._write()                                         # fair 40c, book 49x51
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot), {"ask"})
+        self.assertEqual(bot._vercel_bid_only.get(self.T), "bid")
+        self.assertNotIn(self.T, bot._vercel_stood)
+        # under the payout floor the ask alone stands aside at once
+        bot.state.hopeless_since[self.T] = time.time()
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot), set())
+        self.assertIn(self.T, bot._vercel_stood)
+        bot.state.hopeless_since.pop(self.T)
+        # the fair moves up past the touch: both sides again
+        self._write(x_l=20.2)                                 # fair 60c
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot), {"bid", "ask"})
+        self.assertNotIn(self.T, bot._vercel_bid_only)
+        self.assertNotIn(self.T, bot._vercel_stood)
+        # back down: the bids out again; the kill switch: both sides
+        self._write()
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot), {"ask"})
+        with mock.patch.object(imm, "VERCEL_BID_EDGE", False):
+            bot.run_cycle()
+            self.assertEqual(self._sides(bot), {"bid", "ask"})
+            self.assertNotIn(self.T, bot._vercel_bid_only)
+
+    def test_the_estimate_counts_the_ask_alone(self):
+        with mock.patch.object(imm, "FAMILY_SIDE_LEANS", {}):
+            bot = self._bot()
+            self._write()
+            with mock.patch.object(imm, "VERCEL_BID_EDGE", False):
                 bot.run_cycle()
                 meta = bot.state.selected[self.T]
                 bot._estimate_candidate_yield(meta, [])
@@ -47768,6 +47954,7 @@ class TestVercelDiscovery(unittest.TestCase):
         for s in self.NEW + ("KXHIGHVREQ",):
             imm.VERCEL_SERIES.discard(s)
             imm.SERIES_OVERRIDES.pop(s, None)
+            imm._vercel_series_state["open"].discard(s)
         imm._vercel_series_state["mtime"] = 0.0
         try:
             os.remove(imm.VERCEL_SERIES_FILE)
@@ -47806,6 +47993,21 @@ class TestVercelDiscovery(unittest.TestCase):
         with mock.patch.object(imm, "VERCEL_DISCOVER", False):
             self.assertEqual(imm.load_vercel_series(), 0)
         self.assertFalse(imm.vercel_series("KXOSSPEND"))
+
+    def test_the_lab_series_by_spec(self):
+        # VERCEL BIDS UNDER THE FAIR keeps off the open-weights shares: a
+        # discovered lab share joins its family, an open-weights one does not
+        self._write({"KXOSSPEND": ["open", "cost"], "KXZAIVREQ": ["lab", "zai", "requests"]})
+        with mock.patch.object(imm, "log"):
+            self.assertEqual(imm.load_vercel_series(), 2)
+        self.assertTrue(imm.vercel_lab_series("KXZAIVREQ"))
+        self.assertFalse(imm.vercel_lab_series("KXOSSPEND"))
+        self.assertFalse(imm.vercel_lab_series("KXOPENSOURCESHARE"))
+        self.assertTrue(imm.vercel_lab_series("KXOPENVREQ"))
+        self.assertEqual(imm.vercel_bid_edge_reason(
+            "KXOSSPEND-16NOV26-T27P3", time.time(), 58, 40.0), "")
+        self.assertTrue(imm.vercel_bid_edge_reason(
+            "KXZAIVREQ-16NOV26-T27P3", time.time(), 58, 40.0))
 
 
 class TestCryptoOpenFamily(unittest.TestCase):

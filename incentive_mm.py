@@ -15235,6 +15235,8 @@ _CONFIG_CODE_KNOBS = (
     "VERCEL_BID_ONLY",                           # bid only on an ask breach (2026-10-30)
     # no YES bid on a tail strike (2026-11-23)
     "VERCEL_TAIL_BID", "VERCEL_TAIL_BID_MID_C", "VERCEL_TAIL_BID_SERIES",
+    # no YES bid under a touch over the fair less 3c, lab series (2026-11-23)
+    "VERCEL_BID_EDGE", "VERCEL_BID_EDGE_C",
     "VERCEL_FAIR_HOLD_MIN", "VERCEL_FAIR_REFRESH_SECS",
     "VERCEL_RUN_TTL_MIN", "VERCEL_RUN_ANCHOR",
     "VERCEL_SIZE_MULT",           # the family x2 (2026-10-09)
@@ -20668,7 +20670,9 @@ VERCEL_DISCOVER_CATEGORIES: Tuple[str, ...] = tuple(
     if c.strip())
 VERCEL_SERIES_FILE = os.environ.get(
     "IMM_VERCEL_SERIES_FILE", os.path.join(STATUS_DIR, "vercel_series.json"))
-_vercel_series_state: dict = {"mtime": 0.0}
+# "open": the series the file specs as open-weights shares (add-only, as the
+# family is): VERCEL BIDS UNDER THE FAIR keeps off them (vercel_lab_series)
+_vercel_series_state: dict = {"mtime": 0.0, "open": set()}
 
 
 def add_vercel_series(series: str) -> bool:
@@ -20702,7 +20706,12 @@ def load_vercel_series() -> int:
     except (OSError, ValueError) as e:
         log(f"[IMM] ! vercel series file unreadable: {e}")
         return 0
-    added = [s for s in sorted(data.get("series") or {}) if add_vercel_series(str(s))]
+    specs = data.get("series") or {}
+    if isinstance(specs, dict):
+        _vercel_series_state["open"].update(
+            str(s) for s, sp in specs.items()
+            if isinstance(sp, (list, tuple)) and sp and sp[0] == "open")
+    added = [s for s in sorted(specs) if add_vercel_series(str(s))]
     if added:
         log(f"[IMM] vercel family: +{len(added)} discovered -> {', '.join(added)} "
             f"(pre-D gate, fair lead, x{VERCEL_SIZE_MULT:g})")
@@ -20711,6 +20720,14 @@ def load_vercel_series() -> int:
 
 def vercel_series(series: str) -> bool:
     return VERCEL_ENABLE and series in VERCEL_SERIES
+
+
+def vercel_lab_series(series: str) -> bool:
+    """A Vercel series priced off one lab's share of the lab export -- not an
+    open-weights share (KXOPENSOURCESHARE, or a discovered series the series
+    file specs "open": KXOSSPEND): VERCEL BIDS UNDER THE FAIR's family."""
+    return vercel_series(series) and series != _VERCEL_OPEN_SERIES \
+        and series not in _vercel_series_state["open"]
 
 
 # CRYPTO OPEN FAMILY (Jack 2026-11-13: "for KXBTCHITBY / KXSOLABOVEBY, and
@@ -21705,27 +21722,91 @@ def vercel_tail_bid_reason(ticker: str, ext_bid: Optional[float],
             f"{VERCEL_TAIL_BID_MID_C:g}c: no YES bid on a tail strike")
 
 
+# VERCEL BIDS UNDER THE FAIR (Jack 2026-11-23: "Yes, build it", on "no YES bid
+# while the book's best bid is above our fair minus 3c" on the lab series,
+# with a kill switch). The 11/23 dig after VERCEL TAIL BIDS OFF: the family's
+# YES bids lost at mid prices too (35-65c mids: 60 adding bids, -$396), not
+# to a quick pick-off (still +1 to +4c a contract 5 min to 6 h after the
+# fill; about two-thirds of the loss landed with the day's value) and not on
+# the fair leads (+$44 ahead of the touch), but where a bid had joined a
+# touch at or over the model -- VERCEL_FAIR_TOL_CENTS lets a bid rest up to
+# fair + 15c. Today's fair replayed at each lab-series adding bid since 10/01
+# (settled, pre-D): priced 5c+ under it +$28 on 68 fills, within 5c -$366 on
+# 19, 5c+ over -$372 on 20; 36 of the 37 priced over fair - 3c joined or sat
+# behind a touch itself over it (-$736). -$286 of the -$396 came within
+# 30 min after the running share FELL: the book had not repriced and sellers
+# hit the bids still resting. The asks were fine (+$625 at mid prices). Now,
+# on a lab series (vercel_lab_series: one lab's share; not the open-weights
+# shares, whose chart-based fair the logger cannot replay) while the EXTERNAL
+# touch bid sits over the market's Vercel fair less VERCEL_BID_EDGE_C, the
+# bid side rests no rung -- its at-reference rung, a fair lead and a FAIR
+# CLOSE buy-back alike (8 buy-backs at or behind such a touch lost $373
+# against holding the short) -- and the ask quotes alone on the bid-only
+# rule's terms: the selection probe counts it alone (vercel_side_out), it
+# rests only above the payout floor and only while the scored walk reaches
+# it; an ask breach as well leaves nothing to rest: stand aside. No touch
+# bid, nothing to judge. Replayed on the 54 days to 11/23 (pre-D
+# market-hours; the cost is the bid's half of each hour's modelled reward,
+# an upper bound): $743 of losing bid fills skipped for $348 of reward,
+# +$395 (+$276 beyond VERCEL TAIL BIDS OFF); a 0 / 5 / 8c margin +$302 /
+# +$330 / +$244. Each series had only 2-9 skipped fills (KXANTHVREQ -$22 and
+# KXMOONVSPEND -$29 the two below zero), so it covers the whole lab family.
+# The live fair lags the export by up to VERCEL_FAIR_REFRESH_SECS: the fills
+# under 5 min after a move (-$170) are only partly caught.
+# IMM_VERCEL_BID_EDGE=0 turns it off (env => task-level restart);
+# IMM_VERCEL_BID_EDGE_C tunes the margin.
+VERCEL_BID_EDGE = os.environ.get("IMM_VERCEL_BID_EDGE", "1") == "1"
+VERCEL_BID_EDGE_C = _env_float("IMM_VERCEL_BID_EDGE_C", 3.0)
+
+
+def vercel_bid_edge_reason(ticker: str, now_ts: float, ext_bid: Optional[float],
+                           fair_c: Optional[float] = None) -> str:
+    """Why `ticker`'s bid side rests no rung (VERCEL BIDS UNDER THE FAIR),
+    else '': a lab-series market whose external touch bid sits over its
+    Vercel fair (`fair_c`, else read as FAIR LEAD reads it) less
+    VERCEL_BID_EDGE_C. No touch bid or no fair: ''."""
+    if not VERCEL_BID_EDGE or ext_bid is None \
+            or not vercel_lab_series(series_of(ticker)):
+        return ""
+    if fair_c is None:
+        fair_c = vercel_fair_c(ticker, now_ts)
+        if fair_c is None:
+            return ""
+    bar = fair_c - VERCEL_BID_EDGE_C
+    if float(ext_bid) <= bar + 1e-9:
+        return ""
+    return (f"touch bid {float(ext_bid):g}c over the {fair_c:.1f}c fair less "
+            f"{VERCEL_BID_EDGE_C:g}c ({bar:.1f}c): no YES bid over the fair's edge")
+
+
 def vercel_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                 ext_ask: Optional[float], close_time: Optional[datetime] = None
                 ) -> Tuple[str, dict]:
     """vercel_gate_reason with an ask breach turned into bid only
-    (VERCEL_BID_ONLY) and a tail strike's bids out (VERCEL TAIL BIDS OFF):
+    (VERCEL_BID_ONLY) and the bids out on a tail strike (VERCEL TAIL BIDS
+    OFF) or under a touch over the fair's edge (VERCEL BIDS UNDER THE FAIR):
     ('', {}) to quote both sides; ('', inputs) when inputs' `side_out`
     ("ask" or "bid") rests no rung; else (why, guard-skip inputs): stand
-    aside -- an ask breach on a tail strike too (reason "tail_bid")."""
+    aside -- an ask breach with the bids out too (reason "tail_bid" /
+    "bid_edge")."""
     why, inp = vercel_gate_reason(ticker, now_ts, ext_bid, ext_ask, close_time)
     if (why and VERCEL_BID_ONLY and inp.get("reason") == "band"
             and inp.get("ask_bad") and not inp.get("bid_bad")):
         why, inp = "", dict(inp, why=why, side_out="ask")
     if not why:
-        tail = vercel_tail_bid_reason(ticker, ext_bid, ext_ask)
-        if tail and inp.get("side_out") == "ask":
-            # the asks out on the fair and the bids on the tail: nothing left
-            out = dict(inp, reason="tail_bid", tail=tail)
+        off, rsn = vercel_tail_bid_reason(ticker, ext_bid, ext_ask), "tail_bid"
+        if not off:
+            off, rsn = vercel_bid_edge_reason(ticker, now_ts, ext_bid,
+                                              inp.get("fair")), "bid_edge"
+        if off and inp.get("side_out") == "ask":
+            # the asks out on the fair and the bids on the tail / the
+            # fair's edge: nothing left
+            out = dict(inp, reason=rsn)
+            out["tail" if rsn == "tail_bid" else "edge"] = off
             out.pop("side_out", None)
-            return f"{inp['why']}; and {tail}", out
-        if tail:
-            return "", dict(inp, why=tail, side_out="bid", reason="tail_bid")
+            return f"{inp['why']}; and {off}", out
+        if off:
+            return "", dict(inp, why=off, side_out="bid", reason=rsn)
     return why, inp
 
 
@@ -21733,8 +21814,8 @@ def vercel_side_out(series: str, ticker: str, now_ts: float,
                     ext_bid: Optional[float], ext_ask: Optional[float],
                     close_time: Optional[datetime] = None) -> Optional[str]:
     """The side a Vercel market quotes without right now (vercel_gate's
-    side_out), else None: the selection probe's view of the bid-only rule
-    and of the tail-bid rule."""
+    side_out), else None: the selection probe's view of the bid-only rule,
+    the tail-bid rule and the fair's-edge rule."""
     if not vercel_series(series):
         return None
     return vercel_gate(ticker, now_ts, ext_bid, ext_ask, close_time)[1].get("side_out")
@@ -41757,7 +41838,8 @@ class IncentiveMarketMaker:
             _rso = (rain_monthly_side_out(meta.series, meta.ticker,
                                           _now.timestamp(), eb, ea)
                     # ...and the Vercel bid only on an ask breach (VERCEL_BID_ONLY),
-                    # the ask only on a tail strike (VERCEL TAIL BIDS OFF)
+                    # the ask only on a tail strike (VERCEL TAIL BIDS OFF) or
+                    # under a touch over the fair's edge (VERCEL BIDS UNDER THE FAIR)
                     or vercel_side_out(meta.series, meta.ticker, _now.timestamp(),
                                        eb, ea, meta.close_time))
             if _rso is not None:
@@ -44448,7 +44530,8 @@ class IncentiveMarketMaker:
             # fair - tol leave the bid quoting alone, while the market clears
             # the payout floor (VERCEL_BID_ONLY); a tail strike's mid under
             # VERCEL_TAIL_BID_MID_C leaves the ask alone on the same terms
-            # (VERCEL TAIL BIDS OFF).
+            # (VERCEL TAIL BIDS OFF), and so does a lab-series touch bid over
+            # the fair less VERCEL_BID_EDGE_C (VERCEL BIDS UNDER THE FAIR).
             vc_side_out: Optional[str] = None
             if vercel_series(meta.series):
                 vc_why, vc_in = vercel_gate(t, now_ts, ext_bid, ext_ask,
@@ -45449,7 +45532,8 @@ class IncentiveMarketMaker:
             if rain_side_out is not None:
                 mq = [q for q in mq if q.book_side != rain_side_out]
             # Vercel one side (VERCEL_BID_ONLY: the asks; VERCEL TAIL BIDS
-            # OFF: the bids -- the at-ref rung, a lead and a close alike): the same
+            # OFF and VERCEL BIDS UNDER THE FAIR: the bids -- the at-ref rung,
+            # a lead and a close alike): the same
             if vc_side_out is not None:
                 mq = [q for q in mq if q.book_side != vc_side_out]
 
@@ -45677,8 +45761,9 @@ class IncentiveMarketMaker:
                             f"the scored walk after the caps {rain_caps} "
                             f"(book {ext_bid}x{ext_ask}) -- not resting them")
                     self._rain_period_unearning[t] = _r_dropped
-            # Vercel one side (VERCEL_BID_ONLY / VERCEL TAIL BIDS OFF): the
-            # side left rests only while the scored walk still reaches it
+            # Vercel one side (VERCEL_BID_ONLY / VERCEL TAIL BIDS OFF / VERCEL
+            # BIDS UNDER THE FAIR): the side left rests only while the scored
+            # walk still reaches it
             if vc_side_out is not None:
                 _v_before = {q.book_side for q in mq if not q.is_pad}
                 if meta.price_step < 0.01:
@@ -49607,6 +49692,10 @@ class IncentiveMarketMaker:
                    if VERCEL_TAIL_BID and VERCEL_TAIL_BID_MID_C > 0
                    and VERCEL_TAIL_BID_SERIES
                    else "; tail bids allowed (IMM_VERCEL_TAIL_BID=0)")
+                + (f"; no YES bid on the lab series while the touch bid is over "
+                   f"the fair less {VERCEL_BID_EDGE_C:g}c, the ask alone above the "
+                   f"payout floor" if VERCEL_BID_EDGE
+                   else "; bids over the fair's edge allowed (IMM_VERCEL_BID_EDGE=0)")
                 + f"), decided outside "
                 f"{VERCEL_FAIR_MIN_P * 100:g}-{100 - VERCEL_FAIR_MIN_P * 100:g}c, "
                 f"ttl {VERCEL_FAIR_TTL_MIN}m, hold {VERCEL_FAIR_HOLD_MIN:g}m, "
