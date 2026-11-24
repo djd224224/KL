@@ -641,7 +641,8 @@ class TestRunCycle(unittest.TestCase):
         """BTC's weekly quotes nothing since 2026-11-01 (Jack "take off btc
         weekly"): zero rungs, so no book reads for the event, no new orders,
         and whatever still rests there is cancelled on the next cycle. The
-        six alts keep their 3x1 weekly ladder."""
+        alts keep their weekly ladder (ETH 3x1; SOL/XRP/HYPE/BNB/DOGE 3x2 since
+        2026-11-24)."""
         self.assertEqual(ud.NUM_LEVELS_BY_ASSET_CADENCE[("BTC", "weekly")], 0)
         c = FakeClient(markets=weekly_event())
         b = bot(c, cadences=("weekly",))                 # fixture: BTC weekly on
@@ -659,6 +660,45 @@ class TestRunCycle(unittest.TestCase):
         with priced():
             eth.run_cycle()
         self.assertTrue(eth.state.sim_orders)
+
+    def test_small_coins_weekly_rest_two_lot_rungs(self):
+        """Weekly 2x on SOL/XRP/HYPE/BNB/DOGE (Jack 2026-11-23: "do 1"): their
+        weekly ladder is 3 rungs x 2 contracts a side, and the place backstops
+        let the 2-lot rungs through. ETH weekly stays 3x1, BTC weekly stays
+        off, and a 2x coin's daily tenor keeps its 1-lot rung."""
+        self.assertEqual(ud.CONTRACTS_PER_LEVEL_BY_ASSET_CADENCE,
+                         {(a, "weekly"): 2 for a in ("SOL", "XRP", "HYPE", "BNB", "DOGE")})
+
+        def shape(asset, cadences=("daily", "weekly")):
+            b = ud.UpDownMarketMaker(ud.ASSETS[asset],
+                                     FakeClient(markets=daily_event() + weekly_event()),
+                                     live=False, cadences=cadences)
+            with priced():
+                b.run_cycle()
+            sizes, rungs = {}, {}
+            for o in b.state.sim_orders.values():
+                cad = "daily" if o["ticker"].startswith(EV_D) else "weekly"
+                sizes.setdefault(cad, set()).add(o["remaining_count"])
+                key = (cad, o["ticker"], o["book_side"])
+                rungs[key] = rungs.get(key, 0) + 1
+            return b, sizes, rungs
+
+        for asset in ("SOL", "XRP", "HYPE", "BNB", "DOGE"):
+            b, sizes, rungs = shape(asset)
+            self.assertEqual(sizes["weekly"], {2}, asset)
+            self.assertEqual(sizes["daily"], {1}, asset)
+            self.assertEqual(max(n for (c, _t, _s), n in rungs.items() if c == "weekly"), 3, asset)
+            self.assertEqual(b.contracts_per_level, 2, asset)        # backstop: 2 a level, 6 a side
+            self.assertEqual(b.base_contracts_per_level, 1, asset)
+            self.assertEqual(b.state.rejected_today, 0, asset)
+        b, sizes, _ = shape("ETH")
+        self.assertEqual(sizes["weekly"], {1})
+        self.assertEqual(b.contracts_per_level, 1)
+        # a 2x coin running daily only keeps the 1-lot backstop
+        b, sizes, _ = shape("SOL", cadences=("daily",))
+        self.assertEqual(b.contracts_per_level, 1)
+        # BTC weekly stays off
+        self.assertEqual(ud.NUM_LEVELS_BY_ASSET_CADENCE[("BTC", "weekly")], 0)
 
     def test_daily_offset_is_five_cents_minimum_edge(self):
         """Same args run_cycle passes for a daily event: 1 rung x 1 @5c.
