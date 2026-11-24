@@ -24294,6 +24294,36 @@ class TestVercelTailBids(unittest.TestCase):
         self.assertEqual(self._sides(bot), {"bid", "ask"})
         self.assertNotIn(self.T, bot._vercel_bid_only)
 
+    def test_an_asks_only_series(self):
+        # VERCEL ASKS ONLY (2026-11-24, Jack: "do 1 - 3"): empty by default;
+        # a named series rests no YES bid at any mid, the ask alone on the
+        # bid-only rule's terms
+        self.assertEqual(imm.VERCEL_ASKS_ONLY_SERIES, ())
+        self.assertIn("VERCEL_ASKS_ONLY_SERIES", imm._CONFIG_CODE_KNOBS)
+        now = time.time()
+        g = lambda b, a: imm.vercel_gate(self.T, now, b, a, self.CLOSE)
+        bot = self._bot(self.MID40)
+        self._write(x_l=67.3)                                 # fair 40c, book 38x42
+        self.assertEqual(g(38, 42), ("", {}))                 # both sides
+        with mock.patch.object(imm, "VERCEL_ASKS_ONLY_SERIES", ("KXOPENSOURCESHARE",)):
+            why, inp = g(38, 42)
+            self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "asks_only"))
+            self.assertIn("asks only", inp["why"])
+            self.assertEqual(imm.vercel_side_out("KXOPENSOURCESHARE", self.T, now, 38, 42,
+                                                 self.CLOSE), "bid")
+            self.assertEqual(g(38, 42), imm.vercel_gate(self.T, now, 38, 42, self.CLOSE))
+            bot.run_cycle()
+            self.assertEqual(self._sides(bot), {"ask"})
+            self.assertEqual(bot._vercel_bid_only.get(self.T), "bid")
+            # an ask breach as well (22 < 40 - 15): nothing left to rest
+            why, inp = g(10, 22)
+            self.assertTrue(why)
+            self.assertEqual(inp["reason"], "asks_only")
+            self.assertTrue(inp["asks_only"].startswith("KXOPENSOURCESHARE quotes asks only"))
+            self.assertNotIn("side_out", inp)
+        bot.run_cycle()                                       # off again: both sides
+        self.assertEqual(self._sides(bot), {"bid", "ask"})
+
     def test_the_estimate_counts_the_ask_alone(self):
         with mock.patch.object(imm, "FAMILY_SIDE_LEANS", {}):
             bot = self._bot()

@@ -15248,6 +15248,7 @@ _CONFIG_CODE_KNOBS = (
     "VERCEL_TAIL_BID", "VERCEL_TAIL_BID_MID_C", "VERCEL_TAIL_BID_SERIES",
     # no YES bid under a touch over the fair less 3c, lab series (2026-11-23)
     "VERCEL_BID_EDGE", "VERCEL_BID_EDGE_C",
+    "VERCEL_ASKS_ONLY_SERIES",    # series quoting asks only (2026-11-24)
     "VERCEL_FAIR_HOLD_MIN", "VERCEL_FAIR_REFRESH_SECS",
     "VERCEL_RUN_TTL_MIN", "VERCEL_RUN_ANCHOR",
     "VERCEL_SIZE_MULT",           # the family x2 (2026-10-09)
@@ -20617,8 +20618,18 @@ VERCEL_FAIR_MIN_P = _env_float("IMM_VERCEL_FAIR_MIN_P", 0.05)
 VERCEL_FAIR_TTL_MIN = _env_int("IMM_VERCEL_FAIR_TTL_MIN", 90)
 VERCEL_FAIR_HOLD_MIN = _env_float("IMM_VERCEL_FAIR_HOLD_MIN", 10)
 # 300 s since the running anchor (2026-10-01): the export's running share
-# moves every ~18 min (median), so a read is stale after VERCEL_RUN_TTL_MIN
-VERCEL_FAIR_REFRESH_SECS = _env_int("IMM_VERCEL_FAIR_REFRESH_SECS", 300)
+# moves every ~18 min (median), so a read is stale after VERCEL_RUN_TTL_MIN.
+# 60 s since 2026-11-24 (Jack: "do 1 - 3", on "make the fair update every
+# minute instead of every 5"): of the $736 of lab-series bids VERCEL BIDS
+# UNDER THE FAIR skips in its replay (the fair at the fill minute), $378 had
+# filled within 5 min after the running share moved -- inside the old read's
+# lag, so the live rule judged them on the fair before the move. With a
+# fresh fair the bids it still lets through after a fall made +$26, so no
+# separate post-move hold. vercel_fair busts the export's cache once a
+# minute (one per 5 before) and re-reads the weight-class chart at most
+# every 300 s (CHART_REFRESH_SECS): one more export read a minute, the chart
+# as before. The refresher's floor came down from 120 s to 60 s with it.
+VERCEL_FAIR_REFRESH_SECS = _env_int("IMM_VERCEL_FAIR_REFRESH_SECS", 60)
 VERCEL_RUN_TTL_MIN = _env_int("IMM_VERCEL_RUN_TTL_MIN", 20)
 # read by vercel_fair itself; mirrored here for the startup line + config hash
 VERCEL_RUN_ANCHOR = os.environ.get("IMM_VERCEL_RUN_ANCHOR", "1") == "1"
@@ -21769,6 +21780,32 @@ def vercel_tail_bid_reason(ticker: str, ext_bid: Optional[float],
 # IMM_VERCEL_BID_EDGE_C tunes the margin.
 VERCEL_BID_EDGE = os.environ.get("IMM_VERCEL_BID_EDGE", "1") == "1"
 VERCEL_BID_EDGE_C = _env_float("IMM_VERCEL_BID_EDGE_C", 3.0)
+# VERCEL ASKS ONLY (2026-11-24, Jack: "do 1 - 3", on "give KXOPENSOURCESHARE
+# one week under the cheap-strike rule, then decide: if it's still negative
+# next week with the rule on, go asks-only on it"). A VERCEL_ASKS_ONLY_SERIES
+# market rests no YES bid at all -- its at-reference rung, a fair lead and a
+# FAIR CLOSE buy-back alike -- and its ask quotes alone on the bid-only
+# rule's terms (the selection probe counts it alone, above the payout floor,
+# while the scored walk reaches it); an ask breach as well: stand aside. A
+# short it holds rides to settlement. EMPTY by default: the 12/01 review
+# names KXOPENSOURCESHARE here if its first full week under VERCEL TAIL BIDS
+# OFF (11/24-11/30) nets under zero, rewards + trading. Why the asks: since
+# 10/01 its YES bids lost at every mid (-$260 under 35c, -$162 above; buy-
+# backs -$61) while its asks made +$46 (+$275 at 35-65c mids). Last 7 days
+# to 11/23 it netted -$291 ($154 rewards, -$446 trading), the rest of the
+# family +$271. IMM_VERCEL_ASKS_ONLY_SERIES names the series (env =>
+# task-level restart).
+VERCEL_ASKS_ONLY_SERIES: Tuple[str, ...] = tuple(sorted(
+    s.strip() for s in os.environ.get("IMM_VERCEL_ASKS_ONLY_SERIES", "").split(",")
+    if s.strip()))
+
+
+def vercel_asks_only_reason(ticker: str) -> str:
+    """Why `ticker`'s bid side rests no rung (VERCEL ASKS ONLY), else ''."""
+    s = series_of(ticker)
+    if s not in VERCEL_ASKS_ONLY_SERIES:
+        return ""
+    return f"{s} quotes asks only (VERCEL_ASKS_ONLY_SERIES): no YES bid"
 
 
 def vercel_bid_edge_reason(ticker: str, now_ts: float, ext_bid: Optional[float],
@@ -21795,26 +21832,28 @@ def vercel_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                 ext_ask: Optional[float], close_time: Optional[datetime] = None
                 ) -> Tuple[str, dict]:
     """vercel_gate_reason with an ask breach turned into bid only
-    (VERCEL_BID_ONLY) and the bids out on a tail strike (VERCEL TAIL BIDS
-    OFF) or under a touch over the fair's edge (VERCEL BIDS UNDER THE FAIR):
-    ('', {}) to quote both sides; ('', inputs) when inputs' `side_out`
-    ("ask" or "bid") rests no rung; else (why, guard-skip inputs): stand
-    aside -- an ask breach with the bids out too (reason "tail_bid" /
-    "bid_edge")."""
+    (VERCEL_BID_ONLY) and the bids out on an asks-only series (VERCEL ASKS
+    ONLY), a tail strike (VERCEL TAIL BIDS OFF) or under a touch over the
+    fair's edge (VERCEL BIDS UNDER THE FAIR): ('', {}) to quote both sides;
+    ('', inputs) when inputs' `side_out` ("ask" or "bid") rests no rung;
+    else (why, guard-skip inputs): stand aside -- an ask breach with the
+    bids out too (reason "asks_only" / "tail_bid" / "bid_edge")."""
     why, inp = vercel_gate_reason(ticker, now_ts, ext_bid, ext_ask, close_time)
     if (why and VERCEL_BID_ONLY and inp.get("reason") == "band"
             and inp.get("ask_bad") and not inp.get("bid_bad")):
         why, inp = "", dict(inp, why=why, side_out="ask")
     if not why:
-        off, rsn = vercel_tail_bid_reason(ticker, ext_bid, ext_ask), "tail_bid"
+        off, rsn = vercel_asks_only_reason(ticker), "asks_only"
+        if not off:
+            off, rsn = vercel_tail_bid_reason(ticker, ext_bid, ext_ask), "tail_bid"
         if not off:
             off, rsn = vercel_bid_edge_reason(ticker, now_ts, ext_bid,
                                               inp.get("fair")), "bid_edge"
         if off and inp.get("side_out") == "ask":
-            # the asks out on the fair and the bids on the tail / the
-            # fair's edge: nothing left
+            # the asks out on the fair and the bids on the series, the tail
+            # or the fair's edge: nothing left
             out = dict(inp, reason=rsn)
-            out["tail" if rsn == "tail_bid" else "edge"] = off
+            out[{"tail_bid": "tail", "bid_edge": "edge"}.get(rsn, rsn)] = off
             out.pop("side_out", None)
             return f"{inp['why']}; and {off}", out
         if off:
@@ -21827,7 +21866,7 @@ def vercel_side_out(series: str, ticker: str, now_ts: float,
                     close_time: Optional[datetime] = None) -> Optional[str]:
     """The side a Vercel market quotes without right now (vercel_gate's
     side_out), else None: the selection probe's view of the bid-only rule,
-    the tail-bid rule and the fair's-edge rule."""
+    the asks-only series, the tail-bid rule and the fair's-edge rule."""
     if not vercel_series(series):
         return None
     return vercel_gate(ticker, now_ts, ext_bid, ext_ask, close_time)[1].get("side_out")
@@ -45543,9 +45582,9 @@ class IncentiveMarketMaker:
             # member pads it for depth like any rungless side
             if rain_side_out is not None:
                 mq = [q for q in mq if q.book_side != rain_side_out]
-            # Vercel one side (VERCEL_BID_ONLY: the asks; VERCEL TAIL BIDS
-            # OFF and VERCEL BIDS UNDER THE FAIR: the bids -- the at-ref rung,
-            # a lead and a close alike): the same
+            # Vercel one side (VERCEL_BID_ONLY: the asks; VERCEL ASKS ONLY,
+            # VERCEL TAIL BIDS OFF and VERCEL BIDS UNDER THE FAIR: the bids --
+            # the at-ref rung, a lead and a close alike): the same
             if vc_side_out is not None:
                 mq = [q for q in mq if q.book_side != vc_side_out]
 
@@ -48930,7 +48969,7 @@ class IncentiveMarketMaker:
                             + ", ".join(f"{s} {'/'.join(map(str, specs[s][1:]))}"
                                         for s in new))
                 while True:
-                    delay = max(120, VERCEL_FAIR_REFRESH_SECS)
+                    delay = max(60, VERCEL_FAIR_REFRESH_SECS)
                     try:
                         _discover()
                         ok, miss, mode = vercel_fair.write_fair_file(
@@ -49708,6 +49747,8 @@ class IncentiveMarketMaker:
                    f"the fair less {VERCEL_BID_EDGE_C:g}c, the ask alone above the "
                    f"payout floor" if VERCEL_BID_EDGE
                    else "; bids over the fair's edge allowed (IMM_VERCEL_BID_EDGE=0)")
+                + (f"; asks only on {','.join(VERCEL_ASKS_ONLY_SERIES)}"
+                   if VERCEL_ASKS_ONLY_SERIES else "")
                 + f"), decided outside "
                 f"{VERCEL_FAIR_MIN_P * 100:g}-{100 - VERCEL_FAIR_MIN_P * 100:g}c, "
                 f"ttl {VERCEL_FAIR_TTL_MIN}m, hold {VERCEL_FAIR_HOLD_MIN:g}m, "

@@ -122,6 +122,24 @@ class TestFairModel(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 vf.fetch_labs(now)
 
+    def test_the_cache_key_turns_over_each_minute(self):
+        # 2026-11-24 (Jack: "do 1 - 3"): the IMM reads every 60 s, so the
+        # `to` cache key is per minute -- per 5 minutes before, and a faster
+        # read inside the same slot got the cached copy
+        r = mock.Mock()
+        r.json.return_value = {"rows": [
+            {"date": "2026-09-26", "name": "openai", "metric": "requests", "share_percent": 18.9}]}
+        r.raise_for_status.return_value = None
+        tos = []
+        for hh, mm, ss in ((18, 7, 5), (18, 7, 55), (18, 8, 0), (18, 9, 0)):
+            with mock.patch.object(vf.requests, "get", return_value=r) as g:
+                vf.fetch_labs(datetime(2026, 9, 27, hh, mm, ss, tzinfo=timezone.utc),
+                              days_back=1)
+            tos.append(g.call_args.kwargs["params"]["to"])
+        self.assertEqual(tos[0], tos[1])                     # the same minute
+        self.assertEqual(len(set(tos)), 3)
+        self.assertTrue(all(t > "2026-09-27" for t in tos))
+
 
 NOW = datetime(2026, 9, 27, 18, 0, tzinfo=timezone.utc)     # tau = 1080 min
 
@@ -545,6 +563,42 @@ class TestFetchTable(unittest.TestCase):
         self.assertNotIn("2026-09-27", t2[("zai", "tokens")])
         self.assertEqual(t1[vf.CHART_KEY], {"2026-09-26": 60.0, "2026-09-27": 61.0})
         self.assertEqual(t2[vf.CHART_KEY], {"2026-09-26": 60.5, "2026-09-27": 62.0})
+
+    def test_the_chart_rereads_at_its_own_pace(self):
+        # 2026-11-24: the export fresh at every refresh, the weight-class
+        # chart at most every CHART_REFRESH_SECS, its last fresh read
+        # standing in between; 0 reads it every refresh
+        now = datetime(2026, 9, 27, 18, 0, tzinfo=timezone.utc)
+        long_tab = {("openai", "requests"): {"2026-09-26": 20.0, "2026-09-27": 25.0}}
+        short_tab = {("openai", "requests"): {"2026-09-26": 20.0, "2026-09-27": 26.0}}
+        calls, chart_calls = [], []
+
+        def fake(now_, timeout=30, days_back=None):
+            calls.append(days_back)
+            return long_tab if days_back is None else short_tab
+
+        def fake_chart(now_, timeout=30, days_back=None, metric="tokens"):
+            chart_calls.append(days_back)
+            return {"2026-09-26": 60.0, "2026-09-27": 61.0 + len(chart_calls)}
+        with mock.patch.object(vf, "fetch_labs", side_effect=fake), \
+                mock.patch.object(vf, "fetch_weight_class", side_effect=fake_chart), \
+                mock.patch.object(vf, "OPEN_SPECS", {vf.OPEN_SERIES: "tokens"}):
+            vf.fetch_table(now)                               # the history: both
+            t2 = vf.fetch_table(now)                          # fresh: both
+            t3 = vf.fetch_table(now)                          # the chart reused
+            day, at, last = vf._hist["chart_fresh"]["tokens"]
+            vf._hist["chart_fresh"]["tokens"] = (day, at - vf.CHART_REFRESH_SECS - 1, last)
+            t4 = vf.fetch_table(now)                          # due again
+            with mock.patch.object(vf, "CHART_REFRESH_SECS", 0):
+                vf.fetch_table(now)
+                vf.fetch_table(now)
+        self.assertEqual(calls, [None, 1, 1, 1, 1, 1])
+        self.assertEqual(chart_calls, [None, 1, 1, 1, 1])
+        self.assertEqual(t2[vf.CHART_KEY]["2026-09-27"], 63.0)
+        self.assertEqual(t3[vf.CHART_KEY], t2[vf.CHART_KEY])
+        self.assertEqual(t4[vf.CHART_KEY]["2026-09-27"], 64.0)
+        self.assertEqual(t3[("openai", "requests")]["2026-09-27"], 26.0)
+        self.assertEqual(vf.CHART_REFRESH_SECS, 300)
 
     def test_an_unreadable_chart_leaves_the_lab_sum(self):
         # Jack 2026-10-22 (the meta coverage gap): the chart is the default

@@ -239,6 +239,13 @@ SQRT_SERIES = _env_set("IMM_VERCEL_SQRT_SERIES", "KXMOONVSPEND")
 LOG_SERIES = _env_set("IMM_VERCEL_LOG_SERIES", "KXGOOGVREQ,KXANTHVREQ")
 LOG_FLOOR = 1e-3
 HISTORY_REFRESH_SECS = _env_float("IMM_VERCEL_HISTORY_REFRESH_SECS", 6 * 3600)
+# THE CHART AT ITS OLD PACE (2026-11-24, with the IMM's 1-minute export reads,
+# Jack: "do 1 - 3"): the lab export is read fresh every refresh so the lab
+# series' fair keeps up with the running share (VERCEL BIDS UNDER THE FAIR);
+# the weight-class chart -- two reads a refresh, no CDN cache -- is re-read
+# at most every CHART_REFRESH_SECS (the refresh's old 300 s), its last fresh
+# yesterday + today read standing in between. 0 reads it every refresh.
+CHART_REFRESH_SECS = _env_float("IMM_VERCEL_CHART_REFRESH_SECS", 300)
 # D-1 running anchor (2026-10-01); IMM_VERCEL_RUN_ANCHOR=0 restores the
 # complete-day anchor all day
 RUN_ANCHOR = os.environ.get("IMM_VERCEL_RUN_ANCHOR", "1") == "1"
@@ -312,11 +319,13 @@ def fetch_labs(now: Optional[datetime] = None, timeout: float = 30,
     (default the longer of HISTORY_DAYS and SEASON_DAYS, +10) through today,
     the RUNNING day. The plain export URL is cached 24 h, so each read uses a
     distinct documented `to` date (the API clamps it to today) for a fresh
-    copy."""
+    copy: one per MINUTE of the UTC day since 2026-11-24 (one per 5 minutes
+    before, when the IMM read every 300 s -- a faster read inside the same
+    slot got the cached copy)."""
     now = now or datetime.now(timezone.utc)
     today = now.date()
     back = max(HISTORY_DAYS, SEASON_DAYS) + 10 if days_back is None else days_back
-    slot = (now.hour * 60 + now.minute) // 5
+    slot = now.hour * 60 + now.minute
     r = requests.get(EXPORT, params={
         "dataset": "labs", "modality": "all",
         "from": (today - timedelta(days=back)).isoformat(),
@@ -365,7 +374,9 @@ def fetch_weight_class(now: Optional[datetime] = None, timeout: float = 30,
     return out
 
 
-_hist: dict = {"day": None, "at": 0.0, "tab": None, "chart": None}
+# "chart_fresh": metric -> (UTC day, epoch, its last fresh yesterday + today
+# read), reused for CHART_REFRESH_SECS; emptied by each history read
+_hist: dict = {"day": None, "at": 0.0, "tab": None, "chart": None, "chart_fresh": {}}
 
 
 def fetch_table(now: Optional[datetime] = None, timeout: float = 30
@@ -378,7 +389,7 @@ def fetch_table(now: Optional[datetime] = None, timeout: float = 30
     if _hist["tab"] is None or _hist["day"] != today \
             or time.time() - _hist["at"] > HISTORY_REFRESH_SECS:
         tab = fetch_labs(now, timeout)
-        _hist.update(tab=tab, day=today, at=time.time(), chart=None)
+        _hist.update(tab=tab, day=today, at=time.time(), chart=None, chart_fresh={})
         out = {k: dict(v) for k, v in tab.items()}
     else:
         fresh = fetch_labs(now, timeout, days_back=1)
@@ -405,9 +416,10 @@ def _chart_read(now: datetime, timeout: float, days_back: Optional[int],
 def _add_chart(out: dict, now: datetime, timeout: float) -> None:
     """The weight-class chart into `out` under chart_key(metric), for every
     metric an open-weights series reads: its full window once per history
-    read, then a fresh yesterday + today over it. A failed read leaves that
-    metric's key out, so its series fall back to the lab sum for that
-    refresh (never a chart history beside a lab-sum running day)."""
+    read, then a fresh yesterday + today over it -- re-read at most every
+    CHART_REFRESH_SECS, the last one standing in between. A failed read
+    leaves that metric's key out, so its series fall back to the lab sum for
+    that refresh (never a chart history beside a lab-sum running day)."""
     if OPEN_SOURCE != "chart":
         _chart_state["source"] = "labs"
         _chart_state["by_metric"] = {}
@@ -423,8 +435,15 @@ def _add_chart(out: dict, now: datetime, timeout: float) -> None:
                 chart = dict(_hist["chart"][metric])
             else:
                 t_iso = now.date().isoformat()
+                if not isinstance(_hist.get("chart_fresh"), dict):
+                    _hist["chart_fresh"] = {}
+                fresh = _hist["chart_fresh"].get(metric)
+                if fresh is None or fresh[0] != t_iso \
+                        or time.time() - fresh[1] >= CHART_REFRESH_SECS:
+                    fresh = (t_iso, time.time(), _chart_read(now, timeout, 1, metric))
+                    _hist["chart_fresh"][metric] = fresh
                 chart = {d: v for d, v in _hist["chart"][metric].items() if d != t_iso}
-                chart.update(_chart_read(now, timeout, 1, metric))
+                chart.update(fresh[2])
         except Exception as e:                    # noqa: BLE001 - the lab sum stands in
             by_metric[metric] = f"labs (chart unreadable: {type(e).__name__})"
             continue
