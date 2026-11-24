@@ -1486,10 +1486,11 @@ SERIES_OVERRIDES["KXRAINNYCW"] = SERIES_OVERRIDES[RAIN_PERIOD_ARCHETYPE]
 # announcement lands whenever it lands), and a made-up hour would read like
 # a real event window to every later reader of this file.
 # KXHURCAT (2026-10-08) is the same shape: one event per storm, no date.
+# So is KXGTEMP (2026-11-24): one event per year, "2027", no day.
 for _s in os.environ.get(
         "IMM_UNDATED_GUARD_SERIES",
         "KXMLBPLAYOFFS,KXMLBSEASONGAMES,KXVENUEPERFORM,KXMC,"
-        "KXHURCAT").split(","):
+        "KXHURCAT,KXGTEMP").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(safe_join=True)
 
@@ -8405,7 +8406,23 @@ register_close_cutoff_days(CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS,
 # and the toxic-halt / sweep breakers are what stand between it and a
 # pick-off.
 # ELECTION-DAY RAIN (2026-10-31): RAIN_DAY_SERIES, beside the weekend family.
-_DEFAULT_WEATHER_SERIES = ",".join(["KXRAINWKND", *sorted(RAIN_DAY_SERIES), "KXHURCAT"])
+# HOTTEST YEAR ON RECORD (Jack 2026-11-24: "KXGTEMP-2027 should be quoted, as
+# part of weather auto family", after the family watch's new-family alert of
+# 11/23 02:20Z). KXGTEMP-2027-P0, "Will 2027 be the hottest year on
+# record?": YES if NASA GISS's unsmoothed Land-Ocean Temperature Index for
+# 2027 is above the greater of the 2026 value and 1.28 C. Trading closes
+# 23:59 ET 12/31/2027; it expires at the first 10:00 AM ET after GISS's
+# annual release (or 3/31/2028). One market, Climate and Weather (the
+# dashboard's Weather & quakes, so the event long-shot cut applies: asks x0.75
+# while the YES mid is 70c+). Its program runs 11/24 02:01Z - 11/29 05:00Z;
+# the book at listing was 82 bid x700 against 87 ask x12. The ticker's "2027"
+# carries no day, so trade_cutoff_utc is None and it joins the undated guard
+# set (safe-join), as KXHURCAT did. No GISS fair: the monthly GISS update
+# (~10th-15th of each month) is what moves it, none falls inside this
+# program, and the band, safe-join and the toxic-halt / sweep breakers stand
+# between it and a pick-off. Exact series, no prefix.
+_DEFAULT_WEATHER_SERIES = ",".join(["KXRAINWKND", *sorted(RAIN_DAY_SERIES), "KXHURCAT",
+                                    "KXGTEMP"])
 # SPORTS series allowed IN CODE (Jack 2026-09-11 pm: "allowlist
 # KXMLBPLAYOFFS into IMM", then "allowlist KXMLBSEASONGAMES"). First sports
 # entries in the normal book -- the 9/6 open-scan category lift already

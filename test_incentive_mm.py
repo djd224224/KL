@@ -2746,6 +2746,20 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         self.assertIsNone(imm.trade_cutoff_utc("KXHURCAT-26ISAIAS", None, None))
         self.assertFalse(a("KXHURCATX-26ISAIAS-T3"))          # exact series only
 
+    def test_gtemp_allowed_with_safe_join_and_no_cutoff(self):
+        # Jack 2026-11-24: "KXGTEMP-2027 should be quoted, as part of weather
+        # auto family" -- one event per year, "2027" carries no day, so it
+        # rides the undated guard set like KXHURCAT
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        for t in ("KXGTEMP-2027-P0", "KXGTEMP-2028-P0"):
+            self.assertFalse(b(t), t)
+            self.assertTrue(a(t), t)
+        self.assertIn("KXGTEMP", imm.ALLOW_SERIES)
+        self.assertTrue(imm.series_override("KXGTEMP").safe_join)
+        self.assertIsNone(imm.parse_event_date("KXGTEMP-2027"))
+        self.assertIsNone(imm.trade_cutoff_utc("KXGTEMP-2027", None, None))
+        self.assertFalse(a("KXGTEMPX-2027-P0"))               # exact series only
+
     def test_mlbplayoffs_26_event_blocked(self):
         # Jack 2026-09-26: "blocklist KXMLBPLAYOFFS-26". Every market of
         # the 2026 event and the event ticker are frozen; the series (the
