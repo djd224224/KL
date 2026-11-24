@@ -70,6 +70,7 @@ USAGE:
   python imm_dashboard.py --open       # ... and open it in the browser
   python imm_dashboard.py --no-api     # local sinks only, no Kalshi reads
   python imm_dashboard.py --api-refresh  # ignore the API cache TTL
+  python imm_dashboard.py --backfill-archive  # once: save the days before the history (since inception)
 Output lines are ASCII (the IMM task consoles are cp1252).
 """
 
@@ -117,6 +118,23 @@ LAUNCHER_PATH = os.path.join(HERE, "run_incentive_mm.ps1")
 MAX_DT = 900.0            # cycle-gap cap: the reward estimator's convention
 HISTORY_DAYS = int(os.environ.get("IMM_DASH_HISTORY_DAYS", "30"))
 DETAIL_DAYS = 8           # per-market hourly detail kept this far back
+# SINCE INCEPTION (Jack 2026-11-23: "also add a since inception"; 11/24: "yes
+# do it overnight"): every full ET day's per-market rows (daily_markets) go to
+# the day archive -- rewritten while the history still holds the day, then
+# left alone -- and the "all" window is the archived days before the 30-day
+# window plus the 30-day window. The days older than the history were filled
+# once by --backfill-archive, BACKFILL_CHUNK_DAYS of logs at a time.
+DAY_ARCHIVE_DIR = os.environ.get("IMM_DASH_DAY_ARCHIVE") or None   # None: CACHE_DIR/day_archive
+DAY_FILES_LAST = None     # the backfill reads the sinks only through this UTC day
+INC_CACHE = "inception_sum.pkl"
+# the sums kept per market over the archived days ("rest_s" = resting $ x seconds)
+INC_SUM = ("rew", "pnl", "real", "du", "xfer", "fills", "cts", "usd", "mk", "mk_n", "mk_cts",
+           "rest_s", "fe", "fe_cts", "m5", "m5_cts", "m4", "m4_cts", "mt", "mt_cts")
+# a market only the archive still holds goes on the page compact, in this order
+INC_ROW = ("rew", "pnl", "real", "du", "fills", "cts", "usd", "mk", "mk_n", "mk_cts", "rest",
+           "fe", "fe_cts", "m5", "m5_cts", "m4", "m4_cts", "mt", "mt_cts", "xfer", "settled")
+BACKFILL_CHUNK_DAYS = int(os.environ.get("IMM_DASH_BACKFILL_CHUNK_DAYS", "5"))
+BACKFILL_MIN_COMMIT_GB = 4.0   # wait (then stop) while the machine has less commit left
 API_TTL_MIN = float(os.environ.get("IMM_DASH_API_TTL_MIN", "60"))
 PROGRAMS_TTL_MIN = float(os.environ.get("IMM_DASH_PROGRAMS_TTL_MIN", "30"))
 # The whole account on the Health tab (Jack 2026-10-29: "also show a small
@@ -939,6 +957,266 @@ def bot_roll_start(now: float) -> float:
 # log and the paid-vs-modeled roll-up (each tested on its own)
 # ----------------------------------------------------------------------------
 
+# ----------------------------------------------------------------------------
+# The day archive and the since-inception sums
+# ----------------------------------------------------------------------------
+
+def day_archive_dir() -> str:
+    return DAY_ARCHIVE_DIR or os.path.join(CACHE_DIR, "day_archive")
+
+
+def _iso_date(iso: str):
+    return datetime.strptime(iso, "%Y-%m-%d").date()
+
+
+def full_day(iso: str, d: dict) -> bool:
+    """A daily_markets day that ran from 00:00 ET to the next 00:00 ET (not
+    today, not a day the history only half covers)."""
+    dd = _iso_date(iso)
+    return (abs(_f(d.get("s")) - et_midnight(dd)) < 1
+            and abs(_f(d.get("e")) - et_midnight(dd + timedelta(days=1))) < 1)
+
+
+def archive_days(days: dict, only=None) -> list:
+    """Save each full ET day of `days` (daily_markets) to the day archive as
+    <iso>.json {"s", "e", "ok", "f": DAY_FIELDS, "fx": FX_KEYS, "m"}. A day is
+    rewritten when its rows changed (a later build knows more: a settlement,
+    an exit's result, a market's value now). `only`: the days the caller may
+    write (the backfill: the missing ones). Returns the days written."""
+    root = day_archive_dir()
+    out = []
+    for iso in sorted(days):
+        d = days[iso]
+        if (only is not None and iso not in only) or not full_day(iso, d):
+            continue
+        blob = json.dumps({"v": 1, "s": d["s"], "e": d["e"], "ok": bool(d.get("ok")),
+                           "f": list(DAY_FIELDS), "fx": list(FX_KEYS), "m": d["m"]},
+                          separators=(",", ":"), sort_keys=True, default=str)
+        path = os.path.join(root, iso + ".json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                if fh.read() == blob:
+                    continue
+        except OSError:
+            pass
+        os.makedirs(root, exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            fh.write(blob)
+        os.replace(path + ".tmp", path)
+        out.append(iso)
+    return out
+
+
+def archived_days() -> set:
+    try:
+        return {n[:10] for n in os.listdir(day_archive_dir())
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", n)}
+    except OSError:
+        return set()
+
+
+def _inc_add_day(sums: dict, blob: dict) -> tuple:
+    """Add one archived day's rows into `sums` {ticker: [INC_SUM..., settled]};
+    returns the day's (rewards, trading P&L)."""
+    f = blob.get("f") or list(DAY_FIELDS)
+    fxk = blob.get("fx") or list(FX_KEYS)
+    span = max(_f(blob.get("e")) - _f(blob.get("s")), 1.0)
+    ix = {k: i for i, k in enumerate(INC_SUM)}
+    n = len(INC_SUM)
+    rew = pnl = 0.0
+    for t, row in (blob.get("m") or {}).items():
+        v = dict(zip(f, row))
+        a = sums.get(t)
+        if a is None:
+            a = sums[t] = [0.0] * n + [0]
+        for k in ("rew", "pnl", "real", "du", "xfer", "fills", "cts", "usd", "mk", "mk_n", "mk_cts"):
+            a[ix[k]] += _f(v.get(k))
+        a[ix["rest_s"]] += _f(v.get("rest")) * span
+        fx = v.get("fx")
+        if isinstance(fx, list):
+            for k, x in zip(fxk, fx):
+                if k in ix:
+                    a[ix[k]] += _f(x)
+        if v.get("settled"):
+            a[n] = v["settled"]
+        rew += _f(v.get("rew"))
+        pnl += _f(v.get("pnl"))
+    return rew, pnl
+
+
+def inception_base(before_iso: str):
+    """The archived full ET days before `before_iso` (the 30-day window's
+    first day), summed: ({ticker: [INC_SUM..., settled]}, {iso: [rewards,
+    trading P&L, ok, start, end]}), or None when none is archived. Cached in
+    CACHE_DIR/inception_sum.pkl keyed by each day file's size and mtime: days
+    added after the cached ones are added on, any other change re-sums."""
+    root = day_archive_dir()
+    keys = []
+    for iso in sorted(archived_days()):
+        if iso >= before_iso:
+            continue
+        try:
+            st = os.stat(os.path.join(root, iso + ".json"))
+        except OSError:
+            continue
+        keys.append([iso, st.st_size, st.st_mtime_ns])
+    if not keys:
+        return None
+    cpath = os.path.join(CACHE_DIR, INC_CACHE)
+    cached = None
+    try:
+        with open(cpath, "rb") as fh:
+            cached = pickle.load(fh)
+    except Exception:
+        cached = None
+    ck = cached.get("k") if isinstance(cached, dict) and cached.get("v") == 1 else None
+    if ck and ck == keys[:len(ck)]:
+        sums, dtot, todo = cached["m"], cached["d"], keys[len(ck):]
+    else:
+        sums, dtot, todo = {}, {}, keys
+    done = keys[:len(keys) - len(todo)]
+    for key in todo:
+        blob = load_json(os.path.join(root, key[0] + ".json"), None)
+        if not isinstance(blob, dict) or "m" not in blob:
+            log(f"! day archive {key[0]} unreadable; left out of since inception")
+            continue
+        r, p = _inc_add_day(sums, blob)
+        dtot[key[0]] = [round(r, 4), round(p, 4), bool(blob.get("ok")), _f(blob.get("s")), _f(blob.get("e"))]
+        done.append(key)
+    if todo:
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(cpath + ".tmp", "wb") as fh:
+                pickle.dump({"v": 1, "k": done, "m": sums, "d": dtot}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(cpath + ".tmp", cpath)
+        except OSError as e:
+            log(f"! inception cache write failed ({e!r})")
+    return (sums, dtot) if dtot else None
+
+
+def _num(x, dp):
+    """A rounded number, as an int when whole (shorter on the page)."""
+    v = round(_f(x), dp)
+    return int(v) if v == int(v) else v
+
+
+def backfill_plan(cycle_days, archived, today, keep: int = None, chunk: int = None) -> list:
+    """[[iso, ...]]: runs of at most `chunk` consecutive ET days to backfill --
+    each day both UTC cycle logs it spans are on disk for (UTC day d holds
+    00:00-20:00 ET of d, d+1 the rest), not archived, and older than the
+    history the 10-minute build archives itself (the `keep` days before
+    today), so the two never write the same day."""
+    keep = HISTORY_DAYS if keep is None else keep
+    chunk = BACKFILL_CHUNK_DAYS if chunk is None else chunk
+    cyc = set(cycle_days)
+    last = today - timedelta(days=keep)
+    want = []
+    for iso in sorted(cyc):
+        d = _iso_date(iso)
+        if d >= last or iso in archived or (d + timedelta(days=1)).isoformat() not in cyc:
+            continue
+        want.append(d)
+    out, run = [], []
+    for d in want:
+        if run and ((d - run[-1]).days != 1 or len(run) >= chunk):
+            out.append([x.isoformat() for x in run])
+            run = []
+        run.append(d)
+    if run:
+        out.append([x.isoformat() for x in run])
+    return out
+
+
+def _commit_left_gb():
+    """The machine's commit left (RAM + page file) in GB, or None off Windows."""
+    try:
+        import ctypes
+
+        class _MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        m = _MS()
+        m.dwLength = ctypes.sizeof(_MS)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            return None
+        return m.ullAvailPageFile / 2 ** 30
+    except Exception:
+        return None
+
+
+def backfill_archive(chunk_days: int = None, scratch: str = None) -> int:
+    """Fill the day archive once for the days older than the history (Jack
+    2026-11-24: "yes do it overnight"): a Builder per run of `chunk_days` ET
+    days, its sinks capped at the run's last day (DAY_FILES_LAST) and its
+    caches in `scratch` (seeded with copies of the live exit results and
+    market records, so exits resolve as on the page) -- never the live
+    caches. Writes only days missing from the archive; a day already there
+    is left alone. Below-normal priority; waits for memory between runs.
+    Returns the days written, or -1 when it stopped for memory."""
+    global HISTORY_DAYS, DAY_FILES_LAST, CACHE_DIR, DAY_ARCHIVE_DIR
+    import gc
+    import shutil
+    try:                                   # below normal: the bots come first
+        import ctypes
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
+    except Exception:
+        pass
+    saved = (HISTORY_DAYS, DAY_FILES_LAST, CACHE_DIR, DAY_ARCHIVE_DIR)
+    live_archive = day_archive_dir()
+    scratch = scratch or os.path.join(DASH_DIR, "backfill_cache")
+    os.makedirs(scratch, exist_ok=True)
+    for name in ("exit_results.json", "markets_meta.json", "events_meta.json", SERIES_META_CACHE):
+        src = os.path.join(CACHE_DIR, name)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(scratch, name))
+    written = 0
+    try:
+        DAY_ARCHIVE_DIR, CACHE_DIR = live_archive, scratch
+        today = datetime.now(ET).date()
+        DAY_FILES_LAST = None
+        cyc = [d for d, _p in day_files("cycle_log", "csv", "0000-00-00")]
+        have = archived_days()
+        plan = backfill_plan(cyc, have, today, keep=saved[0], chunk=chunk_days)
+        log(f"backfill: {sum(len(c) for c in plan)} ET days in {len(plan)} runs"
+            + (f" ({plan[0][0]} to {plan[-1][-1]})" if plan else ""))
+        for run in plan:
+            for _ in range(30):            # up to 30 min for memory
+                left = _commit_left_gb()
+                if left is None or left >= BACKFILL_MIN_COMMIT_GB:
+                    break
+                log(f"backfill: {left:.1f} GB commit left, waiting")
+                time.sleep(60)
+            else:
+                log("backfill: stopped, memory stayed short; run it again to go on")
+                return -1
+            t0 = time.time()
+            d0, d1 = _iso_date(run[0]), _iso_date(run[-1])
+            HISTORY_DAYS = (d1 - d0).days + 2
+            DAY_FILES_LAST = (d1 + timedelta(days=1)).isoformat()
+            # six hours past the run's last midnight: the day-end snapshot and
+            # the fills' 4-hour mark-outs are on disk by then
+            b = Builder(et_midnight(d1 + timedelta(days=1)) + 6 * 3600, api=False, api_force=False)
+            b.load()
+            b.build_exits()
+            b.fetch_market_meta()
+            b.build_now_values()
+            days = b.daily_markets(detail=False)
+            wrote = archive_days(days, only=set(run) - have)
+            written += len(wrote)
+            log(f"backfill: {run[0]} to {run[-1]}: wrote {len(wrote)} days "
+                f"({sum(len(days[d]['m']) for d in wrote)} market-days, "
+                f"{sum(1 for d in wrote if days[d].get('ok'))} with trading P&L) in {time.time() - t0:.0f}s")
+            del b, days
+            gc.collect()
+    finally:
+        HISTORY_DAYS, DAY_FILES_LAST, CACHE_DIR, DAY_ARCHIVE_DIR = saved
+    log(f"backfill: done, {written} days written")
+    return written
+
+
 def touch_mark_cents(bid, ask, last, wide=50):
     """incentive_mm.touch_mark_cents: the YES mark of a touch (None = an EMPTY
     side) and the last trade. Two-sided: the mid, or the last trade clamped
@@ -1237,7 +1515,7 @@ def day_files(prefix: str, ext: str, first_day: str):
     out = []
     for p in glob.glob(os.path.join(STATUS_DIR, f"{prefix}_*.{ext}")):
         m = re.search(r"_(\d{4}-\d{2}-\d{2})\." + re.escape(ext) + "$", p)
-        if m and m.group(1) >= first_day:
+        if m and m.group(1) >= first_day and (DAY_FILES_LAST is None or m.group(1) <= DAY_FILES_LAST):
             out.append((m.group(1), p))
     return sorted(out)
 
@@ -3149,10 +3427,11 @@ class Builder:
             out.append((d.isoformat(), a, b))
         return out
 
-    def daily_markets(self):
+    def daily_markets(self, detail: bool = True):
         """{iso day: {"s", "e", "ok", "m": {ticker: [DAY_FIELDS...]}, "c": curve}}
         -- every history day computed exactly as a window, so a past day on
-        the page reads the same as "Yesterday" did on the day after."""
+        the page reads the same as "Yesterday" did on the day after.
+        detail=False (the backfill): the rows alone, no curve or end-of-day book."""
         days = self.day_list()
         hour_day = {}
         for iso, a, b in days:
@@ -3182,9 +3461,11 @@ class Builder:
                            (round(v["pos1"], 2) if "pos1" in v else None),
                            v.get("mk0"), v.get("mk1"), v["settled"] or 0,
                            round(v["cr"], 4), round(v["cs"], 4), fx_array(v)]
-            out[iso] = {"s": a, "e": b, "ok": bool(ok), "e0": e0, "e1": e1, "m": rows,
-                        "c": self.curve(a, b, DAY_CURVE_STEP) if ok else
-                        [[p[0], p[1], None] for p in self.curve_rewards_only(a, b, DAY_CURVE_STEP)]}
+            out[iso] = {"s": a, "e": b, "ok": bool(ok), "e0": e0, "e1": e1, "m": rows}
+            if not detail:
+                continue
+            out[iso]["c"] = (self.curve(a, b, DAY_CURVE_STEP) if ok else
+                             [[p[0], p[1], None] for p in self.curve_rewards_only(a, b, DAY_CURVE_STEP)])
             if ok:
                 # the book as the day ended: worst case per event at the end
                 # marks, and how many markets rested quotes that day
@@ -3193,6 +3474,117 @@ class Builder:
                 out[iso]["wc"] = self.worst_by_event(held)
                 out[iso]["nq"] = sum(1 for v in mk.values() if v["rest_s"] > 0)
         return out
+
+    def inception_window(self, days, mk30):
+        """Since inception (Jack 2026-11-23: "also add a since inception"):
+        saves this build's full days to the day archive, then sums the
+        archived days before the 30-day window with that window's markets
+        `mk30`. Returns (window meta, {ticker: metrics with window_markets'
+        keys}, {iso: day totals}), or None while nothing older than the
+        30-day window is archived. Trading P&L runs from the first day the
+        position log covers (9/6); before it the days carry rewards only.
+        cr / cs (the start position's share) are 0: the window starts flat."""
+        try:
+            archive_days(days)
+        except OSError as e:
+            log(f"! day archive write failed ({e!r})")
+        w30 = self.windows["30d"]
+        first30 = datetime.fromtimestamp(w30["start"], ET).date().isoformat()
+        base = inception_base(first30)
+        if base is None:
+            return None
+        sums, dtot = base
+        # no button until the saved days reach the first cycle log (the
+        # backfill has run); a day missing in between is named in the desc
+        logs = sorted(d for d, _p in day_files("cycle_log", "csv", "0000-00-00"))
+        first = min(dtot)
+        if logs and first > (_iso_date(logs[0]) + timedelta(days=1)).isoformat():
+            return None
+        missing = (_iso_date(first30) - _iso_date(first)).days - len(dtot)
+        start = min(d[3] for d in dtot.values())
+        span = max(self.now - start, 1.0)
+        ix = {k: i for i, k in enumerate(INC_SUM)}
+        n = len(INC_SUM)
+        out = {}
+        for t in set(sums) | set(mk30):
+            v = {"rew": 0.0, "pnl": 0.0, "real": 0.0, "u0": 0.0, "u1": 0.0, "xfer": 0.0,
+                 "fills": 0, "cts": 0.0, "usd": 0.0, "mk": 0.0, "mk_n": 0, "mk_cts": 0.0,
+                 "rest_s": 0.0, "settled": None, "cr": 0.0, "cs": 0.0}
+            for k in FX_KEYS:
+                v[k] = 0.0
+            a = sums.get(t)
+            if a is not None:
+                for k in ("rew", "pnl", "real", "xfer", "cts", "usd", "mk", "mk_cts", "rest_s") + FX_KEYS:
+                    v[k] += a[ix[k]]
+                v["u1"] += a[ix["du"]]
+                v["fills"] += int(round(a[ix["fills"]]))
+                v["mk_n"] += int(round(a[ix["mk_n"]]))
+                v["settled"] = a[n] or None
+            w = mk30.get(t)
+            if w is not None:
+                for k in ("rew", "pnl", "real", "xfer", "cts", "usd", "mk", "mk_cts", "rest_s") + FX_KEYS:
+                    v[k] += w[k]
+                v["u1"] += w["u1"] - w["u0"]
+                v["fills"] += w["fills"]
+                v["mk_n"] += w["mk_n"]
+                v["settled"] = w["settled"] or v["settled"]
+                for k in ("pos1", "avg1", "mk1"):
+                    if k in w:
+                        v[k] = w[k]
+            v["net"] = v["rew"] + v["pnl"]
+            v["rest_avg"] = v["rest_s"] / span
+            out[t] = v
+        d0 = datetime.fromtimestamp(start, ET).date()
+        oks = sorted(iso for iso, d in dtot.items() if d[2]) or sorted(
+            iso for iso, d in days.items() if d.get("ok"))
+        desc = f"since 00:00 ET {d0:%a %b} {d0.day}"
+        if oks and oks[0] > d0.isoformat():
+            dk = _iso_date(oks[0])
+            desc += f"; trading P&L from {dk:%a %b} {dk.day}, when the position log starts"
+        if missing > 0:
+            desc += f"; {missing} day{'s' if missing > 1 else ''} not saved"
+        meta = {"label": "Since inception", "start": start, "end": self.now, "desc": desc,
+                "days": len(dtot)}
+        return meta, out, dtot
+
+    @staticmethod
+    def inception_compact(old: dict) -> dict:
+        """The markets only the day archive holds, for the page:
+        {"f": INC_ROW, "m": {ticker: [values in INC_ROW order, trailing zeros
+        dropped]}, "fam": {series: [family, group]}} -- the template turns each
+        into a market with the "all" window alone."""
+        rows, fams = {}, {}
+        for t, v in old.items():
+            if not (abs(v["rew"]) >= 0.0005 or abs(v["pnl"]) >= 0.0005 or v["fills"] or v["settled"]):
+                continue
+            vals = [_num(v["rew"], 3), _num(v["pnl"], 3), _num(v["real"], 3), _num(v["u1"] - v["u0"], 3),
+                    v["fills"], _num(v["cts"], 1), _num(v["usd"], 2), _num(v["mk"], 3), v["mk_n"],
+                    _num(v["mk_cts"], 1), _num(v["rest_avg"], 2)]
+            vals += [_num(v[k], 1 if k.endswith("_cts") else 3) for k in FX_KEYS]
+            vals += [_num(v["xfer"], 3), v["settled"] or 0]
+            while vals and not vals[-1]:
+                vals.pop()
+            rows[t] = vals
+            ser = series_of(t)
+            if ser not in fams:
+                fams[ser] = list(family_of(ser))
+        return {"f": list(INC_ROW), "m": rows, "fam": fams}
+
+    @staticmethod
+    def inception_curve(dtot: dict, c30: list) -> list:
+        """[[ts, cum rewards, cum trading P&L]]: a point at the end of each
+        archived day, then the 30-day window's own curve on top of them."""
+        pts, r, p = [], 0.0, 0.0
+        for iso in sorted(dtot):
+            d = dtot[iso]
+            if not pts:
+                pts.append([round(d[3]), 0.0, 0.0])
+            r += d[0]
+            p += d[1]
+            pts.append([round(d[4]), round(r, 2), round(p, 2)])
+        for q in c30:
+            pts.append([q[0], round(_f(q[1]) + r, 2), round(_f(q[2]) + p, 2)])
+        return pts
 
     def worst_by_event(self, held):
         """{dashboard event: [worst, gross, method]} for positions
@@ -3550,6 +3942,18 @@ class Builder:
         days = self.daily_markets()
         for dd in days.values():
             market_union |= set(dd["m"])
+        # since inception: the archived days before the 30-day window plus
+        # that window; a market only the archive still holds goes on the
+        # page compact (inc), with no other window
+        t1 = time.time()
+        inc = self.inception_window(days, wins["30d"][0])
+        inc_meta = inc_page = None
+        if inc:
+            inc_meta, inc_mk, inc_days = inc
+            wins["all"] = ({t: v for t, v in inc_mk.items() if t in market_union},
+                           (inc_meta["start"], wins["30d"][1][1], wins["30d"][1][2]))
+            inc_page = self.inception_compact({t: v for t, v in inc_mk.items() if t not in market_union})
+        self._t("inception", t1)
 
         # snapshot candidates (why not quoted)
         snap_by_t = {}
@@ -3606,8 +4010,9 @@ class Builder:
                      "net": round(v["net"], 4), "real": round(v["real"], 4),
                      "du": round(v["u1"] - v["u0"], 4)}
                 if v["fills"]:
-                    o.update(fills=v["fills"], cts=round(v["cts"], 1), usd=round(v["usd"], 2),
-                             buy=round(v["buy"], 1), sell=round(v["sell"], 1))
+                    o.update(fills=v["fills"], cts=round(v["cts"], 1), usd=round(v["usd"], 2))
+                    if "buy" in v:           # since inception keeps no side split
+                        o.update(buy=round(v["buy"], 1), sell=round(v["sell"], 1))
                     if v["mk_n"]:
                         o.update(mk=round(v["mk"], 3), mk_n=v["mk_n"], mk_cts=round(v["mk_cts"], 1))
                     for k in FX_KEYS:
@@ -3686,6 +4091,8 @@ class Builder:
             span = w["end"] - w["start"]
             step = 300.0 if span <= 26 * 3600 else 3600.0
             curves[key] = self.curve(w["start"], w["end"], step)
+        if inc_meta:
+            curves["all"] = self.inception_curve(inc_days, curves.get("30d") or [])
 
         # fills for the fills table, newest first, as far back as the day history
         fills_from = min([d["s"] for d in days.values()] + [self.windows["7d"]["start"]])
@@ -3743,7 +4150,9 @@ class Builder:
             "generated": self.now,
             "generated_et": datetime.fromtimestamp(self.now, ET).strftime("%a %b %d, %I:%M %p ET").replace(" 0", " "),
             "windows": {k: dict(w, pnl_na=not wins[k][1][2])
-                        for k, w in list(self.windows.items()) + list(short_meta.items())},
+                        for k, w in (list(self.windows.items()) + list(short_meta.items())
+                                     + ([("all", inc_meta)] if inc_meta else []))},
+            "inc": inc_page,
             "edges": {k: list(v[1][:2]) for k, v in wins.items()},
             "decisions": self._decision_mix(),
             "markets": markets, "events": events, "paths": per_market_paths,
@@ -4537,6 +4946,8 @@ def main(argv=None) -> int:
     ap.add_argument("--open", action="store_true", help="open the page when done")
     ap.add_argument("--out", default=OUT_HTML)
     ap.add_argument("--json", default=None, help="also dump the model JSON here")
+    ap.add_argument("--backfill-archive", action="store_true",
+                    help="once: save every day older than the history to the day archive (since inception), then exit")
     ap.add_argument("--log", default=None,
                     help="append output here (the scheduled task runs under pythonw, which has no console)")
     args = ap.parse_args(argv)
@@ -4544,6 +4955,14 @@ def main(argv=None) -> int:
         _redirect_to_log(args.log)
     t0 = time.time()
     os.makedirs(DASH_DIR, exist_ok=True)
+    if args.backfill_archive:
+        try:
+            n = backfill_archive()
+        except Exception:
+            log("! backfill failed:\n" + traceback.format_exc())
+            return 1
+        log(f"backfill took {time.time() - t0:.0f}s")
+        return 0 if n >= 0 else 1
     b = Builder(time.time(), api=not args.no_api, api_force=args.api_refresh)
     try:
         model = b.build()

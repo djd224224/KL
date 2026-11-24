@@ -1216,6 +1216,112 @@ class EventRunsTests(unittest.TestCase):
         self.assertEqual(two["KXE"]["since"], (H + 8) * 3600.0 + 60)
 
 
+def _day_row(**kw):
+    """A daily_markets row (DAY_FIELDS order) from keyword values."""
+    base = dict.fromkeys(dash.DAY_FIELDS, 0)
+    base.update(pos0=None, pos1=None, mk0=None, mk1=None)
+    base.update(kw)
+    return [base[k] for k in dash.DAY_FIELDS]
+
+
+def _archive_day(root, iso, rows, ok=True):
+    d = datetime.strptime(iso, "%Y-%m-%d").date()
+    from datetime import timedelta
+    s, e = dash.et_midnight(d), dash.et_midnight(d + timedelta(days=1))
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, iso + ".json"), "w", encoding="utf-8") as f:
+        json.dump({"v": 1, "s": s, "e": e, "ok": ok, "f": list(dash.DAY_FIELDS),
+                   "fx": list(dash.FX_KEYS), "m": rows}, f)
+    return s, e
+
+
+class DayArchiveTests(unittest.TestCase):
+    """Since inception (Jack 2026-11-23: "also add a since inception"; 11/24:
+    "yes do it overnight"): full ET days saved once, summed later."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._old = (dash.CACHE_DIR, dash.DAY_ARCHIVE_DIR, dash.DAY_FILES_LAST, dash.STATUS_DIR)
+        dash.CACHE_DIR = os.path.join(self.dir, "cache")
+        dash.DAY_ARCHIVE_DIR = None
+        self.root = dash.day_archive_dir()
+
+    def tearDown(self):
+        dash.CACHE_DIR, dash.DAY_ARCHIVE_DIR, dash.DAY_FILES_LAST, dash.STATUS_DIR = self._old
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_archive_dir_follows_the_cache(self):
+        self.assertEqual(self.root, os.path.join(self.dir, "cache", "day_archive"))
+
+    def test_only_full_days_are_saved_and_rewritten_on_change(self):
+        from datetime import date
+        y0, t0 = dash.et_midnight(date(2026, 9, 27)), dash.et_midnight(date(2026, 9, 28))
+        days = {
+            "2026-09-27": {"s": y0, "e": t0, "ok": True, "m": {"KXA-1": _day_row(rew=1.5)}},
+            "2026-09-28": {"s": t0, "e": t0 + 3600, "ok": True, "m": {"KXA-1": _day_row(rew=0.1)}},
+        }
+        self.assertEqual(dash.archive_days(days), ["2026-09-27"])
+        self.assertEqual(dash.archived_days(), {"2026-09-27"})
+        self.assertEqual(dash.archive_days(days), [])             # unchanged: no write
+        days["2026-09-27"]["m"]["KXA-1"] = _day_row(rew=1.75)      # a later build knows more
+        self.assertEqual(dash.archive_days(days), ["2026-09-27"])
+        # the backfill writes only the days it is given
+        self.assertEqual(dash.archive_days(days, only=set()), [])
+
+    def test_dst_day_is_full(self):
+        from datetime import date
+        s, e = dash.et_midnight(date(2026, 11, 1)), dash.et_midnight(date(2026, 11, 2))
+        self.assertEqual(e - s, 25 * 3600)
+        self.assertTrue(dash.full_day("2026-11-01", {"s": s, "e": e}))
+        self.assertFalse(dash.full_day("2026-11-01", {"s": s, "e": e - 3600}))
+
+    def test_inception_base_sums_the_days_before_the_window(self):
+        s1, e1 = _archive_day(self.root, "2026-07-20", {
+            "KXA-1": _day_row(rew=2.0, rest=10.0),
+            "KXOLD-1": _day_row(rew=0.5, pnl=-1.0, fills=2, cts=20, usd=9.0, settled="settled NO",
+                                fx=[0.1, 20, 0.2, 20, 0.3, 20, 0.4, 20]),
+        }, ok=False)
+        _archive_day(self.root, "2026-09-10", {"KXA-1": _day_row(rew=1.0, pnl=3.0, du=2.0, real=1.0)})
+        _archive_day(self.root, "2026-10-30", {"KXA-1": _day_row(rew=100.0)})   # inside the window
+        sums, dtot = dash.inception_base("2026-10-26")
+        ix = {k: i for i, k in enumerate(dash.INC_SUM)}
+        self.assertEqual(sorted(dtot), ["2026-07-20", "2026-09-10"])
+        self.assertAlmostEqual(sums["KXA-1"][ix["rew"]], 3.0)
+        self.assertAlmostEqual(sums["KXA-1"][ix["pnl"]], 3.0)
+        self.assertAlmostEqual(sums["KXA-1"][ix["rest_s"]], 10.0 * (e1 - s1))
+        self.assertEqual(sums["KXOLD-1"][-1], "settled NO")
+        self.assertAlmostEqual(sums["KXOLD-1"][ix["mt"]], 0.4)
+        self.assertEqual(dtot["2026-07-20"][:3], [2.5, -1.0, False])
+        # a later day is added on to the cached sums; an edited one re-sums
+        _archive_day(self.root, "2026-10-01", {"KXA-1": _day_row(rew=4.0)})
+        sums, dtot = dash.inception_base("2026-10-26")
+        self.assertAlmostEqual(sums["KXA-1"][ix["rew"]], 7.0)
+        _archive_day(self.root, "2026-07-20", {"KXA-1": _day_row(rew=20.0)})
+        sums, dtot = dash.inception_base("2026-10-26")
+        self.assertAlmostEqual(sums["KXA-1"][ix["rew"]], 25.0)
+        self.assertNotIn("KXOLD-1", sums)
+        self.assertIsNone(dash.inception_base("2026-07-01"))
+
+    def test_backfill_plan(self):
+        from datetime import date
+        cyc = [f"2026-07-{d:02d}" for d in range(11, 25)] + ["2026-07-27", "2026-07-28"]
+        plan = dash.backfill_plan(cyc, {"2026-07-15"}, date(2026, 8, 20), keep=30, chunk=3)
+        # the last UTC day (07-24, 07-28) has no next-day log; 07-15 is saved;
+        # 07-21 is the history's (30 days before 08-20)
+        self.assertEqual(plan, [["2026-07-11", "2026-07-12", "2026-07-13"], ["2026-07-14"],
+                                ["2026-07-16", "2026-07-17", "2026-07-18"], ["2026-07-19", "2026-07-20"]])
+
+    def test_day_files_cap(self):
+        dash.STATUS_DIR = self.dir
+        for d in ("2026-07-11", "2026-07-12", "2026-07-13"):
+            open(os.path.join(self.dir, f"cycle_log_{d}.csv"), "w").close()
+        dash.DAY_FILES_LAST = "2026-07-12"
+        self.assertEqual([d for d, _p in dash.day_files("cycle_log", "csv", "2026-07-11")],
+                         ["2026-07-11", "2026-07-12"])
+        dash.DAY_FILES_LAST = None
+        self.assertEqual(len(dash.day_files("cycle_log", "csv", "2026-07-11")), 3)
+
+
 class BuilderIntegrationTests(unittest.TestCase):
     """One synthetic ET day through the whole Builder."""
 
@@ -1323,6 +1429,52 @@ class BuilderIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(m["curves"]["today"][-1][2],
                                sum(v["w"].get("today", {}).get("pnl", 0) for v in m["markets"].values()),
                                places=1)
+
+    def test_since_inception_adds_the_archived_days(self):
+        # Jack 2026-11-23: "also add a since inception". A day saved before
+        # the 30-day window (Aug 30 here) adds to it; a market only the saved
+        # days hold goes on the page compact, not as a full market
+        root = dash.day_archive_dir()
+        _archive_day(root, "2026-08-01", {
+            "KXA-1": _day_row(rew=2.0, pnl=1.0, fills=1, cts=5, usd=2.5),
+            "KXOLD-1": _day_row(rew=0.5, settled="settled NO"),
+        }, ok=False)
+        b = dash.Builder(self.NOW, api=False, api_force=False)
+        m = b.build()
+        w = m["windows"]["all"]
+        self.assertEqual(w["label"], "Since inception")
+        self.assertEqual(w["start"], _ts("2026-08-01T04:00:00Z"))
+        self.assertIn("trading P&L from Mon Sep 28", w["desc"])
+        a, a30 = m["markets"]["KXA-1"]["w"]["all"], m["markets"]["KXA-1"]["w"]["30d"]
+        self.assertAlmostEqual(a["rew"], a30["rew"] + 2.0, places=3)
+        self.assertAlmostEqual(a["pnl"], a30["pnl"] + 1.0, places=3)
+        self.assertEqual(a["fills"], a30["fills"] + 1)
+        self.assertNotIn("buy", a)
+        self.assertNotIn("KXOLD-1", m["markets"])
+        inc = m["inc"]
+        self.assertEqual(inc["f"][0], "rew")
+        self.assertEqual(inc["m"]["KXOLD-1"][0], 0.5)
+        self.assertEqual(inc["m"]["KXOLD-1"][-1], "settled NO")
+        self.assertIn("KXOLD", inc["fam"])
+        # the curve starts flat at inception and ends on the window's totals
+        c = m["curves"]["all"]
+        self.assertEqual(c[0][1:], [0.0, 0.0])
+        tot_rew = sum(v["w"].get("all", {}).get("rew", 0) for v in m["markets"].values()) + 0.5
+        self.assertAlmostEqual(c[-1][1], tot_rew, places=1)
+        # Aug 2-29 (before the 30-day window's Aug 30) are not saved: said so
+        self.assertTrue(w["desc"].endswith("; 28 days not saved"), w["desc"])
+        # saved days that start after the first cycle log (the backfill has
+        # not run): no button yet
+        os.remove(os.path.join(root, "2026-08-01.json"))
+        _archive_day(root, "2026-09-26", {"KXA-1": _day_row(rew=1.0)})
+        open(os.path.join(self.dir, "cycle_log_2026-08-10.csv"), "w").close()
+        self.assertNotIn("all", dash.Builder(self.NOW, api=False, api_force=False).build()["windows"])
+        os.remove(os.path.join(self.dir, "cycle_log_2026-08-10.csv"))
+        # a page with no archived day before the window has no such window
+        shutil.rmtree(root)
+        m2 = dash.Builder(self.NOW, api=False, api_force=False).build()
+        self.assertNotIn("all", m2["windows"])
+        self.assertIsNone(m2["inc"])
 
     def test_cash_chart_files_each_move_under_its_source(self):
         # Jack 2026-11-14: "what families are drawing cash or adding cash".

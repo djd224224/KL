@@ -689,8 +689,28 @@ const ICON = {
 function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
 /* ======================= state ======================= */
-// a window the data lacks (a page built before "30d" existed) gets no button
-const WKEYS = ["today", "yesterday", "24h", "7d", "30d"].filter((k) => !!(D && D.windows && D.windows[k]));
+// since inception (Jack 2026-11-23: "also add a since inception"): a market only
+// the saved days still hold comes compact (D.inc) and becomes a market with
+// that one window; its event, too, when no other market of it is on the page
+(function () {
+  const I = D && D.inc;
+  if (!I || !I.m || !D.markets) return;
+  const F = I.f || [], fams = I.fam || {};
+  D.events = D.events || {};
+  for (const t in I.m) {
+    if (D.markets[t]) continue;
+    const row = I.m[t], o = {};
+    F.forEach((k, i) => { const v = row[i]; if (v !== undefined && v !== null && v !== 0 && v !== "") o[k] = v; });
+    o.net = num(o.rew) + num(o.pnl);
+    const cut = t.lastIndexOf("-"), ev = cut < 0 ? t : t.slice(0, cut), ser = t.split("-")[0];
+    const fg = fams[ser] || ["Other", ""];
+    D.markets[t] = { t: t, ev: ev, ser: ser, fam: fg[0], grp: fg[1], sel: false, scanm: false, pos: 0, avg: 0, acc: 0, w: { all: o }, old: 1 };
+    const e = D.events[ev] || (D.events[ev] = { ev: ev, fam: fg[0], grp: fg[1], ser: ser, mkts: [], cred: 0, cred7: 0 });
+    e.mkts.push(t);
+  }
+})();
+// a window the data lacks (a page built before "30d" / "all" existed) gets no button
+const WKEYS = ["today", "yesterday", "24h", "7d", "30d", "all"].filter((k) => !!(D && D.windows && D.windows[k]));
 const DAYS = Object.keys((D && D.days) || {}).sort();          // ET days, oldest first
 const DF = (D && D.day_fields) || [];
 const FXK = (D && D.fx_keys) || [];
@@ -944,7 +964,7 @@ function lineChart(host, series, o) {
 }
 function timeTicks(x0, x1) {
   const span = x1 - x0, out = [];
-  const step = span <= 30 * 3600 ? (span <= 14 * 3600 ? 2 * 3600 : 4 * 3600) : 86400;
+  const step = span <= 30 * 3600 ? (span <= 14 * 3600 ? 2 * 3600 : 4 * 3600) : span > 45 * 86400 ? 7 * 86400 : 86400;
   // align to ET boundaries via the ET offset of x0
   const off = (new Date(x0 * 1000).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit" }) | 0);
   let t = x0 - ((off % (step / 3600)) * 3600) - (x0 % 3600);
