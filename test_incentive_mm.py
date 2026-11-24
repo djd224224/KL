@@ -2760,6 +2760,16 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         self.assertIsNone(imm.trade_cutoff_utc("KXGTEMP-2027", None, None))
         self.assertFalse(a("KXGTEMPX-2027-P0"))               # exact series only
 
+    def test_gtemp_rests_at_three_times_the_global_size(self):
+        # Jack 2026-11-24: "size up KXGTEMP to 3x" -- only the size changes
+        # (safe-join stays), and the applied multiplier the ladder, the caps
+        # and the floor projection read is 3
+        ov = imm.SERIES_OVERRIDES["KXGTEMP"]
+        self.assertEqual(ov, imm.SeriesOverride(safe_join=True, size_mult=3.0))
+        with mock.patch.object(imm, "size_test_mult", return_value=1.0):
+            self.assertEqual(imm.applied_mention_mult("KXGTEMP"), 3.0)
+        self.assertIn("GTEMP_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
+
     def test_mlbplayoffs_26_event_blocked(self):
         # Jack 2026-09-26: "blocklist KXMLBPLAYOFFS-26". Every market of
         # the 2026 event and the event ticker are frozen; the series (the

@@ -1493,6 +1493,17 @@ for _s in os.environ.get(
         "KXHURCAT,KXGTEMP").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(safe_join=True)
+# KXGTEMP x3 (Jack 2026-11-24: "size up KXGTEMP to 3x", once its first quotes
+# rested at 02:16Z: 56 bid @ 82c, 42 ask @ 88c, a modelled $14.51 to the
+# 11/29 program end at x1). The size_mult wire (applied_mention_mult): the
+# rung, the per-market and per-event caps, the skew knees and the
+# payout-floor projection scale together; safe-join stays. The split size
+# test ended 11/09, so nothing stacks on top. IMM_GTEMP_SIZE_MULT sets it
+# (a *_SIZE_MULT name, so env_overrides.txt can carry it); 1 reverts.
+GTEMP_SIZE_MULT = _env_float("IMM_GTEMP_SIZE_MULT", 3.0)
+if "KXGTEMP" in SERIES_OVERRIDES:
+    SERIES_OVERRIDES["KXGTEMP"] = replace(SERIES_OVERRIDES["KXGTEMP"],
+                                          size_mult=GTEMP_SIZE_MULT)
 
 # RAMP AI INDEX FAMILY (Jack 2026-09-12: "allowlist the Ramp AI Index events
 # into the IMM bot. set a release guard at midnight ET on the 6th day of the
@@ -15338,6 +15349,7 @@ _CONFIG_CODE_KNOBS = (
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
     "SPRLVLDATE_SIZE_MULT",       # KXSPRLVLDATE x2 (2026-11-10)
+    "GTEMP_SIZE_MULT",            # KXGTEMP x3 (2026-11-24)
     "ART_PRICE_MIN", "ART_PRICE_MAX",                    # KXART 2-98c (2026-11-11)
     "OSCAR_PRICE_MIN", "OSCAR_PRICE_MAX",                # KXOSCAR* 1-99c (2026-11-13)
     "ART_BOOST_SIDE_CAP", "ART_BOOST_CHEAP_C", "ART_BOOST_CHEAP_SIDE_CAP",
