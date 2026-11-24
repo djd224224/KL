@@ -1391,7 +1391,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                   | set(QUOTE_OFFSET_BY_CADENCE))
     per_tenor = "".join(
         f" ({c} {NUM_LEVELS_BY_CADENCE.get(c, NUM_LEVELS)}x"
-        f"{CONTRACTS_PER_LEVEL_BY_CADENCE.get(c, CONTRACTS_PER_LEVEL)}"
+        f"{CONTRACTS_PER_LEVEL_BY_ASSET_CADENCE.get((cfg.asset, c), CONTRACTS_PER_LEVEL_BY_CADENCE.get(c, CONTRACTS_PER_LEVEL))}"
         f" @{QUOTE_OFFSET_BY_CADENCE.get(c, QUOTE_OFFSET_CENTS)}c)"
         for c in sorted(overridden) if c in cadences)
     log(f"=== {MODEL_VERSION} asset={cfg.asset} series={cfg.series} "
