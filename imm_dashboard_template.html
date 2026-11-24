@@ -689,7 +689,8 @@ const ICON = {
 function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
 /* ======================= state ======================= */
-const WKEYS = ["today", "yesterday", "24h", "7d", "30d"];
+// a window the data lacks (a page built before "30d" existed) gets no button
+const WKEYS = ["today", "yesterday", "24h", "7d", "30d"].filter((k) => !!(D && D.windows && D.windows[k]));
 const DAYS = Object.keys((D && D.days) || {}).sort();          // ET days, oldest first
 const DF = (D && D.day_fields) || [];
 const FXK = (D && D.fx_keys) || [];
