@@ -3,12 +3,15 @@
 high_temp_trading.py talks to Kalshi on import, so -- like
 test_high_temp_run_slot.py -- this lifts the sizing blocks out of the source
 and executes them. What it pins down:
-  - morning markets split sticky 50/50 into the 25-vs-40 size test (Jack
-    2026-11-01: "Test a bigger morning size, 25 vs 40"): control rungs start
-    at the slot base, 25, treatment rungs at 40;
-  - evening (15) and west_late (25) stay out of the test at their slot base;
+  - the 25-vs-40 morning size test is OFF by default (Jack 2026-11-23: "Yes,
+    end at 25"), so every slot rungs at its base: morning 25, west_late 25,
+    evening 15;
+  - SIZE_EXP_ENABLED=true restarts it: morning markets split sticky 50/50
+    (Jack 2026-11-01: "Test a bigger morning size, 25 vs 40"), control rungs
+    at the slot base, 25, treatment rungs at 40; evening and west_late stay
+    out at their slot base;
   - BASE_CONTRACTS_DAY / BASE_CONTRACTS_EVENING / SIZE_EXP_TREATMENT_CONTRACTS
-    override the sizes, and SIZE_EXP_ENABLED=false ends the test.
+    override the sizes.
 
     python -m unittest test_high_temp_sizing
 """
@@ -50,8 +53,18 @@ def base_for(g, ticker):
 class TestBaseContracts(unittest.TestCase):
     TICKERS = [f"KXHIGHNY-26OCT{d:02d}-B{t}.5" for d in range(1, 29) for t in (60, 62, 64)]
 
-    def test_mornings_split_25_vs_40(self):
-        g = sizing("morning")
+    ON = {"SIZE_EXP_ENABLED": "true"}
+
+    def test_test_ended_every_morning_market_rungs_at_25(self):
+        # default, empty, and junk values all leave the test off
+        for env in ({}, {"SIZE_EXP_ENABLED": ""}, {"SIZE_EXP_ENABLED": "false"}, {"SIZE_EXP_ENABLED": "nope"}):
+            g = sizing("morning", env)
+            self.assertFalse(g["SIZE_EXP_ACTIVE"], env)
+            self.assertEqual({g["_size_exp_assign_arm"](t) for t in self.TICKERS}, {"off"}, env)
+            self.assertEqual({base_for(g, t) for t in self.TICKERS}, {25}, env)
+
+    def test_mornings_split_25_vs_40_when_enabled(self):
+        g = sizing("morning", self.ON)
         self.assertTrue(g["SIZE_EXP_ACTIVE"])
         arms = {t: g["_size_exp_assign_arm"](t) for t in self.TICKERS}
         treated = sum(a == "treatment" for a in arms.values())
@@ -60,11 +73,11 @@ class TestBaseContracts(unittest.TestCase):
         for t, arm in arms.items():
             self.assertEqual(base_for(g, t), 40 if arm == "treatment" else 25)
         # sticky: a later run gives every market the same arm
-        self.assertEqual(arms, {t: sizing("morning")["_size_exp_assign_arm"](t) for t in self.TICKERS})
+        self.assertEqual(arms, {t: sizing("morning", self.ON)["_size_exp_assign_arm"](t) for t in self.TICKERS})
 
     def test_evening_and_west_late_stay_out(self):
         for slot, want in (("west_late", 25), ("evening", 15)):
-            g = sizing(slot)
+            g = sizing(slot, self.ON)
             self.assertFalse(g["SIZE_EXP_ACTIVE"])
             self.assertEqual({g["_size_exp_assign_arm"](t) for t in self.TICKERS}, {"off"}, slot)
             self.assertEqual({base_for(g, t) for t in self.TICKERS}, {want}, slot)
@@ -77,7 +90,7 @@ class TestBaseContracts(unittest.TestCase):
 
     def test_env_overrides_each_size(self):
         env = {"BASE_CONTRACTS_DAY": "30", "BASE_CONTRACTS_EVENING": "10",
-               "SIZE_EXP_TREATMENT_CONTRACTS": "50"}
+               "SIZE_EXP_TREATMENT_CONTRACTS": "50", "SIZE_EXP_ENABLED": "true"}
         g = sizing("morning", env)
         self.assertEqual({base_for(g, t) for t in self.TICKERS}, {30, 50})
         g = sizing("evening", env)
