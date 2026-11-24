@@ -901,6 +901,10 @@ def build_windows(now: float) -> dict:
     t0 = et_midnight(today)
     y0 = et_midnight(today - timedelta(days=1))
     w0 = et_midnight(today - timedelta(days=6))
+    # 30 ET days through today, the drivers' "Last 30 days" span (Jack
+    # 2026-11-23: "add a L30D view to the top toggle options")
+    m0d = today - timedelta(days=29)
+    m0 = et_midnight(m0d)
     h24 = (int(now // 3600) - 24) * 3600.0
     roll = bot_roll_start(now)
     return {
@@ -913,6 +917,8 @@ def build_windows(now: float) -> dict:
                 "desc": "since " + datetime.fromtimestamp(h24, ET).strftime("%a %I:%M %p ET").replace(" 0", " ")},
         "7d": {"label": "7 days", "start": w0, "end": now,
                "desc": f"since 00:00 ET {(today - timedelta(days=6)):%a %b} {(today - timedelta(days=6)).day}"},
+        "30d": {"label": "30 days", "start": m0, "end": now,
+                "desc": f"since 00:00 ET {m0d:%a %b} {m0d.day}"},
         "roll": {"label": "Bot day", "start": roll, "end": now, "hidden": True,
                  "desc": "since the bot's 5am CT roll"},
     }

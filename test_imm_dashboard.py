@@ -489,6 +489,12 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(w["yesterday"]["start"], _ts("2026-09-27T04:00:00Z"))
         self.assertEqual(w["yesterday"]["end"], w["today"]["start"])
         self.assertEqual(w["7d"]["start"], _ts("2026-09-22T04:00:00Z"))
+        # the 30-day toggle: 30 ET days through today (Jack 2026-11-23: "add a
+        # L30D view to the top toggle options")
+        self.assertEqual(w["30d"]["start"], _ts("2026-08-30T04:00:00Z"))
+        self.assertEqual(w["30d"]["end"], now)
+        self.assertEqual(w["30d"]["label"], "30 days")
+        self.assertFalse(w["30d"].get("hidden"))
         self.assertEqual(w["roll"]["start"], _ts("2026-09-28T10:00:00Z"))   # 5am CDT
         self.assertEqual(w["24h"]["start"], _ts("2026-09-27T20:00:00Z"))
 
