@@ -452,6 +452,36 @@ class TestParseEventDate(unittest.TestCase):
     def test_bad_day(self):
         self.assertIsNone(parse_event_date("KXFOO-26FEB31"))
 
+    # DAY-FIRST BY THE YEAR (2026-11-24): a YYMONDD year before
+    # TICKER_FIRST_YEAR is a DDMONYY ticker
+    def _et_ymd(self, ticker):
+        et = parse_event_date(ticker).astimezone(imm.ET)
+        return (et.year, et.month, et.day, et.hour)
+
+    def test_day_first_grammy_count(self):
+        # the 69th Grammys, not 2007-02-27
+        self.assertEqual(self._et_ymd("KXGRAMMYCOUNT-07FEB27ROS"), (2027, 2, 7, 0))
+        self.assertEqual(self._et_ymd("KXGRAMMYCOUNT-07FEB27ROS-3"), (2027, 2, 7, 0))
+
+    def test_day_first_fx_event_with_time(self):
+        self.assertEqual(self._et_ymd("KXEURUSDEVENT-03DEC260930"), (2026, 12, 3, 0))
+        self.assertEqual(self._et_ymd("KXUSDJPYEVENT-18DEC261100-T16100"), (2026, 12, 18, 0))
+
+    def test_year_first_kept_when_plausible(self):
+        self.assertEqual(self._et_ymd("KXHIGHNY-26NOV24"), (2026, 11, 24, 0))
+        # day 21-31 reads both ways: left to the per-series rules
+        self.assertEqual(self._et_ymd("KXFOO-24DEC26"), (2024, 12, 26, 0))
+
+    def test_both_readings_old_kept(self):
+        # neither reading reaches TICKER_FIRST_YEAR: unchanged
+        self.assertEqual(self._et_ymd("KXFOO-05JAN07"), (2005, 1, 7, 0))
+
+    def test_day_first_cutoff(self):
+        exp = utc(2027, 2, 7, 19, 30)
+        self.assertEqual(trade_cutoff_utc("KXGRAMMYCOUNT-07FEB27ROS", None, exp),
+                         parse_event_date("KXGRAMMYCOUNT-07FEB27ROS"))
+        self.assertEqual(trade_cutoff_utc("KXGRAMMYCOUNT-07FEB27ROS", None, exp).year, 2027)
+
 
 class TestTradeCutoff(unittest.TestCase):
     def test_ticker_date_only(self):

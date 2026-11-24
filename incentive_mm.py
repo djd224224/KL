@@ -23930,6 +23930,9 @@ _EARNINGS_PREFIX = "KXEARNINGSMENTION"
 _MONTHS = {m: i + 1 for i, m in enumerate(
     ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])}
 _TICKER_DATE_RE = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})")
+# no Kalshi ticker dates an event before this year (parse_event_date's
+# day-first rule)
+TICKER_FIRST_YEAR = 2021
 
 
 _RAIN_PERIOD_SEG_RE = re.compile(r"(\d{2})([A-Z]{3})(\d{2})")
@@ -24027,6 +24030,16 @@ def parse_event_date(event_ticker: str) -> Optional[datetime]:
     month = _MONTHS.get(mon)
     if month is None:
         return None
+    if 2000 + int(yy) < TICKER_FIRST_YEAR <= 2000 + int(dd):
+        # DAY-FIRST BY THE YEAR (2026-11-24, Jack: "Yes, enroll it"): no Kalshi
+        # market is dated before TICKER_FIRST_YEAR, so a YYMONDD reading there
+        # is a DDMONYY ticker. KXGRAMMYCOUNT-07FEB27ROS is the 69th Grammys,
+        # Feb 7 2027; read as 2007-02-27, the cutoff and the 24h pre-filter
+        # dropped all 59 of its programs unquoted. The per-series swaps above
+        # caught each earlier family one at a time (rain spans 03OCT26 -> 2003,
+        # snow days 01DEC26 -> 2001); this catches a new series whose day is
+        # 01-20. Day 21-31 still reads both ways (24DEC26) and needs its own.
+        yy, dd = dd, yy
     try:
         naive = datetime(2000 + int(yy), month, int(dd))
     except ValueError:
