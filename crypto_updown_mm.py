@@ -206,6 +206,21 @@ NUM_LEVELS_BY_ASSET_CADENCE = {
     ("BTC", "daily"): _env_i("CUD_NUM_LEVELS_DAILY_BTC", 1),
     ("BTC", "weekly"): _env_i("CUD_NUM_LEVELS_WEEKLY_BTC", 0),
 }
+# Weekly 2x on the small coins (Jack 2026-11-23: "do 1"): SOL, XRP, HYPE, BNB
+# and DOGE rest 2 contracts per rung on the weekly tenor (3x2), ETH stays 3x1
+# and BTC weekly stays off. Fills 9/16-11/20: these five made money in 9 of
+# 10 settled weeks, +$28.9/week (sd $22.6, t 4.0) on ~178 contracts/week at
+# 1-lot rungs, with no cap hits; ETH +$2.1/week (sd $20.8, t 0.3). The 11/01
+# tape replay put alts 2x at +$2-3/day. Caps unchanged (80/400/800, $120 per
+# event-direction, reduce-only 240, skew full 120): the five coins' worst
+# week since 10/01 peaked at |net| 69 and $50 of risk (XRP, 26NOV20), so 2x
+# fits under them. CUD_CONTRACTS_PER_LEVEL_WEEKLY_<ASSET>=1 reverts one coin
+# (needs that bot's restart).
+WEEKLY_2X_ASSETS = ("SOL", "XRP", "HYPE", "BNB", "DOGE")
+CONTRACTS_PER_LEVEL_BY_ASSET_CADENCE = {
+    (a, "weekly"): _env_i(f"CUD_CONTRACTS_PER_LEVEL_WEEKLY_{a}", 2)
+    for a in WEEKLY_2X_ASSETS
+}
 QUOTE_OFFSET_BY_CADENCE = {
     # 4->5c (Jack 2026-08-18 "min edge 5c") after the 8/17 defenses; the
     # skew floor (3c) leaves +/-2c of effective inventory skew here.
@@ -683,6 +698,7 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
     max_fair_divergence_cents = MAX_FAIR_DIVERGENCE_CENTS
     idle_poll_secs = IDLE_POLL_SECS
     contracts_per_level_by_cadence = CONTRACTS_PER_LEVEL_BY_CADENCE
+    contracts_per_level_by_asset_cadence = CONTRACTS_PER_LEVEL_BY_ASSET_CADENCE
     num_levels_by_cadence = NUM_LEVELS_BY_CADENCE
     num_levels_by_asset_cadence = NUM_LEVELS_BY_ASSET_CADENCE
     quote_offset_by_cadence = QUOTE_OFFSET_BY_CADENCE
@@ -705,6 +721,17 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
         self.cadences = tuple(cadences)
         self.tag = f"[{cfg.asset} ud]"
         self.u = UpDownState()
+        # place_with_side_cap's backstops (num_levels x contracts_per_level a
+        # side, contracts_per_level a price level) read self.contracts_per_level.
+        # Size them to this asset's largest rung across its tenors, so the
+        # small coins' 2-lot weekly rungs aren't refused as over the level cap.
+        # The ladder's own default stays the class value (base_contracts_per_level).
+        self.base_contracts_per_level = self.contracts_per_level
+        self.contracts_per_level = max(
+            [self.contracts_per_level]
+            + [n for c, n in self.contracts_per_level_by_cadence.items() if c in self.cadences]
+            + [n for (a, c), n in self.contracts_per_level_by_asset_cadence.items()
+               if a == cfg.asset and c in self.cadences])
 
     # ---- volatility (horizon-matched) --------------------------------------
 
@@ -1075,8 +1102,11 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
             events_left -= 1
             event_room_buy = min(self.max_event - event_net, event_share_buy)
             event_room_sell = min(self.max_event + event_net, event_share_sell)
-            cpl = self.contracts_per_level_by_cadence.get(
-                v.cadence, self.contracts_per_level)
+            cpl = self.contracts_per_level_by_asset_cadence.get(
+                (self.cfg.asset, v.cadence))
+            if cpl is None:
+                cpl = self.contracts_per_level_by_cadence.get(
+                    v.cadence, self.base_contracts_per_level)
             n_levels = self.num_levels_by_asset_cadence.get(
                 (self.cfg.asset, v.cadence))
             if n_levels is None:
@@ -1379,7 +1409,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         defenses.append(f"momo z={MOMO_Z:g} hold {MOMO_HOLD_SECS:g}s "
                         f"on {'/'.join(MOMO_CADENCES)}")
     for (a, c) in sorted(set(QUOTE_OFFSET_BY_ASSET_CADENCE)
-                         | set(NUM_LEVELS_BY_ASSET_CADENCE)):
+                         | set(NUM_LEVELS_BY_ASSET_CADENCE)
+                         | set(CONTRACTS_PER_LEVEL_BY_ASSET_CADENCE)):
         if a != cfg.asset or c not in cadences:
             continue
         parts = []
@@ -1389,6 +1420,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         n = NUM_LEVELS_BY_ASSET_CADENCE.get((a, c))
         if n is not None:
             parts.append("OFF (0 rungs)" if n <= 0 else f"{n} rung{'s' if n != 1 else ''}")
+        k = CONTRACTS_PER_LEVEL_BY_ASSET_CADENCE.get((a, c))
+        if k is not None:
+            parts.append(f"{k} contracts/rung")
         defenses.append(f"{a} {c} {', '.join(parts)}")
     if defenses:
         log(f"=== defenses: {'; '.join(defenses)} ===")

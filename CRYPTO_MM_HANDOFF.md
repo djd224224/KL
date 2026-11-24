@@ -437,6 +437,18 @@ exit on `ap.error` and the launcher would respawn it every ~30s. Re-enable by re
 entry (or `CUD_NUM_LEVELS_WEEKLY_BTC=3` for an emergency). Banner: `BTC weekly OFF (0 rungs)`.
 The six alts are unchanged (3x1 @5c).
 
+**WEEKLY 2x ON THE SMALL COINS since 2026-11-24** (Jack 2026-11-23: "do 1"):
+- `CONTRACTS_PER_LEVEL_BY_ASSET_CADENCE` gives SOL, XRP, HYPE, BNB and DOGE weekly 2 contracts per rung (3x2 @5c).
+- ETH weekly stays 3x1, and BTC weekly stays off.
+- The case (fills 9/16-11/20, valued at settlement):
+  - These five: 9 of 10 weeks up, +$28.9/week, sd $22.6, t 4.0, at 1-lot rungs with no cap hits.
+  - ETH: +$2.1/week, sd $20.8.
+  - The 11/01 tape replay put alts 2x at +$2-3/day.
+- Caps are unchanged (80/400/800, $120 per event-direction, reduce-only 240, skew full 120). The five coins' worst week since 10/01 peaked at |net| 69 and $50 of risk (XRP 26NOV20).
+- The place backstops (`place_with_side_cap`'s side and level caps) read `self.contracts_per_level`. `UpDownMarketMaker.__init__` raises that to the asset's largest rung across its tenors, and the ladder's own default is `base_contracts_per_level`.
+- Banner: `SOL weekly 2 contracts/rung`.
+- To revert one coin: `CUD_CONTRACTS_PER_LEVEL_WEEKLY_<ASSET>=1`, or drop it from `WEEKLY_2X_ASSETS`, then restart that bot.
+
 **DAILY TENOR OFF fleet-wide since 2026-09-03** (Jack "turn off daily crypto markets.
 keep weekly/monthly"): `DISABLED_ASSET_CADENCES` default is now `"*:daily"` — the `*`
 wildcard disables a cadence for every asset (BTC's 8/23 solo off-switch subsumed;

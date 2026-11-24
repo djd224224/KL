@@ -282,6 +282,7 @@ class AnnualMarketMaker(ud.UpDownMarketMaker):
     # and inheriting the updown fleet's daily tables would be dead config at
     # best and a surprise at worst.
     contracts_per_level_by_cadence = {}
+    contracts_per_level_by_asset_cadence = {}
     num_levels_by_cadence = {}
     num_levels_by_asset_cadence = {}
     quote_offset_by_cadence = {}
