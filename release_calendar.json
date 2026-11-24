@@ -4,17 +4,27 @@
     "bls_state": {
       "name": "BLS State Employment and Unemployment",
       "url": "https://www.bls.gov/schedule/news_release/laus.htm",
-      "times_et": ["2026-09-18 10:00", "2026-10-20 10:00", "2026-11-20 10:00", "2026-12-18 10:00"]
+      "note": "2027 dates read from BLS's schedule 2026-11-24 (January data on 03-15, after the annual benchmark)",
+      "times_et": ["2026-09-18 10:00", "2026-10-20 10:00", "2026-11-20 10:00", "2026-12-18 10:00",
+                   "2027-01-26 10:00", "2027-03-15 10:00", "2027-03-26 10:00", "2027-04-20 10:00",
+                   "2027-05-21 10:00", "2027-06-22 10:00", "2027-07-20 10:00", "2027-08-20 10:00",
+                   "2027-09-21 10:00", "2027-10-22 10:00", "2027-11-19 10:00", "2027-12-17 10:00"]
     },
     "bls_metro": {
       "name": "BLS Metropolitan Area Employment and Unemployment",
       "url": "https://www.bls.gov/schedule/news_release/metro.htm",
-      "times_et": ["2026-12-02 10:00", "2026-12-30 10:00"]
+      "note": "2027 dates read from BLS's schedule 2026-11-24",
+      "times_et": ["2026-12-02 10:00", "2026-12-30 10:00",
+                   "2027-02-03 10:00", "2027-03-19 10:00", "2027-04-07 10:00", "2027-04-28 10:00",
+                   "2027-06-02 10:00", "2027-06-30 10:00", "2027-07-28 10:00", "2027-09-01 10:00",
+                   "2027-09-29 10:00", "2027-11-03 10:00", "2027-12-01 10:00"]
     },
     "bls_qcew": {
       "name": "BLS County Employment and Wages (QCEW)",
-      "url": "https://www.bls.gov/schedule/2026/home.htm",
-      "times_et": ["2026-08-28 10:00", "2026-12-02 10:00"]
+      "url": "https://www.bls.gov/schedule/news_release/cew.htm",
+      "note": "quarterly; 2027 dates read from BLS's schedule 2026-11-24",
+      "times_et": ["2026-08-28 10:00", "2026-12-02 10:00",
+                   "2027-03-03 10:00", "2027-05-27 10:00", "2027-08-26 10:00", "2027-12-08 10:00"]
     },
     "bls_empsit": {
       "name": "BLS Employment Situation",
@@ -44,32 +54,32 @@
     "nass_milk": {
       "name": "USDA NASS Milk Production",
       "url": "https://www.nass.usda.gov/Publications/Calendar/reports_by_date.php",
-      "note": "monthly, 24 states; add the 2027 dates when NASS posts its 2027 calendar, and the Milk Production, Disposition, and Income annual (late April, KXVTMILK settles on it)",
+      "note": "monthly, 24 states; add the 2027 dates when NASS posts its 2027 calendar, and the Milk Production, Disposition, and Income annual (late April, KXVTMILK settles on it); checked 2026-11-24: no 2027 dates on NASS's calendar yet",
       "times_et": ["2026-09-22 15:00", "2026-10-22 15:00", "2026-11-20 15:00", "2026-12-22 15:00"]
     },
     "nass_cattle": {
       "name": "USDA NASS Cattle (January 1 inventory)",
       "url": "https://www.nass.usda.gov/Publications/Calendar/reports_by_date.php",
-      "note": "late January; not on NASS's calendar yet",
+      "note": "late January; not on NASS's calendar yet (checked 2026-11-24: its calendar and .ics end 2026-12-31)",
       "times_et": []
     },
     "nass_poultry": {
       "name": "USDA NASS Poultry - Production and Value",
       "url": "https://www.nass.usda.gov/Publications/Calendar/reports_by_date.php",
-      "note": "annual summary, late April; not on NASS's calendar yet",
+      "note": "annual summary, late April; not on NASS's calendar yet (checked 2026-11-24)",
       "times_et": []
     },
     "nass_catfish": {
       "name": "USDA NASS Catfish Production",
       "url": "https://www.nass.usda.gov/Publications/Calendar/reports_by_date.php",
-      "note": "annual; not on NASS's calendar yet",
+      "note": "annual; not on NASS's calendar yet (checked 2026-11-24; the 2026 releases were 02-09 and 07-15)",
       "times_et": []
     },
     "eia_epm": {
       "name": "EIA Electric Power Monthly",
       "url": "https://www.eia.gov/electricity/monthly/",
       "note": "the last week of the month; EIA posts only the next date",
-      "times_et": ["2026-09-24 10:00", "2026-10-23 10:00"]
+      "times_et": ["2026-09-24 10:00", "2026-10-23 10:00", "2026-11-24 10:00"]
     },
     "eia_psm": {
       "name": "EIA Petroleum Supply Monthly",
@@ -101,7 +111,7 @@
     "eia_qcr": {
       "name": "EIA Quarterly Coal Report",
       "url": "https://www.eia.gov/coal/production/quarterly/",
-      "note": "next release TBD on EIA's page (10/01 carried Q2; Q3 due about January, Q4 about April)",
+      "note": "next release TBD on EIA's page (10/01 carried Q2; Q3 due about January, Q4 about April); still TBD when checked 2026-11-24",
       "times_et": []
     },
     "census_bps": {
@@ -121,7 +131,7 @@
     "census_popest": {
       "name": "Census Vintage state population estimates",
       "url": "https://www.census.gov/programs-surveys/popest/about/schedule.html",
-      "note": "Vintage 2026 national and state totals: 'December 2026', day not posted yet",
+      "note": "Vintage 2026 national and state totals: 'December 2026', day not posted yet (still so when checked 2026-11-24)",
       "times_et": []
     },
     "fhfa_hpi": {
