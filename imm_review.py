@@ -68,6 +68,10 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+# Day files older than 35 days are .gz (imm_log_retention, R-261124-03): a
+# re-run for an old day finds and opens them through imm_logfiles.
+import imm_logfiles  # noqa: E402
+
 try:
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
@@ -213,7 +217,8 @@ def _load_pickle(path: str):
 
 def _iter_jsonl(path: str) -> Iterable[dict]:
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
+        with imm_logfiles.open_text(imm_logfiles.resolve(path), encoding="utf-8",
+                                    errors="replace") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -929,10 +934,10 @@ def cycle_times(day: date) -> List[float]:
     s, e = et_bounds(day)
     seen = set()
     for u in utc_dates(day):
-        path = os.path.join(STATUS_DIR, f"cycle_log_{u}.csv")
+        path = imm_logfiles.resolve(os.path.join(STATUS_DIR, f"cycle_log_{u}.csv"))
         last = b""
         try:
-            with open(path, "rb") as fh:
+            with imm_logfiles.open_bin(path) as fh:
                 for line in fh:
                     head = line[:20]
                     if head == last or not head[:2].isdigit():
@@ -1179,6 +1184,48 @@ def sec_system(day: date, bootstrap_days: int = 14) -> dict:
     out["sync"] = sync_status(day)
     out["git"] = git_state()
     out["machine"] = machine_state(day)
+    out["retention"] = retention_status()
+    return out
+
+
+def retention_status(now: float = None) -> dict:
+    """imm_log_retention's last run (R-261124-03) from retention/last_run.json,
+    plus lifetime totals from its manifest. {"present": False} before the
+    first run."""
+    rdir = os.path.join(STATUS_DIR, "retention")
+    lr = _load_json(os.path.join(rdir, "last_run.json"), None)
+    if not isinstance(lr, dict):
+        return {"present": False}
+    now = time.time() if now is None else now
+    ts = _ts_of(lr.get("ts"))
+    out = {"present": True, "age_h": round((now - ts) / 3600.0, 1) if ts else None}
+    for k in ("ts", "mode", "reason", "stopped", "cutoff_days", "candidates", "candidates_gb", "next_run",
+              "next_run_gb", "compressed", "removed_plain", "plain_held", "in_gb", "freed_gb", "remaining",
+              "remaining_gb", "held", "held_gb", "held_reasons", "skipped", "disk_free_gb"):
+        out[k] = lr.get(k)
+    out["failed"] = lr.get("failed") or []
+    out["conflicts"] = lr.get("conflicts") or []
+    files = restored = 0
+    freed = 0
+    try:
+        with open(os.path.join(rdir, "manifest.jsonl"), encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                act = r.get("action")
+                if act == "compressed":
+                    files += 1
+                    freed += (r.get("size") or 0) - (r.get("gz_size") or 0)
+                elif act == "removed_plain":
+                    files += 1
+                    freed += r.get("size") or 0
+                elif act == "restored":
+                    restored += 1
+    except OSError:
+        pass
+    out.update(lifetime_files=files, lifetime_freed_gb=round(freed / 1e9, 1), lifetime_restored=restored)
     return out
 
 
@@ -1984,7 +2031,8 @@ def cycle_share(day: date) -> Dict[str, dict]:
     cycles: Dict[str, set] = defaultdict(set)
     for u in utc_dates(day):
         try:
-            fh = open(os.path.join(STATUS_DIR, f"cycle_log_{u}.csv"), encoding="utf-8", errors="replace")
+            fh = imm_logfiles.open_text(imm_logfiles.resolve(os.path.join(STATUS_DIR, f"cycle_log_{u}.csv")),
+                                        encoding="utf-8", errors="replace")
         except OSError:
             continue
         idx = None
@@ -2609,6 +2657,30 @@ def render_evidence(ev: dict) -> str:
           f"{m.get('status_dir_gb')} GB growing {m.get('growth_gb_day')} GB/day -> ~{m.get('days_to_full')} days to full; "
           f"stale .tmp {m.get('stale_tmp')}; research token {m.get('token_age_days')} days old (1-year life); "
           f"dashboard {m.get('dashboard_age_min')} min old; status {m.get('status_age_min')} min old; memory {m.get('memory')}")
+    rt = sy.get("retention") or {}
+    if rt.get("present"):
+        why = f" ({rt['reason']})" if rt.get("reason") else ""
+        stale = " STALE: no run in 30 h" if (rt.get("age_h") or 0) > 30 else ""
+        if rt.get("mode") == "apply":
+            what = (f"{rt.get('compressed')} files compressed ({rt.get('in_gb')} GB in), {rt.get('freed_gb')} GB "
+                    f"freed; {rt.get('remaining')} files ({rt.get('remaining_gb')} GB) past the cutoff still plain"
+                    + (f"; stopped at {rt['stopped']}" if rt.get("stopped") else ""))
+        elif rt.get("mode") == "dry-run":
+            what = (f"would compress {rt.get('candidates')} files ({rt.get('candidates_gb')} GB); an --apply run "
+                    f"takes {rt.get('next_run')} ({rt.get('next_run_gb')} GB)")
+        else:
+            what = "nothing done"
+        a(f"Log retention (imm_log_retention, R-261124-03): last run {rt.get('ts')} ({rt.get('age_h')} h ago){stale}, "
+          f"mode {rt.get('mode')}{why}: {what}; {rt.get('held')} old files held {rt.get('held_reasons') or {}}; "
+          f"skipped {rt.get('skipped') or {}}; failed {len(rt['failed'])}, conflicts {len(rt['conflicts'])}; "
+          f"lifetime {rt.get('lifetime_files')} files, {rt.get('lifetime_freed_gb')} GB freed, "
+          f"{rt.get('lifetime_restored')} restored")
+        bad = rt["failed"] + rt["conflicts"]
+        if bad:
+            a("Log retention FAILURES (the original is kept; read run-logs/incentive-mm/retention/run.log): "
+              + "; ".join(f"{x.get('file')}: {x.get('reason')}" for x in bad[:10]))
+    elif "retention" in sy:
+        a("Log retention: no run yet (Task Scheduler 'KL imm log-retention', 02:40 ET)")
     # 7 data
     dh = ev.get("data") or {}
     a("\n## 7. Data health (sizes of the UTC day's sink files)")

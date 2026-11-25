@@ -637,6 +637,38 @@ class CycleParseTests(unittest.TestCase):
         self.assertEqual(len(out["cycles"]), 4)
         self.assertEqual(out["last"]["KXA-1"]["_ts"], _ts("2026-09-28T06:01:00Z"))
 
+    def test_a_compressed_day_lists_and_parses_the_same(self):
+        # R-261124-03: imm_log_retention gzips day files older than 35 days in place
+        import imm_log_retention as ret
+        path = self._write([
+            self._row("2026-09-28T04:00:00Z", "KXA-1", 0.1, 864, 10, 0, 40, ""),
+            self._row("2026-09-28T04:00:30Z", "KXA-1", 0.1, 864, 10, 0, 40, ""),
+            self._row("2026-09-28T04:01:00Z", "KXA-1", 0.2, 864, 10, 5, 40, 45),
+        ])
+        snap = os.path.join(self.dir, "selection_snapshot_2026-09-28.jsonl")
+        with open(snap, "w", encoding="utf-8") as f:
+            for ts in ("2026-09-28T04:00:00Z", "2026-09-28T05:00:00Z", "2026-09-28T05:00:00Z"):
+                f.write(json.dumps({"ts": ts, "ticker": "KXA-1"}) + "\n")
+        old = time.time() - 40 * 86400
+        os.utime(path, (old, old))
+        old_dir = dash.STATUS_DIR
+        dash.STATUS_DIR = self.dir
+        try:
+            plain = dash.parse_cycle_file(path, keep_last=True)
+            rows = list(dash.iter_jsonl(snap))
+            last = dash.read_last_snapshot()
+            for p in (path, snap):
+                self.assertEqual(ret.compress_file(p)["action"], "compressed")
+            got = dash.day_files("cycle_log", "csv", "0000-00-00")
+            self.assertEqual(got, [("2026-09-28", path + ".gz")])
+            self.assertEqual(dash.parse_cycle_file(path + ".gz", keep_last=True), plain)
+            self.assertEqual(list(dash.iter_jsonl(snap + ".gz")), rows)
+            self.assertEqual(dash.read_last_snapshot(), last)
+            self.assertEqual(len(last[0]), 2)
+            self.assertTrue(dash.file_complete("2026-09-28", path + ".gz", time.time()))
+        finally:
+            dash.STATUS_DIR = old_dir
+
     def test_half_written_last_cycle_falls_back(self):
         rows = []
         for t in ("KXA-1", "KXB-1", "KXC-1", "KXD-1"):
