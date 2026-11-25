@@ -309,5 +309,129 @@ class SessionAnchorTests(unittest.TestCase):
             wf.FETCH, wf.CLOSE_FETCH, wf.CLOSES_FILE, wf.ANCHOR_FETCH = saved
 
 
+class FxAnchorTests(unittest.TestCase):
+    """Jack 2026-11-23 "Yes, build it": while FX trades every FX pair re-anchors to the median
+    venue / Yahoo ratio of its last 6 complete 5-min bars (none in the 5 PM ET roll), so Kraken's
+    USD/CAD book falling apart at the 11/20 close (its close refused, 3.04% off Yahoo) costs the
+    weekend only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "closes.json")
+        self.t0 = U(2026, 11, 20, 22)                     # Fri 11/20 close; reopen Sun 11/22 22:00Z
+        self.now = U(2026, 11, 23, 21, 20)                # Mon 4:20 PM ET: the 21:15 bar in progress
+        b0 = U(2026, 11, 23, 20, 40)
+        self.ybars = [(b0 + timedelta(minutes=5 * k), 1.4360 + k / 1e5) for k in range(8)]   # 20:40 .. 21:15
+        self.c_last = 1.4360 + 6 / 1e5                     # the 21:10 bar
+        self.vratio = {t: 0.9994 for t, _c in self.ybars}
+        self.vratio[b0] = 0.5                             # 20:40: seven bars back, not used
+        self.vratio[b0 + timedelta(minutes=15)] = 0.95    # 20:55: one stray bar, the median holds
+        self.vratio[b0 + timedelta(minutes=35)] = 0.5     # 21:15: in progress, not used
+        self.vcalls = []
+        # the Friday the week starts from: AUD kept, USD/CAD refused (no close)
+        with open(self.path, "w") as fh:
+            json.dump({"2026-11-20T22:00Z": {"close": {"KXAUDUSDEVENT": 0.66230}, "source": {"KXAUDUSDEVENT":
+                       "yahoo:AUDUSD=X"}, "venue_ref": {"KXAUDUSDEVENT": 0.66133, "KXUSDCADEVENT": 1.391655}}}, fh)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fetch(self, syms=("CAD=X", "AUDUSD=X")):
+        def ybars(sym, now):
+            if sym not in syms:
+                raise ValueError("no chart")
+            k = 1.0 if sym == "CAD=X" else 0.4612
+            return [(t, c * k) for t, c in self.ybars]
+
+        def vbars(src, sym, starts):
+            self.vcalls.append((src, sym, tuple(starts)))
+            k = 1.0 if sym == "USDCAD" else 0.4612
+            return {t: c * k * self.vratio[t] for t, c in self.ybars if t in starts}
+        return {"yahoo_bars": ybars, "venue_bars": vbars}
+
+    def book(self):
+        with open(self.path) as fh:
+            return json.load(fh)["2026-11-20T22:00Z"]
+
+    def test_the_median_of_the_last_six_complete_bars_and_the_venue_at_them(self):
+        out, failed = wf.fx_anchors(self.t0, self.now, fetch=self.fetch(), path=self.path)
+        c, r, why = out["KXUSDCADEVENT"]
+        self.assertAlmostEqual(c, self.c_last)                          # the 21:10 bar, not the 21:15 in progress
+        self.assertAlmostEqual(r / c, 0.9994)                           # the 0.95 stray bar leaves it alone
+        self.assertIn("kraken:USDCAD", why)
+        self.assertIn(("kraken", "USDCAD", tuple(U(2026, 11, 23, 20, 45) + timedelta(minutes=5 * k)
+                                                 for k in range(6))), self.vcalls)
+        self.assertIn("KXEURUSDEVENT", failed)                          # no chart for it here: kept as it was
+        wk = self.book()
+        self.assertAlmostEqual(wk["close"]["KXUSDCADEVENT"], self.c_last)
+        self.assertAlmostEqual(wk["venue_ref"]["KXUSDCADEVENT"], self.c_last * 0.9994)
+        # AUD's Friday values are kept under "friday"; USD/CAD had none to keep
+        self.assertEqual(wk["friday"]["close"], {"KXAUDUSDEVENT": 0.66230})
+        self.assertEqual(wk["friday"]["venue_ref"], {"KXAUDUSDEVENT": 0.66133})
+
+    def test_a_venue_far_off_yahoo_is_refused_and_the_weeks_last_anchor_stands(self):
+        wf.fx_anchors(self.t0, self.now, fetch=self.fetch(), path=self.path)
+        self.vratio = {t: 0.97 for t in self.vratio}                   # the venue's book collapses
+        out, failed = wf.fx_anchors(self.t0, self.now + timedelta(minutes=15), fetch=self.fetch(), path=self.path)
+        self.assertNotIn("KXUSDCADEVENT", out)
+        self.assertIn("-3.00% off yahoo:CAD=X", failed["KXUSDCADEVENT"])
+        self.assertAlmostEqual(self.book()["venue_ref"]["KXUSDCADEVENT"], self.c_last * 0.9994)
+        self.assertEqual(self.book()["friday"]["close"], {"KXAUDUSDEVENT": 0.66230})   # not re-recorded
+
+    def test_the_5pm_roll_is_left_out(self):
+        b0 = U(2026, 11, 23, 21, 20)                      # 4:20-5:15 PM ET
+        self.ybars = [(b0 + timedelta(minutes=5 * k), 1.4360 + k / 1e5) for k in range(12)]
+        self.vratio = {t: (1.004 if wf._in_roll(t) else 0.9994) for t, _c in self.ybars}
+        out, _f = wf.fx_anchors(self.t0, U(2026, 11, 23, 22, 20), fetch=self.fetch(), path=self.path)
+        c, r, why = out["KXUSDCADEVENT"]
+        self.assertIn("5m bar 2026-11-23T21:50Z", why)                  # 4:50 PM ET: the last bar before the roll
+        self.assertAlmostEqual(r / c, 0.9994)
+
+    def test_no_anchor_on_a_weekend_before_three_bars_or_with_the_switch_off(self):
+        self.assertEqual(wf.fx_anchors(self.t0, U(2026, 11, 21, 12), fetch=self.fetch(), path=self.path), ({}, {}))
+        # Sunday 5:27 PM ET: the 5:00-5:10 bars are the roll, two bars since
+        self.ybars = [(U(2026, 11, 22, 22, m), 1.4361) for m in (0, 5, 10, 15, 20)]
+        self.vratio = {t: 0.9994 for t, _c in self.ybars}
+        out, failed = wf.fx_anchors(self.t0, U(2026, 11, 22, 22, 27), fetch=self.fetch(), path=self.path)
+        self.assertEqual(out, {})
+        self.assertIn("2 complete Yahoo 5-min bar(s)", failed["KXUSDCADEVENT"])
+        saved = wf.FX_ANCHOR_ON
+        try:
+            wf.FX_ANCHOR_ON = False
+            self.assertEqual(wf.fx_anchors(self.t0, self.now, fetch=self.fetch(), path=self.path), ({}, {}))
+        finally:
+            wf.FX_ANCHOR_ON = saved
+
+    def test_the_weekday_fair_prices_usdcad_from_the_anchor(self):
+        saved = (wf.FETCH, wf.CLOSE_FETCH, wf.CLOSES_FILE, wf.ANCHOR_FETCH)
+        try:
+            wf.CLOSES_FILE, wf.ANCHOR_FETCH = self.path, self.fetch(syms=("CAD=X",))
+            wf.CLOSE_FETCH = {"yahoo": lambda sym, t0: (_ for _ in ()).throw(ValueError("refetch")),
+                              "kalshi": lambda sym, t0: (_ for _ in ()).throw(ValueError("not settled"))}
+            mid = self.c_last * 0.9994 * 1.001                         # Kraken now: 0.1% over the anchor
+            wf.FETCH = {k: (lambda sym, starts=None, need_ref=True: (None if not need_ref else 1.0, mid))
+                        for k in ("hl", "kraken", "bitso")}
+            rows = [{"ticker": "KXUSDCADEVENT-25NOV261100-T14400", "floor_strike": 1.44, "strike_type": "greater",
+                     "close_time": "2026-11-25T16:00:00Z"}]
+            out = os.path.join(self.tmp.name, "fair.json")
+            rc = wf.main(out, True, now=self.now, list_markets=lambda s: rows if s == "KXUSDCADEVENT" else [])
+            self.assertEqual(rc, 0)
+            with open(out) as fh:
+                doc = json.load(fh)
+            self.assertNotIn("KXUSDCADEVENT", doc["failed"])
+            self.assertAlmostEqual(doc["spot"]["KXUSDCADEVENT"], self.c_last * 1.001, places=6)
+            self.assertIn("KXUSDCADEVENT-25NOV261100-T14400", doc["fair"])
+        finally:
+            wf.FETCH, wf.CLOSE_FETCH, wf.CLOSES_FILE, wf.ANCHOR_FETCH = saved
+
+    def test_a_new_weekend_close_keeps_the_weeks_other_keys(self):
+        wf.fx_anchors(self.t0, self.now, fetch=self.fetch(), path=self.path)
+        close, _src, _f = wf.weekend_closes(self.t0, {"KXEURUSDEVENT": 1.0967},
+                                            fetch={"yahoo": lambda sym, t0: 1.0970, "kalshi": lambda sym, t0: 1.0},
+                                            path=self.path)
+        self.assertAlmostEqual(close["KXUSDCADEVENT"], self.c_last)     # the anchor, not refetched
+        self.assertIn("friday", self.book())                             # the write kept it
+
+
 if __name__ == "__main__":
     unittest.main()

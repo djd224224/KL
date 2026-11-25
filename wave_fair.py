@@ -46,7 +46,10 @@ moves:
   * "floor": 0 -- a ticker with no fair rests NOTHING (no 2c / 98c floor sides): a fair is
     required (the weekend keeps the 2c floors);
   * valid 20 min (one missed refresh stands it aside), and a failed source reuses its last
-    price only under 20 min old.
+    price only under 20 min old;
+  * THE FX PAIRS RE-ANCHOR EACH RUN (2026-11-23, fx_anchors): their last complete Yahoo 5-min
+    bars and the venue's at the same minutes replace the Friday close, so a venue whose book fell
+    apart at the close (Kraken USD/CAD 11/20) costs the weekend, not the week.
 
 Writes {"at", "mode", "close_at", "reopen", "close", "spot", "live", "failed", "vol_d",
 "margin", "margin_extra", "floor", "valid_until", "fair"} to OUT atomically; pvd_wave_tune
@@ -177,39 +180,55 @@ def _ms(t: datetime) -> int:
     return int(t.timestamp() * 1000)
 
 
+def bars_hl(coin: str, starts: list) -> dict:
+    """{bar start: close} of the Hyperliquid perp's 5-min bars from starts[0] to starts[-1]."""
+    bars = _get("https://api.hyperliquid.xyz/info", {"type": "candleSnapshot", "req": {
+        "coin": coin, "interval": "5m", "startTime": _ms(starts[0]), "endTime": _ms(starts[-1]) + 60_000}})
+    return {datetime.fromtimestamp(int(b["t"]) / 1000, timezone.utc): float(b["c"]) for b in bars or []}
+
+
+def bars_kraken(pair: str, starts: list) -> dict:
+    """{bar start: close} of Kraken's 5-min bars from starts[0] (it serves ~60 h back)."""
+    o = _get(f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=5&since={int(starts[0].timestamp()) - 300}")
+    rows = next(v for k, v in o["result"].items() if k != "last")
+    return {datetime.fromtimestamp(int(r[0]), timezone.utc): float(r[4]) for r in rows}
+
+
+def bars_bitso(book: str, starts: list) -> dict:
+    """{bar start: close} of Bitso's 5-min buckets from starts[0] to starts[-1]."""
+    o = _get(f"https://api.bitso.com/api/v3/ohlc?book={book}&time_bucket=300"
+             f"&start={_ms(starts[0])}&end={_ms(starts[-1]) + 300_000}")
+    return {datetime.fromtimestamp(int(b["bucket_start_time"]) / 1000, timezone.utc): float(b["last_rate"])
+            for b in o["payload"]}
+
+
+VENUE_BARS = {"hl": bars_hl, "kraken": bars_kraken, "bitso": bars_bitso}
+
+
+def venue_bars(src: str, sym: str, starts: list) -> dict:
+    return VENUE_BARS[src](sym, starts)
+
+
 def fetch_hl(coin: str, starts: list = None, need_ref: bool = True, _cache={}) -> tuple:
     starts = starts or REF_STARTS
     if "mids" not in _cache:
         meta, ctx = _get("https://api.hyperliquid.xyz/info", {"type": "metaAndAssetCtxs", "dex": "xyz"})
         _cache["mids"] = {u["name"]: float(c.get("midPx") or c.get("markPx")) for u, c in zip(meta["universe"], ctx)
                           if (c.get("midPx") or c.get("markPx"))}
-    ref = None
-    if need_ref:
-        bars = _get("https://api.hyperliquid.xyz/info", {"type": "candleSnapshot", "req": {
-            "coin": coin, "interval": "5m", "startTime": _ms(starts[0]), "endTime": _ms(starts[-1]) + 60_000}})
-        ref = _ref({datetime.fromtimestamp(int(b["t"]) / 1000, timezone.utc): float(b["c"]) for b in bars}, starts)
+    ref = _ref(bars_hl(coin, starts), starts) if need_ref else None
     return ref, _cache["mids"][coin]
 
 
 def fetch_kraken(pair: str, starts: list = None, need_ref: bool = True) -> tuple:
     starts = starts or REF_STARTS
-    ref = None
-    if need_ref:
-        o = _get(f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=5&since={int(starts[0].timestamp()) - 300}")
-        rows = next(v for k, v in o["result"].items() if k != "last")
-        ref = _ref({datetime.fromtimestamp(int(r[0]), timezone.utc): float(r[4]) for r in rows}, starts)
+    ref = _ref(bars_kraken(pair, starts), starts) if need_ref else None
     t = next(iter(_get(f"https://api.kraken.com/0/public/Ticker?pair={pair}")["result"].values()))
     return ref, (float(t["b"][0]) + float(t["a"][0])) / 2
 
 
 def fetch_bitso(book: str, starts: list = None, need_ref: bool = True) -> tuple:
     starts = starts or REF_STARTS
-    ref = None
-    if need_ref:
-        o = _get(f"https://api.bitso.com/api/v3/ohlc?book={book}&time_bucket=300"
-                 f"&start={_ms(starts[0])}&end={_ms(starts[-1]) + 300_000}")
-        ref = _ref({datetime.fromtimestamp(int(b["bucket_start_time"]) / 1000, timezone.utc): float(b["last_rate"])
-                    for b in o["payload"]}, starts)
+    ref = _ref(bars_bitso(book, starts), starts) if need_ref else None
     t = _get(f"https://api.bitso.com/v3/ticker/?book={book}")["payload"]
     return ref, (float(t["bid"]) + float(t["ask"])) / 2
 
@@ -279,7 +298,7 @@ def fetch_hl_bar(coin: str, start: datetime, get=None) -> float:
     raise ValueError(f"no {coin} bar at {start:%Y-%m-%dT%H:%MZ}")
 
 
-ANCHOR_FETCH = {"yahoo_bars": fetch_yahoo_bars, "hl_bar": fetch_hl_bar}
+ANCHOR_FETCH = {"yahoo_bars": fetch_yahoo_bars, "hl_bar": fetch_hl_bar, "venue_bars": venue_bars}
 
 
 def _session_bar(t: datetime, now: datetime) -> bool:
@@ -340,6 +359,103 @@ def session_anchors(t0: datetime, now: datetime, fetch=None, path: str = None) -
     for s in list(failed):
         if close.get(s) and refs.get(s):
             del failed[s]                     # the week's last anchor stands
+    return out, failed
+
+
+# THE WEEKDAY FX ANCHOR (Jack 2026-11-23, "Yes, build it"). The weekend close is only as good as
+# the 24/7 venue's price at it, and some venues' books fall apart as FX shuts: on 11/20 Kraken's
+# USD/CAD went 1.431 -> 1.380 (20Z) -> 1.270 (21Z) -> 1.245 (22Z) -> 1.043 (23Z). The median of
+# its four bars to the close, 1.39166, sat 3.04% under Yahoo's 1.4339, so the close was refused
+# -- right for the weekend -- and with the Friday close the only anchor, USD/CAD had no fair all
+# week, though Kraken traded normally again from Sunday (1.4359 vs Yahoo 1.4368 on 11/23). AUD
+# wicked too (0.6439 at 22Z): its kept venue close sat 0.146% under Yahoo's, so the weekday spot
+# read 0.08% high (~1c at the money a month out). So while FX trades, each run re-anchors every FX
+# pair: its last FX_ANCHOR_BARS complete Yahoo 5-min bars since the Sunday reopen (below), the
+# venue's 5-min bars at the same minutes, and the median venue / Yahoo ratio over them --
+# refused, as the Friday close, past CLOSE_CHECK_PCT. Kept under the week's key in CLOSES_FILE
+# as the pair's "close" (Yahoo's last bar) and "venue_ref" (that x the ratio), which the bot's
+# fx_event_fair reads when the file changes: spot = the venue now / the ratio. The Friday values
+# are kept under "friday". A refused or failed anchor keeps the week's last one (or the Friday
+# close); none at all = no fair, as before. Weekends are unchanged; the metals keep Kalshi's weekly
+# settlement (no Yahoo spot price); the S&P has its own session anchor. PVD_FX_ANCHOR=0 = off.
+FX_ANCHOR = {s: sym for s, (kind, sym) in CLOSE_SRC.items() if kind == "yahoo"}   # the six FX pairs
+# Measured 11/23 19:50-22:10Z, venue / Yahoo per 5-min bar: within ~+-0.03% of each pair's level
+# most of the hour, single bars 0.05-0.1% off around the 5 PM ET roll (AUD -0.127%, MXN +0.104%,
+# CAD +0.043% at 22:00-22:10Z), and Hyperliquid's GBP perp skips bars it didn't trade and stepped
+# -0.10% -> +0.035% at 21:35Z. So: the median of the last 6 complete bars (30 min: a stray bar or
+# two don't move it, a step shows within ~15 min), at least 3 the venue has, none starting in
+# the daily roll (4:55-5:15 PM ET, Sunday's open too), 90 min back at most.
+FX_ANCHOR_BARS = 6
+FX_ANCHOR_MIN_BARS = 3
+FX_ANCHOR_LOOKBACK_MIN = 90
+FX_ROLL_ET = ((16, 55), (17, 15))           # [from, to) ET start of a bar left out
+FX_ANCHOR_ON = os.environ.get("PVD_FX_ANCHOR", "1") != "0"
+FX_ANCHOR_TAG = "weekday anchor"
+
+
+def _in_roll(t: datetime) -> bool:
+    lo = t.astimezone(ET)
+    return FX_ROLL_ET[0] <= (lo.hour, lo.minute) < FX_ROLL_ET[1]
+
+
+def fx_anchors(t0: datetime, now: datetime, fetch=None, path: str = None) -> tuple:
+    """WEEKDAY FX ANCHOR: ({series: (close, venue_ref, source)} kept this run, {series: why not}).
+    Nothing on a weekend, with the switch off, or without the Yahoo / venue bar readers."""
+    fetch = ANCHOR_FETCH if fetch is None else fetch
+    path = path or CLOSES_FILE
+    if not FX_ANCHOR_ON or _shut(now) or "yahoo_bars" not in fetch or "venue_bars" not in fetch:
+        return {}, {}
+    _c, reopen, _s = fx_shut_window(now)
+
+    def ok(t):
+        return (t >= reopen and not _shut(t) and not _in_roll(t) and t + timedelta(minutes=6) <= now
+                and now - t <= timedelta(minutes=FX_ANCHOR_LOOKBACK_MIN))
+    out, failed = {}, {}
+    for s, sym in FX_ANCHOR.items():
+        src, vsym = PROXY[s]
+        try:
+            ys = [(t, c) for t, c in fetch["yahoo_bars"](sym, now) if ok(t) and c > 0][-FX_ANCHOR_BARS:]
+            if len(ys) < FX_ANCHOR_MIN_BARS:
+                raise ValueError(f"{len(ys)} complete Yahoo 5-min bar(s) in the last {FX_ANCHOR_LOOKBACK_MIN} min "
+                                 f"outside the 5 PM ET roll")
+            vb = fetch["venue_bars"](src, vsym, [t for t, _c in ys])
+            pairs = [(t, c, float(vb[t])) for t, c in ys if vb.get(t)]
+            if len(pairs) < FX_ANCHOR_MIN_BARS:
+                raise ValueError(f"the venue has {len(pairs)} of those {len(ys)} bars")
+            ratio = statistics.median(v / c for _t, c, v in pairs)
+            off = 100 * (ratio - 1)
+            if abs(off) > CLOSE_CHECK_PCT:
+                raise ValueError(f"{src}:{vsym} is {off:+.2f}% off yahoo:{sym} over {len(pairs)} bars to "
+                                 f"{pairs[-1][0]:%m-%d %H:%MZ}")
+            c_last = ys[-1][1]
+            out[s] = (float(c_last), float(c_last) * ratio,
+                      f"{FX_ANCHOR_TAG}: yahoo:{sym} 5m bar {ys[-1][0]:%Y-%m-%dT%H:%MZ}, {src}:{vsym} "
+                      f"{off:+.3f}% (median of {len(pairs)} bars)")
+        except Exception as ex:  # noqa: BLE001
+            failed[s] = f"{FX_ANCHOR_TAG} yahoo:{sym}/{src}:{vsym}: {str(ex)[:120]}"
+    if out:
+        key = t0.strftime("%Y-%m-%dT%H:%MZ")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                book = json.load(fh)
+        except (OSError, ValueError):
+            book = {}
+        wk = dict(book.get(key) or {})
+        close, src_, refs = (dict(wk.get("close") or {}), dict(wk.get("source") or {}),
+                             dict(wk.get("venue_ref") or {}))
+        fri = {k: dict(v) for k, v in (wk.get("friday") or {"close": {}, "venue_ref": {}, "source": {}}).items()}
+        for s, (c, r, why) in out.items():
+            if s in close and s not in fri["close"] and not str(src_.get(s, "")).startswith(FX_ANCHOR_TAG):
+                fri["close"][s], fri["venue_ref"][s], fri["source"][s] = close[s], refs.get(s), src_.get(s)
+            close[s], refs[s], src_[s] = c, r, why
+        book[key] = dict(wk, close=close, source=src_, venue_ref=refs, friday=fri,
+                         at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        book = {k: v for k, v in sorted(book.items())[-8:]}      # the last 8 weekends
+        tmp = path + ".tmp"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(book, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
     return out, failed
 
 
@@ -432,8 +548,9 @@ def weekend_closes(t0: datetime, venue_ref: dict, fetch=None, path: str = None) 
         except Exception as ex:  # noqa: BLE001
             failed[s] = f"close {kind}:{sym}: {str(ex)[:120]}"
     if added:
-        book[key] = {"close": close, "source": src, "venue_ref": refs,
-                     "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        # (dict(wk, ...): the week's other keys -- the weekday anchors' "friday" record -- stay)
+        book[key] = dict(wk, close=close, source=src, venue_ref=refs,
+                         at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
         book = {k: v for k, v in sorted(book.items())[-8:]}      # the last 8 weekends
         tmp = path + ".tmp"
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -504,6 +621,13 @@ def main(out_path: str, live_on: bool, now: datetime = None, list_markets=None) 
         except (OSError, ValueError):
             prev = {}
         _anc, a_fail = session_anchors(t0, now)       # the S&P's anchor first: kept_refs reads it
+        # ...and on weekdays every FX pair's (a refused one keeps the week's last: not a failure)
+        fx_anc, fx_fail = fx_anchors(t0, now) if weekday else ({}, {})
+        if fx_anc or fx_fail:
+            print("weekday FX anchors: "
+                  + ", ".join(f"{s.replace('KX', '').replace('EVENT', '')} {100 * (r / c - 1):+.3f}%"
+                              for s, (c, r, _w) in sorted(fx_anc.items()))
+                  + "".join(f"; KEPT LAST ({why})" for _s, why in sorted(fx_fail.items())))
         live, failed = live_moves(prev, now, t0=t0, refs=kept_refs(t0), reuse_min=reuse)
         for s, why in a_fail.items():
             failed.setdefault(s, why)
