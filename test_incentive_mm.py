@@ -33460,17 +33460,32 @@ class TestAwardsByKalshiTag(unittest.TestCase):
                 self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
                 self.assertEqual(imm.series_max_position(s),
                                  2.0 * imm.MAX_POSITION_CONTRACTS, s)
-            for s in ("KXGRAMAOTY", "KXGRAMBNA"):
+            # ...and the count ladder at its own x2 (Jack 2026-11-24: "also
+            # x2 KXGRAMMYCOUNT"), not a winner series by name
+            self.assertEqual(imm.GRAMMY_COUNT_SIZE_MULT, 2.0)
+            self.assertIn("GRAMMY_COUNT_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
+            self.assertEqual(imm.applied_mention_mult("KXGRAMMYCOUNT"), 2.0)
+            self.assertEqual(imm.series_max_position("KXGRAMMYCOUNT"),
+                             2.0 * imm.MAX_POSITION_CONTRACTS)
+            for s in ("KXGRAMAOTY", "KXGRAMBNA", "KXGRAMMYCOUNT"):
                 self.assertEqual(imm.SERIES_OVERRIDES[s],
                                  imm.replace(parent, size_mult=2.0), s)
                 self.assertTrue(imm.awards_auto_rules(s), s)   # still a member
                 self.assertEqual(imm.event_top_n_for(s), 5, s)
-            # the count ladder (no period yet) and another show stay x1 on the
-            # parent's clone; the nominee families are not winners
-            for s in ("KXGRAMMYCOUNT", "KXGAMEAWARDS"):
-                self.assertEqual(imm.SERIES_OVERRIDES[s], parent, s)
-                self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
-                self.assertEqual(imm.event_top_n_for(s), 5, s)
+            # another show stays x1 on the parent's clone
+            self.assertEqual(imm.SERIES_OVERRIDES["KXGAMEAWARDS"], parent)
+            self.assertEqual(imm.applied_mention_mult("KXGAMEAWARDS"), 1.0)
+            self.assertEqual(imm.event_top_n_for("KXGAMEAWARDS"), 5)
+        # each knob reverts on its own
+        imm.SERIES_OVERRIDES.pop("KXGRAMMYCOUNT", None)
+        with mock.patch.object(imm, "GRAMMY_COUNT_SIZE_MULT", 1.0):
+            imm.ensure_family_override("KXGRAMMYCOUNT")
+            self.assertEqual(imm.SERIES_OVERRIDES["KXGRAMMYCOUNT"], parent)
+            self.assertEqual(imm.grammy_size_mult("KXGRAMAOTY"), 2.0)
+        with mock.patch.object(imm, "GRAMMY_WIN_SIZE_MULT", 1.0):
+            self.assertEqual(imm.grammy_size_mult("KXGRAMAOTY"), 1.0)
+            self.assertEqual(imm.grammy_size_mult("KXGRAMMYCOUNT"), 2.0)
+        self.assertEqual(imm.grammy_size_mult("KXGAMEAWARDS"), 1.0)
         for s in ("KXGRAMMYCOUNT", "KXGRAMMYNOM", "KXGRAMMYNOMAOTY",
                   "KXGRAMMYNOMCOUNTKL", "KXGAMEAWARDS"):
             self.assertFalse(imm.grammy_win_series(s), s)

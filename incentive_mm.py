@@ -7237,9 +7237,10 @@ def awards_auto_rules(series: str) -> bool:
     parent = SERIES_OVERRIDES.get(AWARDS_AUTO_PARENT)
     return awards_extra_series(series) and (
         ov is None or ov == parent
-        # a Grammy winner category clones the rule set at its own size
-        # (GRAMMY_WIN_SIZE_MULT, 2026-11-24): still a member, same 5/event
-        or (grammy_win_series(series) and parent is not None
+        # a Grammy winner category / the count ladder clones the rule set at
+        # its own size (grammy_size_mult, 2026-11-24): still a member, same
+        # 5/event
+        or (grammy_size_mult(series) != 1.0 and parent is not None
             and replace(ov, size_mult=parent.size_mult) == parent))
 
 
@@ -7259,12 +7260,19 @@ def awards_auto_rules(series: str) -> bool:
 # 5/event cap and the stand-down (00:00 ET Feb 6 2027) are unchanged.
 # KXGRAMMY takes it on its own override (beside the AWARDS_SERIES loop); a
 # KXGRAM<CATEGORY> tag member in ensure_family_override, on top of the awards
-# rule set it clones. NOT the nominees (KXGRAMMYNOM*, their own x2) nor
-# KXGRAMMYCOUNT (enrolled 11/24, no period yet): the (?!MY) keeps every
-# KXGRAMMY* name out of the category pattern. IMM_GRAMMY_WIN_SIZE_MULT=1
-# reverts (a *_SIZE_MULT name, so env_overrides.txt can carry it).
+# rule set it clones. NOT the nominees (KXGRAMMYNOM*, their own x2): the
+# (?!MY) keeps every KXGRAMMY* name out of the category pattern.
+# IMM_GRAMMY_WIN_SIZE_MULT=1 reverts (a *_SIZE_MULT name, so
+# env_overrides.txt can carry it).
+# KXGRAMMYCOUNT x2 TOO (Jack 2026-11-24: "also x2 KXGRAMMYCOUNT"), the
+# "At least N" Grammy-win ladder per artist hand-enrolled the same day
+# (59 programs, $4,830, 11/25 21:01Z - 11/29 05:00Z; no period of its own
+# yet). The same wire on the awards rule set it clones, its own knob so it
+# reverts apart from the winners: IMM_GRAMMY_COUNT_SIZE_MULT=1.
 GRAMMY_WIN_SIZE_MULT = _env_float("IMM_GRAMMY_WIN_SIZE_MULT", 2.0)
+GRAMMY_COUNT_SIZE_MULT = _env_float("IMM_GRAMMY_COUNT_SIZE_MULT", 2.0)
 GRAMMY_WIN_SERIES = "KXGRAMMY"
+GRAMMY_COUNT_SERIES = "KXGRAMMYCOUNT"
 GRAMMY_WIN_CATEGORY_RE = re.compile(r"KXGRAM(?!MY)[A-Z0-9]+")
 
 
@@ -7273,6 +7281,14 @@ def grammy_win_series(series: str) -> bool:
     (KXGRAMAOTY, KXGRAMBNA); never a KXGRAMMY* nominee / count series."""
     return series == GRAMMY_WIN_SERIES or bool(
         GRAMMY_WIN_CATEGORY_RE.fullmatch(series))
+
+
+def grammy_size_mult(series: str) -> float:
+    """The Grammy family size a series takes (2026-11-24): the winners'
+    GRAMMY_WIN_SIZE_MULT, KXGRAMMYCOUNT's GRAMMY_COUNT_SIZE_MULT, else 1."""
+    if series == GRAMMY_COUNT_SERIES:
+        return GRAMMY_COUNT_SIZE_MULT
+    return GRAMMY_WIN_SIZE_MULT if grammy_win_series(series) else 1.0
 
 
 # NFL GAME / SEASON FAMILIES, AUTO-ENROLLED (Jack 2026-10-12: "can you
@@ -13526,11 +13542,11 @@ def ensure_family_override(series: str) -> None:
             # family size (KXSUEZWEEKLY x2, 2026-10-11, FAMILY_X2_1011): a
             # graduate clones the scan's guard set, never that size.
             ov = replace(ov, size_mult=None)
-        if parent == AWARDS_AUTO_PARENT and grammy_win_series(series) \
-                and GRAMMY_WIN_SIZE_MULT != 1.0:
-            # a Grammy winner category by tag (KXGRAMAOTY, KXGRAMBNA): the
-            # awards rule set at the winners' size (2026-11-24)
-            ov = replace(ov, size_mult=GRAMMY_WIN_SIZE_MULT)
+        if parent == AWARDS_AUTO_PARENT and grammy_size_mult(series) != 1.0:
+            # a Grammy winner category by tag (KXGRAMAOTY, KXGRAMBNA) or the
+            # count ladder (KXGRAMMYCOUNT): the awards rule set at its
+            # Grammy size (2026-11-24)
+            ov = replace(ov, size_mult=grammy_size_mult(series))
         SERIES_OVERRIDES[series] = ov
         log(f"[IMM] {series}: family override inherited from {parent}")
         return
@@ -15414,6 +15430,7 @@ _CONFIG_CODE_KNOBS = (
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     "CONTROLS_SIZE_MULT",         # CONTROLS (2028 Senate) x6 (2026-11-24)
     "GRAMMY_WIN_SIZE_MULT",       # the Grammy winner families x2 (2026-11-24)
+    "GRAMMY_COUNT_SIZE_MULT",     # KXGRAMMYCOUNT x2 (2026-11-24)
     "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
     "SPRLVLDATE_SIZE_MULT",       # KXSPRLVLDATE x2 (2026-11-10)
     "GTEMP_SIZE_MULT",            # KXGTEMP x3 (2026-11-24)
