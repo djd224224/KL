@@ -14,6 +14,34 @@ Jack 2026-11-25: "create a skill that on a daily basis goes through IMM bot in i
 
 The pieces: `imm_review.py` collects the evidence and holds the ledger (no judgment, no model). This skill judges and writes. `send_imm_review.py` sends. `run_imm_daily_review.ps1` runs the three every morning. Jack's choices on 11/25: fixes go to him as plans that he approves with one text ("Plan + your yes"); the email lands around 06:30 ET beside the existing IMM emails; after two weeks (from 12/09) the review proposes which of those to retire.
 
+## The moat: why this gets better as the markets get harder
+
+Jack 2026-11-25: "the skill's daily iterative process should lead to compounding and building a moat on data, analysis, and process that allows it to continually get better even as the markets get more competitive".
+
+Other makers can copy a quote. They cannot copy months of our own measured outcomes, the models fitted to them, or a process that turns every lesson into a rule. Every run must add to all three. The collector maintains them in `daily_review/moat/`; the evidence pack shows them in section 10.
+
+| Moat | What compounds | Where | How a run uses it |
+|---|---|---|---|
+| Data | One row per family per day, kept forever: rewards, trading, net, fills, $ resting, mark-outs, and our **share of the reward pool** (from the cycle log). Plus every prediction, finding, verdict, config version and error signature. | family_daily.csv, counterfactual.jsonl, ledger.jsonl, config_manifest.jsonl, error_signatures.json | The base for every measurement. Never delete; propose a durable backup if none exists |
+| Analysis | Family priors shrunk toward the book (rewards and net per $1k resting, trading tax, mark-out, share). The edge watch (7 days vs the 21 before). Missed-market estimates netted by family tax. The review's own calibration. | priors.json, evidence section 10 | Rank by net, not by modelled reward; discount claims by the review's calibration; see erosion early |
+| Process | Verified fixes become playbook rules. Every bug class becomes a collector check. Rejections stand. Lessons get promoted into this skill. | playbook.md, history.md, imm_review.py | Apply proven rules to new families and waves before they cost money |
+
+**The competition lens.** When the edge watch shows a family eroding (pool share or rewards per $1k resting down 25%+ against its own last 3 weeks), work out why before proposing anything:
+- **more makers in the same books:** share down at steady size;
+- **we are sized past target:** share steady, reward per $ down;
+- **toxic flow:** mark-outs worse.
+
+Then, cheapest first:
+1. Re-target to the books where share holds; mid-price books beat tails, which are a size race.
+2. Size to target, not past it.
+3. Tighten protection only when mark-outs moved.
+4. Move capital to strengthening families.
+5. Retire a family whose net per $1k stays under the book for 3 straight weeks. That is a decision for Jack.
+
+Always look for edges others can't copy: families where our own fair, data feed or speed cuts the trading tax, and new programs we can enroll first. The unestimated pool is where those hide.
+
+**Every run adds to the moat.** It has a finding that improves data (a gap to log), analysis (a prior or check to add), or process (a rule to promote), or it says why none was warranted.
+
 ## 0. Invocation contract
 
 | Mode | How it starts | What you do |
@@ -51,7 +79,7 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 
 **Step 2. Memory.**
 - Run `python imm_review.py ledger list` and `python imm_review.py ledger due --day D`.
-- Read the last 60 lines of `run-logs/incentive-mm/daily_review/lessons.md`.
+- Read the last 60 lines of `run-logs/incentive-mm/daily_review/lessons.md` and all of `daily_review/moat/playbook.md` (rules that verified; apply them).
 - Read "Standing decisions" in `history.md` beside this file. Never re-suggest something Jack rejected unless the facts changed, and say what changed.
 
 **Step 3. How the day went.**
@@ -60,6 +88,7 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 - Give the risk numbers: Sharpe, drawdown, worst day, the trading/rewards "tax", net per $1k resting.
 - A dashboard tie-out MISMATCH is a P1 data finding.
 - Today-so-far and the live status line are context only, never the verdict.
+- Read evidence section 10 (the moat). An eroding family in the edge watch gets the competition-lens treatment above. A strengthening one is a candidate for more capital.
 
 **Step 4. Losses and adverse selection.** Take the 3 largest losers by |net| (events or series), plus any persistent loser not yet in the ledger.
 - **Split the loss:** carry re-marked (cr), carry settled (cs) or new fills. Old inventory moving is a sizing or exit question; new fills losing is a quoting question.
@@ -73,7 +102,7 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 - **Check git log before calling a gap open:** `git log --since=<date> --format="%h %ad %s" | grep -i <word>`, then grep the code for the knob (lesson 11/24).
 - **Propose the rule that would have stopped it, with its cost:** the rewards it gives up, measured with `python imm_review.py measure --pattern <regex> --split <date>` or from the family table. Show "$/day saved vs $/day forgone". Before cutting size anywhere, state the $/day given up against the collateral freed (Jack, 11/19).
 
-**Step 5. Missed markets** (counterfactual; every estimate is MODELLED and shown with the realisation factor):
+**Step 5. Missed markets** (counterfactual; every estimate is MODELLED). Rank by the NET estimate: reward x realisation x (1 - the family's trading tax, from the priors). A $10/day miss in a family that gives back 80% of its rewards is worth $2; quote it as such.
 - **Not enrolled with a real pool:** read the imm_unquoted call. An ADD or ADD WITH CARE whose tape makers are at or above zero and whose x1 clears $5/day is an enrollment suggestion. Name the file (extra_allow_series.json) and the cutoff rule it needs.
 - **Config gaps** (fail-closed, missing verified dates): list them. If two sources settle the date in minutes, put both in the plan; the row is written in apply mode with `imm_rows.py`.
 - **Capacity / economics / deliberate with a sizeable estimate:** ask whether the rule still earns its keep. Deliberate blocks get re-litigated only weekly, or when a new pool is large.
@@ -113,6 +142,8 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   - **failed:** no effect or harmful. A harmful one becomes a decision to revert, with the exact revert.
   - **inconclusive:** too few days or confounded. Say why. You may set a new metric with `eval_after_days` in the item's next finding row.
 - Also close items the evidence shows are resolved: signature gone 3+ days, or a commit fixed it (closure "fixed-elsewhere" with the sha).
+- **A verified item becomes a playbook rule** (findings.json "playbook"): the general lesson, which families it applies to, and the evidence id. Example: "a new event-ladder family starts at x1 with the sweep breaker on; size up only after 7 days with 4h mark-outs above -2c (R-261201-03)". The next runs apply it without re-learning it.
+- **Calibrate yourself:** evidence section 10 shows the review's realised / predicted ratio by kind. Scale today's impact estimates by it, and say so.
 
 **Step 8. Prioritise.**
 - Score = expected $/day (risk-adjusted, after the realisation factor) x confidence. P0/P1 ops go first.
@@ -178,6 +209,7 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   ],
   "evaluations": [{"id": "R-261118-03", "verdict": "verified", "before": "...", "after": "...", "delta_usd_day": 42.0, "note": "..."}],
   "closures": [{"id": "R-261120-01", "status": "fixed-elsewhere", "note": "f748498 shipped the guard 11/21"}],
+  "playbook": [{"rule": "the general rule a verified item taught", "applies_to": "families / waves it covers", "evidence": "R-261118-03"}],
   "lessons": ["one durable lesson about running this review, if any"]
 }
 ```
@@ -268,6 +300,12 @@ The email carries the exact-number tables from evidence.json, so don't paste the
   - open items whose fingerprint has not been seen for 7 days: close as `closed` with the reason.
 - **The review's own score** (`python imm_review.py ledger stats`): items raised, approved, verified, and verified $/day. Note false positives in `lessons`. If a kind keeps failing verification, say so and tighten the rule for raising it.
 - **Experiments:** at most 2 proposals with a control arm and a pre-registered metric, aimed at the biggest uncertainty in this week's numbers.
+- **The moat review:**
+  - **Asset growth:** family-days, share days, predictions, playbook rules, findings.
+  - **Priors drift:** families whose net per $1k moved most in 3 weeks.
+  - **The edge watch:** the 3-week trend and what the competition lens says to do.
+  - **The review's calibration:** if a kind runs 2x high, say so and tighten.
+  - **Durability:** the moat lives in run-logs, which has no backup. Until Jack approves a backup (R-261124-20), every Sunday names that risk.
 - **From 12/09:** propose which existing IMM emails the review now covers (each with what it would lose), as a decision.
 - **Lessons:** propose promoting durable lines from lessons.md into this skill's history.md. That is a decision, because it changes the skill.
 

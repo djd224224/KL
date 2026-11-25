@@ -36,6 +36,7 @@ The facts the runbook (`SKILL.md`) leans on. Sourced from the 11/25 survey of th
 | System | `incentive-mm-<local launch date>.log`, `config_history_<utc>.jsonl`, Task Scheduler (`KL *`), task logs, `health-alert.log`, `run-logs/sync-kl-main.log`, git, disk, token mtime | Signatures in `error_signatures.json` |
 | Data | sizes of each sink's UTC-day file vs its 14-day median | LOW < 0.3x, HIGH > 3x, MISSING when present 10+ of 14 days |
 | Changes | `git log` (local HEAD + origin/main), `config_manifest.jsonl` + `config_store/` (the reloadable files, versioned by the review since 11/25) | Commit subjects naming `R-YYMMDD-NN` mark that item shipped |
+| Moat (section 10) | `daily_review/moat/`:<br>- `family_daily.csv`: per day x family, from the day archive. `share` = sum(est_frac x pool_per_day) / sum(pool_per_day) over the cycle log's market-cycles, and `pool_cov` = the average pool $/day managed.<br>- `priors.json`: 30 days, shrunk with m = 5 days toward the book.<br>- `playbook.md`.<br>Plus the edge watch and the review's calibration from the ledger. | Share is our cut of the pool where we quote, the cleanest competition signal. The first run back-fills share for 7 days; older days carry none. |
 
 ## 3. Data map and reading recipes
 

@@ -86,12 +86,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # ---------------------------------------------------------------------------
 # Paths (configure() re-derives them; tests point them at a temp dir)
 # ---------------------------------------------------------------------------
-LIVE_REPO = STATUS_DIR = REVIEW_DIR = DASH_DIR = CACHE_DIR = ARCHIVE_DIR = RUN_LOGS = ""
+LIVE_REPO = STATUS_DIR = REVIEW_DIR = DASH_DIR = CACHE_DIR = ARCHIVE_DIR = RUN_LOGS = MOAT_DIR = ""
 
 
 def configure(status_dir: Optional[str] = None, review_dir: Optional[str] = None,
               repo: Optional[str] = None) -> None:
-    global LIVE_REPO, STATUS_DIR, REVIEW_DIR, DASH_DIR, CACHE_DIR, ARCHIVE_DIR, RUN_LOGS
+    global LIVE_REPO, STATUS_DIR, REVIEW_DIR, DASH_DIR, CACHE_DIR, ARCHIVE_DIR, RUN_LOGS, MOAT_DIR
     LIVE_REPO = repo or os.environ.get("IMM_REVIEW_REPO") or r"C:\Users\jackd\Documents\KL"
     STATUS_DIR = status_dir or os.environ.get("IMM_STATUS_DIR") or os.path.join(
         LIVE_REPO, "run-logs", "incentive-mm")
@@ -101,6 +101,7 @@ def configure(status_dir: Optional[str] = None, review_dir: Optional[str] = None
     CACHE_DIR = os.path.join(DASH_DIR, "cache")
     ARCHIVE_DIR = os.path.join(CACHE_DIR, "day_archive")
     RUN_LOGS = os.path.dirname(os.path.normpath(STATUS_DIR))
+    MOAT_DIR = os.path.join(REVIEW_DIR, "moat")
 
 
 configure()
@@ -764,14 +765,32 @@ def sec_counterfactual(day: date) -> dict:
                                "est": round(v["est"], 2), "est_adj": round(v["est"] * fac, 2)}
                            for k, v in sorted(by_cls.items(), key=lambda kv: -kv[1]["pool"])}
 
+        # THE MOAT AT WORK: a missed market is worth its modelled reward x the
+        # realisation factor x (1 - its family's trading tax), the tax being the
+        # share of rewards that family's fills gave back over 30 days (priors.json,
+        # shrunk toward the book; the book's own for a family never quoted).
+        pri = _load_json(os.path.join(MOAT_DIR, "priors.json"), {}) or {}
+        book_tax = ((pri.get("book") or {}).get("tax"))
+
+        def tax_of(r):
+            fam = family_of(r.get("series") or series_of(r.get("event") or ""))[0]
+            t = (((pri.get("families") or {}).get(fam) or {}).get("prior") or {}).get("tax")
+            t = book_tax if t is None else t
+            return fam, (None if t is None else min(max(float(t), -0.5), 1.5))
+
         def slim(r):
+            fam, tax = tax_of(r)
+            adj = _f(r.get("est")) * fac
             return {"event": r.get("event"), "series": r.get("series"), "title": (r.get("title") or "")[:70],
                     "reason": r.get("reason"), "class": reason_class(r.get("reason") or ""),
                     "pool": round(_f(r.get("pool")), 2), "est": round(_f(r.get("est")), 2),
-                    "est_adj": round(_f(r.get("est")) * fac, 2), "yld": r.get("yld"),
-                    "n": r.get("n"), "n_est": r.get("n_est"), "end": r.get("end")}
-        est_rows = sorted((r for r in rows if _f(r.get("est")) > 0), key=lambda r: -_f(r.get("est")))
-        out["top_estimated"] = [slim(r) for r in est_rows[:20]]
+                    "est_adj": round(adj, 2), "family": fam, "tax": tax,
+                    "est_net": round(adj * (1.0 - tax), 2) if tax is not None else round(adj, 2),
+                    "yld": r.get("yld"), "n": r.get("n"), "n_est": r.get("n_est"), "end": r.get("end")}
+        est_rows = sorted((slim(r) for r in rows if _f(r.get("est")) > 0), key=lambda x: -x["est_net"])
+        out["top_estimated"] = est_rows[:20]
+        out["net_basis"] = (f"est x {fac} realisation x (1 - the family's 30-day trading tax; "
+                            f"book {book_tax})" if book_tax is not None else "no priors yet")
         unest = sorted((r for r in rows if not _f(r.get("n_est"))), key=lambda r: -_f(r.get("pool")))
         out["top_unestimated_pool"] = [slim(r) for r in unest[:12]]
         log_predictions(day, est_rows[:40], fac)
@@ -1830,6 +1849,19 @@ def ledger_ingest(day: date, path: Optional[str] = None) -> dict:
         with open(os.path.join(REVIEW_DIR, "lessons.md"), "a", encoding="utf-8") as fh:
             for l in lessons[:5]:
                 fh.write(f"- {iso}: {l[:400]}\n")
+    # PROCESS MOAT: a verified fix becomes a reusable rule the next runs apply
+    # to other families and new waves (moat/playbook.md, one line per rule)
+    rules = [p for p in data.get("playbook") or [] if isinstance(p, dict) and str(p.get("rule") or "").strip()]
+    if rules:
+        os.makedirs(MOAT_DIR, exist_ok=True)
+        path = os.path.join(MOAT_DIR, "playbook.md")
+        new = not os.path.exists(path)
+        with open(path, "a", encoding="utf-8") as fh:
+            if new:
+                fh.write("# IMM playbook: rules that verified (appended by imm_review.py ledger ingest)\n\n")
+            for p in rules[:5]:
+                fh.write(f"- {iso} [{str(p.get('evidence') or '')[:40]}] "
+                         f"{str(p.get('applies_to') or 'all')[:80]}: {str(p['rule']).strip()[:400]}\n")
     return {"created": created, "seen": seen, "evals": evals, "closes": closes, "ids": ids}
 
 
@@ -1887,6 +1919,288 @@ def sec_ledger(day: date, commits: List[dict]) -> dict:
                            "seen": len(it.get("seen_days") or [])}
                           for it in sorted(open_items, key=lambda x: (x.get("severity") or "P9",
                                                                      x.get("id")))][:60]}
+
+
+# ---------------------------------------------------------------------------
+# The moat: what compounds (Jack 2026-11-25: "the skill's daily iterative
+# process should lead to compounding and building a moat on data, analysis,
+# and process that allows it to continually get better even as the markets
+# get more competitive")
+#
+# DATA      moat/family_daily.csv   one row per (ET day, family), kept forever:
+#                                   rewards, trading, net, fills, contracts, $ resting,
+#                                   mark-outs, markets, and our SHARE of the reward pool
+#                                   from the cycle log -- the competition signal no one
+#                                   else has for our book
+# ANALYSIS  moat/priors.json        per family over 30 days, shrunk toward the book:
+#                                   rewards and net per $1k resting, the trading tax,
+#                                   mark-out, share. The counterfactual nets its
+#                                   missed-market estimates with each family's tax.
+#           edge watch              last 7 vs the prior 21 days per family: where other
+#                                   makers are eating the edge, where it is growing
+#           review calibration      the review's predicted $/day vs what verified, by kind
+# PROCESS   moat/playbook.md        verified fixes as reusable rules (ingest appends
+#                                   findings.json "playbook"); the skill applies them
+# ---------------------------------------------------------------------------
+
+MOAT_PRIOR_DAYS = 30
+MOAT_PRIOR_SHRINK = 5.0      # days of the book's own average blended into each family's prior
+MOAT_SHARE_BACKFILL = 7      # first run only: the cycle-log share for this many prior days
+EDGE_RECENT, EDGE_BASE = 7, 21
+FAMILY_DAILY_COLS = ["day", "family", "rew", "pnl", "net", "fills", "cts", "rest",
+                     "fe", "fe_cts", "m5", "m5_cts", "mk", "mk_cts", "m4", "m4_cts",
+                     "mt", "mt_cts", "markets", "markets_rew", "share", "pool_cov"]
+
+
+def family_rows_for(iso: str) -> Dict[str, dict]:
+    """{family: sums} for one archived ET day."""
+    blob = load_archive(iso)
+    if not blob:
+        return {}
+    fams: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for t, v in market_rows(blob):
+        a = fams[_fam_key(t)]
+        for k in ("rew", "pnl", "fills", "cts", "rest", "mk", "mk_cts") + FX_KEYS:
+            a[k] += _f(v.get(k))
+        a["markets"] += 1
+        if _f(v.get("rew")) > 0:
+            a["markets_rew"] += 1
+    out = {}
+    for f, a in fams.items():
+        a = dict(a)
+        a["net"] = a.get("rew", 0.0) + a.get("pnl", 0.0)
+        out[f] = a
+    return out
+
+
+def cycle_share(day: date) -> Dict[str, dict]:
+    """{family: {"share", "pool_cov"}} for an ET day from the cycle log: our
+    pool-weighted fraction of the reward pool (sum est_frac x pool / sum pool over
+    every managed market-cycle) and the average pool $/day under management. A
+    share falling at a steady size is other makers crowding in."""
+    s, e = et_bounds(day)
+    num: Dict[str, float] = defaultdict(float)
+    den: Dict[str, float] = defaultdict(float)
+    cycles: Dict[str, set] = defaultdict(set)
+    for u in utc_dates(day):
+        try:
+            fh = open(os.path.join(STATUS_DIR, f"cycle_log_{u}.csv"), encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        idx = None
+        last_s, last_ts = None, None
+        with fh:
+            for line in fh:
+                if line.startswith("ts,"):
+                    cols = line.rstrip("\r\n").split(",")
+                    try:
+                        idx = (cols.index("ts"), cols.index("ticker"), cols.index("est_frac"),
+                               cols.index("pool_per_day"))
+                    except ValueError:
+                        idx = None
+                    continue
+                if idx is None:
+                    continue
+                parts = line.split(",")
+                if len(parts) <= max(idx):
+                    continue
+                ts_s = parts[idx[0]]
+                if ts_s != last_s:
+                    last_s = ts_s
+                    try:
+                        last_ts = datetime.strptime(ts_s, "%Y-%m-%dT%H:%M:%SZ") \
+                            .replace(tzinfo=timezone.utc).timestamp()
+                    except ValueError:
+                        last_ts = None
+                if last_ts is None or not (s <= last_ts < e):
+                    continue
+                pool = _f(parts[idx[3]])
+                if pool <= 0:
+                    continue
+                fam = _fam_key(parts[idx[1]])
+                num[fam] += _f(parts[idx[2]]) * pool
+                den[fam] += pool
+                cycles[fam].add(ts_s)
+    return {f: {"share": round(num[f] / den[f], 5), "pool_cov": round(den[f] / max(1, len(cycles[f])), 2)}
+            for f in den if den[f] > 0}
+
+
+def _read_rows(path: str) -> List[dict]:
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            return list(csv.DictReader(fh))
+    except OSError:
+        return []
+
+
+def _write_rows(path: str, rows: List[dict], cols: List[str]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in cols})
+    os.replace(tmp, path)
+
+
+def _window_stats(rows: List[dict]) -> dict:
+    """Ratios over a set of family-day rows: per $1k resting (rest is a day's
+    average $ resting, so sum(rest)/1000 is $1k-days), the trading tax, mark-out."""
+    S = defaultdict(float)
+    shares = []
+    for r in rows:
+        for k in ("rew", "pnl", "rest", "mt", "mt_cts", "fills"):
+            S[k] += _f(r.get(k))
+        if r.get("share") not in (None, ""):
+            shares.append(_f(r["share"]))
+    kd = S["rest"] / 1000.0
+    return {"days": len(rows),
+            "rew_per_1k": round(S["rew"] / kd, 4) if kd > 0 else None,
+            "net_per_1k": round((S["rew"] + S["pnl"]) / kd, 4) if kd > 0 else None,
+            "tax": round(-S["pnl"] / S["rew"], 4) if S["rew"] > 0 else None,
+            "mt_c": cpc(S["mt"], S["mt_cts"]),
+            "share": round(sum(shares) / len(shares), 5) if shares else None,
+            "share_days": len(shares),
+            "rew": round(S["rew"], 2), "net": round(S["rew"] + S["pnl"], 2)}
+
+
+def compute_priors(rows: List[dict], day: date) -> dict:
+    """Per family over the last MOAT_PRIOR_DAYS, each ratio blended with the
+    book's own value: (n * family + m * book) / (n + m), m = MOAT_PRIOR_SHRINK.
+    A family with a few days leans on the book; one with a month stands alone."""
+    iso = day.isoformat()
+    lo = (day - timedelta(days=MOAT_PRIOR_DAYS - 1)).isoformat()
+    sel = [r for r in rows if lo <= r["day"] <= iso and _f(r.get("rest")) > 0]
+    book = _window_stats(sel)
+    by_f: Dict[str, List[dict]] = defaultdict(list)
+    for r in sel:
+        by_f[r["family"]].append(r)
+    fams = {}
+    m = MOAT_PRIOR_SHRINK
+    for f, rs in by_f.items():
+        st = _window_stats(rs)
+        n = st["days"]
+        blended = {}
+        for k in ("rew_per_1k", "net_per_1k", "tax", "mt_c"):
+            fv, bv = st.get(k), book.get(k)
+            if fv is None:
+                blended[k] = bv
+            elif bv is None:
+                blended[k] = fv
+            else:
+                blended[k] = round((n * fv + m * bv) / (n + m), 4)
+        fams[f] = {"raw": st, "prior": blended, "days": n}
+    return {"as_of": iso, "window_days": MOAT_PRIOR_DAYS, "shrink_days": m, "book": book, "families": fams}
+
+
+def edge_watch(rows: List[dict], day: date) -> List[dict]:
+    """Families whose edge moved: the last EDGE_RECENT days against the EDGE_BASE
+    before them -- rewards per $1k resting (falls when other makers crowd the
+    books we sit in), our pool share when the cycle log gave it, net per $1k."""
+    iso = day.isoformat()
+    r_lo = (day - timedelta(days=EDGE_RECENT - 1)).isoformat()
+    b_lo = (day - timedelta(days=EDGE_RECENT + EDGE_BASE - 1)).isoformat()
+    by_f: Dict[str, Tuple[List[dict], List[dict]]] = defaultdict(lambda: ([], []))
+    for r in rows:
+        if _f(r.get("rest")) <= 0:
+            continue
+        if r_lo <= r["day"] <= iso:
+            by_f[r["family"]][0].append(r)
+        elif b_lo <= r["day"] < r_lo:
+            by_f[r["family"]][1].append(r)
+    out = []
+    for f, (rec, base) in by_f.items():
+        if len(rec) < 4 or len(base) < 10:
+            continue
+        a, b = _window_stats(rec), _window_stats(base)
+
+        def ratio(k):
+            x, y = a.get(k), b.get(k)
+            return round(x / y, 3) if x is not None and y not in (None, 0) and y > 0 else None
+        rr = ratio("rew_per_1k")
+        # share leads only when both windows have it on enough days (the cycle
+        # log share starts with the review: one base day would be noise)
+        sr = ratio("share") if a.get("share_days", 0) >= 4 and b.get("share_days", 0) >= 4 else None
+        lead = sr if sr is not None else rr
+        if lead is None:
+            continue
+        verdict = "eroding" if lead <= 0.75 else "strengthening" if lead >= 1.33 else "steady"
+        out.append({"family": f, "verdict": verdict, "rew_per_1k_ratio": rr, "share_ratio": sr,
+                    "recent": a, "base": b, "lead": lead})
+    out.sort(key=lambda x: -abs(math.log(max(x["lead"], 1e-6))))
+    return out
+
+
+def review_calibration() -> dict:
+    """The review's own record: for findings that were verified or failed with a
+    measured $/day, the realised / predicted ratio by kind."""
+    by_kind: Dict[str, List[float]] = defaultdict(list)
+    for it in ledger_state().values():
+        if it.get("status") not in ("verified", "failed"):
+            continue
+        pred = _f((it.get("impact") or {}).get("usd_day"))
+        ev = (it.get("evals") or [{}])[-1]
+        if pred > 0 and ev.get("delta_usd_day") is not None:
+            by_kind[it.get("kind") or "?"].append(_f(ev["delta_usd_day"]) / pred)
+    return {k: {"n": len(v), "median_ratio": round(sorted(v)[len(v) // 2], 3)} for k, v in by_kind.items()}
+
+
+def sec_moat(day: date) -> dict:
+    os.makedirs(MOAT_DIR, exist_ok=True)
+    path = os.path.join(MOAT_DIR, "family_daily.csv")
+    rows = {(r["day"], r["family"]): r for r in _read_rows(path)}
+    have_days = {d for d, _ in rows}
+    iso = day.isoformat()
+    totals = all_day_totals()
+    archived = [d for d in archive_days() if d <= iso and (totals.get(d) or {}).get("ok", True)]
+    todo = [d for d in archived if d not in have_days or d == iso]
+    share_days = {iso} if have_days else set(archived[-(MOAT_SHARE_BACKFILL + 1):])
+    added = 0
+    for d in todo:
+        fr = family_rows_for(d)
+        sh = cycle_share(date.fromisoformat(d)) if d in share_days else {}
+        for f, a in fr.items():
+            old = rows.get((d, f)) or {}
+            row = {"day": d, "family": f, "markets": int(a.get("markets", 0)),
+                   "markets_rew": int(a.get("markets_rew", 0))}
+            for k in ("rew", "pnl", "net", "fills", "cts", "rest", "mk", "mk_cts") + FX_KEYS:
+                row[k] = round(_f(a.get(k)), 4)
+            s = sh.get(f) or {}
+            row["share"] = s.get("share", old.get("share") or None)
+            row["pool_cov"] = s.get("pool_cov", old.get("pool_cov") or None)
+            rows[(d, f)] = row
+            added += 1
+    ordered = [rows[k] for k in sorted(rows)]
+    _write_rows(path, ordered, FAMILY_DAILY_COLS)
+    priors = compute_priors(ordered, day)
+    _write_json(os.path.join(MOAT_DIR, "priors.json"), priors)
+    edge = edge_watch(ordered, day)
+    playbook = os.path.join(MOAT_DIR, "playbook.md")
+    try:
+        with open(playbook, encoding="utf-8") as fh:
+            n_rules = sum(1 for l in fh if l.startswith("- "))
+    except OSError:
+        n_rules = 0
+    days = sorted({r["day"] for r in ordered})
+    assets = {
+        "family_days": len(ordered), "days": len(days), "first_day": days[0] if days else None,
+        "share_days": len({r["day"] for r in ordered if r.get("share") not in (None, "")}),
+        "predictions": sum(1 for _ in _iter_jsonl(os.path.join(REVIEW_DIR, "counterfactual.jsonl"))),
+        "findings": len(ledger_state()), "playbook_rules": n_rules,
+        "signatures": len(_load_json(os.path.join(REVIEW_DIR, "error_signatures.json"), {}) or {}),
+        "config_versions": sum(1 for _ in _iter_jsonl(os.path.join(REVIEW_DIR, "config_manifest.jsonl"))),
+    }
+    today = [r for r in ordered if r["day"] == iso]
+    return {"assets": assets, "rows_added": added,
+            "edge": [e for e in edge if e["verdict"] != "steady"][:10],
+            "edge_steady": sum(1 for e in edge if e["verdict"] == "steady"),
+            "priors_book": priors["book"],
+            "priors_top": sorted(({"family": f, **v["prior"], "days": v["days"]}
+                                  for f, v in priors["families"].items()),
+                                 key=lambda x: -_f(x.get("net_per_1k")))[:20],
+            "share_today": {r["family"]: r.get("share") for r in today if r.get("share") not in (None, "")},
+            "review_calibration": review_calibration()}
 
 
 # ---------------------------------------------------------------------------
@@ -1994,6 +2308,8 @@ def collect(day: date, bootstrap_days: int = 14, only: Optional[List[str]] = Non
         ev["adverse"] = _section("adverse", sec_adverse, day)
     if want("monitors"):
         ev["monitors"] = _section("monitors", sec_monitors, day)
+    if want("moat"):          # before the counterfactual: it nets estimates with the priors
+        ev["moat"] = _section("moat", sec_moat, day)
     if want("counterfactual"):
         ev["counterfactual"] = _section("counterfactual", sec_counterfactual, day)
     if want("coverage"):
@@ -2186,10 +2502,11 @@ def render_evidence(ev: dict) -> str:
         for k, v in cf["by_class"].items():
             a(f"| {k} | {v['rows']} | {usd0(v['pool'], False)} | {usd(v['est'], False)} | {usd(v['est_adj'], False)} |")
     if cf.get("top_estimated"):
-        a("\nTop estimated misses:")
+        a(f"\nTop estimated misses, ranked by NET ({cf.get('net_basis')}):")
         for x in cf["top_estimated"]:
             a(f"- {x['event']} [{x['class']}: {x['reason']}] pool {usd0(x['pool'], False)}/day, est "
-              f"{usd(x['est'], False)} (adj {usd(x['est_adj'], False)}), {x['n_est']}/{x['n']} mkts read - {x['title']}")
+              f"{usd(x['est'], False)} -> adj {usd(x['est_adj'], False)} -> net {usd(x.get('est_net'), False)} "
+              f"({x.get('family')}, tax {x.get('tax')}), {x['n_est']}/{x['n']} mkts read - {x['title']}")
     if cf.get("top_unestimated_pool"):
         a("\nBiggest UNESTIMATED pools (no book read):")
         for x in cf["top_unestimated_pool"]:
@@ -2327,6 +2644,35 @@ def render_evidence(ev: dict) -> str:
     if lg2.get("open_list"):
         a("Open: " + "; ".join(f"{x['id']} [{x['status']}/{x['severity']}/{x['kind']}] {x['title']} (fp {x['fingerprint']}, seen {x['seen']}d)"
                                for x in lg2["open_list"]))
+    # 10 moat
+    mo = ev.get("moat") or {}
+    a("\n## 10. The moat (what compounds)")
+    if mo.get("error"):
+        a(f"- ERROR: {mo['error']}")
+    else:
+        s = mo.get("assets") or {}
+        a(f"Assets: {s.get('family_days')} family-days over {s.get('days')} days since {s.get('first_day')} "
+          f"({s.get('share_days')} days with pool share); {s.get('predictions')} logged predictions; "
+          f"{s.get('findings')} findings; {s.get('playbook_rules')} playbook rules; {s.get('signatures')} log "
+          f"signatures; {s.get('config_versions')} config snapshots.")
+        b = mo.get("priors_book") or {}
+        a(f"Book, last 30 days: rewards {usd(b.get('rew_per_1k'), False)} and net {usd(b.get('net_per_1k'))} per $1k "
+          f"resting/day; trading tax {_fmt(b.get('tax'), 3)}; mark-out to date {_c(b.get('mt_c'))}.")
+        if mo.get("edge"):
+            a(f"Edge watch (last {EDGE_RECENT} days vs the {EDGE_BASE} before; {mo.get('edge_steady')} families steady):")
+            a("| Family | Verdict | Share now / before | Rewards per $1k now / before | Net per $1k now / before |")
+            a("|---|---|---:|---:|---:|")
+            for e in mo["edge"]:
+                r, bb = e["recent"], e["base"]
+                a(f"| {e['family']} | {e['verdict']} | {_fmt(r.get('share'), 4)} / {_fmt(bb.get('share'), 4)} | "
+                  f"{_fmt(r.get('rew_per_1k'))} / {_fmt(bb.get('rew_per_1k'))} | "
+                  f"{_fmt(r.get('net_per_1k'))} / {_fmt(bb.get('net_per_1k'))} |")
+        if mo.get("priors_top"):
+            a("Family priors (30 days, shrunk to the book), best net per $1k resting first:")
+            a("; ".join(f"{p['family']} net {_fmt(p.get('net_per_1k'))}/rew {_fmt(p.get('rew_per_1k'))} per $1k, "
+                        f"tax {_fmt(p.get('tax'), 2)}, {p['days']}d" for p in mo["priors_top"][:12]))
+        if mo.get("review_calibration"):
+            a(f"The review's own calibration (realised / predicted $/day, by kind): {mo['review_calibration']}")
     a("")
     return "\n".join(L)
 

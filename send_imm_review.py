@@ -256,6 +256,17 @@ def health_checks(ev: dict) -> List[Tuple[str, str]]:
     return out
 
 
+def edge_line(ev: dict, n: int = 3) -> str:
+    """Where competition moved the edge (evidence moat.edge): 'Elections rewards
+    per $1k resting -35% (eroding); KXRT +40% (strengthening)'."""
+    out = []
+    for e in ((ev.get("moat") or {}).get("edge") or [])[:n]:
+        lead = rv._f(e.get("lead"))
+        what = "pool share" if e.get("share_ratio") is not None else "rewards per $1k resting"
+        out.append(f"{e['family']} {what} {(lead - 1) * 100:+.0f}% ({e['verdict']})")
+    return "; ".join(out)
+
+
 # ---------------------------------------------------------------------------
 # HTML
 # ---------------------------------------------------------------------------
@@ -404,6 +415,9 @@ def render_html(ctx: dict, fallback_reason: str = "") -> str:
                 famline += f'<div style="margin-top:8px"><b style="color:{GREEN}">Best:</b> {esc(", ".join(best))}</div>'
             if worst:
                 famline += f'<div><b style="color:{RED}">Worst:</b> {esc(", ".join(worst))}</div>'
+        edge = edge_line(ev)
+        if edge:
+            famline += f'<div style="margin-top:8px"><b>Edge watch:</b> {esc(edge)}</div>'
         a(_card("".join(t) + (f'<div style="margin-top:10px;color:{MUTED};font-size:13px">{esc("; ".join(risk))}.</div>' if risk else "") + famline))
     checks = health_checks(ev)
     if checks:
@@ -454,6 +468,9 @@ def render_text(ctx: dict, fallback_reason: str = "") -> str:
             L.append(f"- Follow-up {e['id']}: {e['verdict']} - {e['headline']}")
         for w in ctx["waiting"]:
             L.append(f"- Still waiting on you ({w['age']}d): {w['headline']} - text do {w['id']}")
+    edge = edge_line(ctx["ev"])
+    if edge:
+        L += ["", "EDGE WATCH: " + edge]
     checks = health_checks(ctx["ev"])
     if checks:
         L += ["", "HEALTH: " + "; ".join(t for t, _ in checks)]

@@ -10,6 +10,7 @@ import pickle
 import shutil
 import tempfile
 import unittest
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
@@ -447,6 +448,92 @@ class LedgerTests(Base):
         iid = [k for k, v in rv.ledger_state().items() if v["fingerprint"] == "data-z"][0]
         self.assertEqual(rv.main(["ledger", "close", iid, "--status", "fixed-elsewhere", "--note", "x"]), 0)
         self.assertEqual(rv.ledger_state()[iid]["status"], "fixed-elsewhere")
+
+
+class MoatTests(Base):
+    def _cycle_log(self, day, rows):
+        """rows: (hh, mm, ticker, est_frac, pool) -> cycle_log files by UTC date."""
+        by_u = defaultdict(list)
+        for hh, mm, t, frac, pool in rows:
+            z = datetime.fromtimestamp(_ts(day, hh, mm), timezone.utc)
+            by_u[z.date().isoformat()].append(f"{z.strftime('%Y-%m-%dT%H:%M:%SZ')},{t},1,2,{frac},{pool}")
+        for u, lines in by_u.items():
+            self.write(f"cycle_log_{u}.csv", "ts,ticker,ext_bid,ext_ask,est_frac,pool_per_day\n"
+                       + "\n".join(lines) + "\n")
+
+    def test_cycle_share_is_pool_weighted(self):
+        self._cycle_log(DAY, [(9, 0, "KXAAA-1-T1", 0.10, 100), (9, 0, "KXAAA-2-T1", 0.30, 300),
+                              (9, 1, "KXAAA-1-T1", 0.10, 100), (9, 1, "KXAAA-2-T1", 0.30, 300),
+                              (9, 1, "KXBBB-1-T1", 0.50, 0)])            # no pool: ignored
+        sh = rv.cycle_share(DAY)
+        self.assertAlmostEqual(sh["Fam KXAA"]["share"], (0.1 * 100 + 0.3 * 300) / 400)
+        self.assertAlmostEqual(sh["Fam KXAA"]["pool_cov"], 400.0)       # per cycle, 2 cycles
+        self.assertNotIn("Fam KXBB", sh)
+
+    def test_history_priors_and_edge_watch(self):
+        # 28 days: KXGOOD steady; KXFADE's reward per $ resting halves in the last 7
+        for i in range(28):
+            d = DAY - timedelta(days=27 - i)
+            fade = 5.0 if i >= 21 else 10.0
+            self.archive(d, {"KXGOOD-1-T1": _row(rew=10, pnl=-2, rest=1000),
+                             "KXFADE-1-T1": _row(rew=fade, pnl=-1, rest=1000)})
+        self._cycle_log(DAY, [(9, 0, "KXGOOD-1-T1", 0.2, 100)])
+        mo = rv.sec_moat(DAY)
+        rows = rv._read_rows(os.path.join(rv.MOAT_DIR, "family_daily.csv"))
+        self.assertEqual(len(rows), 56)
+        self.assertEqual(mo["assets"]["days"], 28)
+        today = {r["family"]: r for r in rows if r["day"] == DAY.isoformat()}
+        self.assertAlmostEqual(float(today["Fam KXGO"]["share"]), 0.2)
+        edge = {e["family"]: e for e in mo["edge"]}
+        self.assertEqual(edge["Fam KXFA"]["verdict"], "eroding")
+        self.assertAlmostEqual(edge["Fam KXFA"]["rew_per_1k_ratio"], 0.5)
+        self.assertNotIn("Fam KXGO", edge)                                # steady
+        self.assertTrue(all(e["share_ratio"] is None for e in mo["edge"]))  # 1 share day: not used
+        pri = rv._load_json(os.path.join(rv.MOAT_DIR, "priors.json"))
+        g = pri["families"]["Fam KXGO"]
+        self.assertAlmostEqual(g["raw"]["rew_per_1k"], 10.0)
+        self.assertAlmostEqual(g["raw"]["tax"], 0.2)
+        # second run: nothing re-added except the day itself; share kept
+        mo2 = rv.sec_moat(DAY)
+        self.assertEqual(mo2["rows_added"], 2)
+        self.assertEqual(len(rv._read_rows(os.path.join(rv.MOAT_DIR, "family_daily.csv"))), 56)
+
+    def test_counterfactual_nets_by_family_tax(self):
+        os.makedirs(rv.MOAT_DIR, exist_ok=True)
+        rv._write_json(os.path.join(rv.MOAT_DIR, "priors.json"), {
+            "book": {"tax": 0.5}, "families": {"Fam KXTA": {"prior": {"tax": 0.8}}}})
+        rows = [{"event": "KXTAX-1", "series": "KXTAX", "pool": 100, "est": 10.0, "n": 1, "n_est": 1,
+                 "reason": "capacity"},
+                {"event": "KXNEW-1", "series": "KXNEW", "pool": 100, "est": 8.0, "n": 1, "n_est": 1,
+                 "reason": "capacity"}]
+        with open(os.path.join(rv.CACHE_DIR, "api_gaps.pkl"), "wb") as fh:
+            pickle.dump({"at": 1.0, "val": {"rows": rows, "ctx": {}}}, fh)
+        top = {x["event"]: x for x in rv.sec_counterfactual(DAY)["top_estimated"]}
+        self.assertAlmostEqual(top["KXTAX-1"]["est_net"], round(10 * 0.72 * 0.2, 2))
+        self.assertAlmostEqual(top["KXNEW-1"]["est_net"], round(8 * 0.72 * 0.5, 2))  # book tax
+        self.assertEqual([x["event"] for x in rv.sec_counterfactual(DAY)["top_estimated"]],
+                         ["KXNEW-1", "KXTAX-1"])                          # ranked by net
+
+    def test_playbook_rules_are_appended_by_ingest(self):
+        p = os.path.join(self.review, DAY.isoformat(), "findings.json")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            json.dump({"findings": [], "playbook": [
+                {"rule": "new ladders start at x1", "applies_to": "event ladders", "evidence": "R-261124-02"},
+                {"rule": "  "}]}, fh)
+        rv.ledger_ingest(DAY)
+        with open(os.path.join(rv.MOAT_DIR, "playbook.md"), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("[R-261124-02] event ladders: new ladders start at x1", text)
+        self.assertEqual(text.count("\n- "), 1)
+
+    def test_edge_line_in_the_email(self):
+        ev = {"moat": {"edge": [{"family": "Elections", "verdict": "eroding", "lead": 0.65,
+                                 "share_ratio": 0.65},
+                                {"family": "Rotten Tomatoes", "verdict": "strengthening", "lead": 1.4,
+                                 "share_ratio": None}]}}
+        self.assertEqual(sr.edge_line(ev), "Elections pool share -35% (eroding); "
+                                           "Rotten Tomatoes rewards per $1k resting +40% (strengthening)")
 
 
 class MeasureTests(Base):

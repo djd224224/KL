@@ -7,7 +7,10 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
 - **2026-11-25, built.** Jack asked for a daily skill that reviews the IMM holistically and suggests fixes in a morning email: "the goal is a self-improving system that compounds on itself over time and maximizes risk-adjusted returns with minimal involvement".
 - **Autonomy: "Plan + your yes" (11/25).** Every fix goes to Jack as an exact plan. He approves with one text ("do R-...", through sms_inbox's PLAN + YES-code flow) or in any session. No code is written before his yes, and nothing auto-applies. Autopilot for bounded knobs is NOT on; raise it only once the ledger shows a kind of suggestion verifying reliably, as its own decision.
 - **Email: "Add it at ~6:30 AM" (11/25).** The review lands before the 07:00 cluster, and the existing IMM emails keep going. From 12/09 the weekly pass proposes which of them to retire, one decision each.
-- **Deploy (11/25):** "Unstick now, review later". The wedged sync was fixed the same morning, then the review landed on main and the 04:30 task was registered.
+- **Deploy (11/25):** "Unstick now, review later".
+- **The moat (11/25):** "the skill's daily iterative process should lead to compounding and building a moat on data, analysis, and process that allows it to continually get better even as the markets get more competitive".
+  - Built the same day: moat/family_daily.csv (with pool share from the cycle log), priors.json, the edge watch, missed markets netted by family tax, the review's self-calibration, and the playbook.
+  - The durable backup (R-261124-20) is a decision for Jack. The wedged sync was fixed the same morning, then the review landed on main and the 04:30 task was registered.
 
 ## 2026-11-25: what the survey found before the first run (the baseline)
 
