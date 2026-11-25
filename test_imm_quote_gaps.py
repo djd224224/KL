@@ -86,6 +86,41 @@ def _rows(n, start=0):
             for i in range(start, start + n)]
 
 
+class TestScanArchive(unittest.TestCase):
+    """R-261124-24 (Jack 2026-11-25: "Push and archive"): every scan is one line of
+    gap_scans_<UTC date>.jsonl, so the review can add up the whole day."""
+
+    def test_one_compact_line_a_scan_and_the_kill_switch(self):
+        end = datetime(2026, 11, 26, 5, tzinfo=timezone.utc)
+        rows = [{"event": "KXA-1", "series": "KXA", "n": 3, "n_est": 3, "pool": 12.345, "est": 1.23456,
+                 "yld": None, "reason": "blocklisted", "end": end},
+                {"event": "KXB-1", "series": "KXB", "n": 1, "n_est": 0, "pool": 5.0, "est": None,
+                 "yld": None, "reason": "not read (budget)", "end": None}]
+        ctx = {"programs": 10, "books_read": 4, "batch_error": "", "not_scalar": [1, 2]}
+        with tempfile.TemporaryDirectory() as d:
+            p = g.archive_scan(rows, ctx, NOW, source="email", path_dir=d)
+            self.assertTrue(p.endswith("gap_scans_2026-10-07.jsonl"))
+            g.archive_scan(rows, ctx, NOW, path_dir=d)
+            with open(p, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            self.assertEqual(len(lines), 2)
+            rec = json.loads(lines[0])
+            self.assertEqual((rec["ts"], rec["source"]), ("2026-10-07T11:20:00Z", "email"))
+            self.assertNotIn("not_scalar", rec["ctx"])                 # scalars only
+            self.assertEqual(rec["rows"][0]["est"], 1.235)
+            self.assertEqual(rec["rows"][0]["end"], end.timestamp())
+            self.assertIsNone(rec["rows"][1]["est"])
+            self.assertEqual(json.loads(lines[1])["source"], "scan")
+            saved = g.ARCHIVE_SCANS
+            g.ARCHIVE_SCANS = False
+            try:
+                self.assertIsNone(g.archive_scan(rows, ctx, NOW, path_dir=d))
+            finally:
+                g.ARCHIVE_SCANS = saved
+            with open(p, encoding="utf-8") as fh:
+                self.assertEqual(len(fh.read().splitlines()), 2)
+
+
 class TestBatchBooks(unittest.TestCase):
     """R-261124-22 (Jack 2026-11-25: "Yes, all four"): every unquoted book is
     read 100 a call, and the scan bot's single read is only borrowed."""

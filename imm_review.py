@@ -833,6 +833,19 @@ def sec_counterfactual(day: date) -> dict:
     sel = selection_day(day, latest)
     rows: List[dict] = []
     urows: List[dict] = []
+    # THE MOAT AT WORK: a missed market is worth its modelled reward x the
+    # realisation factor x (1 - its family's trading tax), the tax being the
+    # share of rewards that family's fills gave back over 30 days (priors.json,
+    # shrunk toward the book; the book's own for a family never quoted).
+    pri = _load_json(os.path.join(MOAT_DIR, "priors.json"), {}) or {}
+    book_tax = ((pri.get("book") or {}).get("tax"))
+
+    def tax_of(r):
+        fam = family_of(r.get("series") or series_of(r.get("event") or ""))[0]
+        t = (((pri.get("families") or {}).get(fam) or {}).get("prior") or {}).get("tax")
+        t = book_tax if t is None else t
+        return fam, (None if t is None else min(max(float(t), -0.5), 1.5))
+
     gaps = _load_pickle(os.path.join(CACHE_DIR, "api_gaps.pkl")) or {}
     val = gaps.get("val") if isinstance(gaps, dict) else None
     if isinstance(val, dict):
@@ -851,19 +864,6 @@ def sec_counterfactual(day: date) -> dict:
         out["by_class"] = {k: {"rows": v["rows"], "pool": round(v["pool"], 2),
                                "est": round(v["est"], 2), "est_adj": round(v["est"] * fac, 2)}
                            for k, v in sorted(by_cls.items(), key=lambda kv: -kv[1]["pool"])}
-
-        # THE MOAT AT WORK: a missed market is worth its modelled reward x the
-        # realisation factor x (1 - its family's trading tax), the tax being the
-        # share of rewards that family's fills gave back over 30 days (priors.json,
-        # shrunk toward the book; the book's own for a family never quoted).
-        pri = _load_json(os.path.join(MOAT_DIR, "priors.json"), {}) or {}
-        book_tax = ((pri.get("book") or {}).get("tax"))
-
-        def tax_of(r):
-            fam = family_of(r.get("series") or series_of(r.get("event") or ""))[0]
-            t = (((pri.get("families") or {}).get(fam) or {}).get("prior") or {}).get("tax")
-            t = book_tax if t is None else t
-            return fam, (None if t is None else min(max(float(t), -0.5), 1.5))
 
         def slim(r):
             fam, tax = tax_of(r)
@@ -902,6 +902,10 @@ def sec_counterfactual(day: date) -> dict:
         bot_events = {ev for _t, (_ts, dec, _est, ev) in latest.items() if ev and dec != "selected"}
         for x in out.get("top_unestimated_pool") or []:
             x["measured_by"] = unmeasured_class(x, unq_series, dict.fromkeys(bot_events))
+    try:
+        out["whole_day"] = whole_day_misses(day, {r.get("event") for r in rows}, fac, tax_of)
+    except Exception as ex:                      # a report section, never a crash
+        out["whole_day"] = {"scans": 0, "error": f"{type(ex).__name__}: {ex}"}
     cg = _load_json(os.path.join(STATUS_DIR, "config_gaps.json"), {}) or {}
     gaps_now = cg.get("gaps") or {}
     out["config_gaps"] = [{"event": k, "series": v.get("series"), "since": v.get("since"),
@@ -910,6 +914,88 @@ def sec_counterfactual(day: date) -> dict:
     out["selection"] = sel
     out["calibration"] = calibrate_predictions(day)
     return out
+
+
+WHOLE_DAY_GAP_CAP_S = 2 * 3600       # a scan stands for at most 2h after it
+
+
+def gap_scans_of_day(day: date) -> List[Tuple[float, dict]]:
+    """[(ts, scan)] of the ET day from STATUS_DIR/gap_scans_<UTC date>.jsonl (one line
+    per gap scan, imm_quote_gaps.archive_scan), oldest first."""
+    s, e = et_bounds(day)
+    scans = []
+    for u in utc_dates(day):
+        for r in _iter_jsonl(os.path.join(STATUS_DIR, f"gap_scans_{u}.jsonl")):
+            ts = _ts_of(r.get("ts"))
+            if ts is not None and s <= ts < e and isinstance(r.get("rows"), list):
+                scans.append((ts, r))
+    scans.sort(key=lambda x: x[0])
+    return scans
+
+
+def whole_day_misses(day: date, morning_events: set, fac: float, tax_of) -> dict:
+    """THE WHOLE DAY (review R-261124-24, Jack 2026-11-25: "Push and archive"): the
+    morning gap scan only knows what is unquoted at 04:30, so a pool that lived and
+    ended during the day was never counted. Every hourly scan is archived; each
+    stands for the time to the next one (capped at 2h; the first also for the gap
+    since midnight), so an event's modelled $ over the day = sum of its est $/day x
+    the share of the day each scan covers. MODELLED: one reading per scan, x1."""
+    scans = gap_scans_of_day(day)
+    if not scans:
+        return {"scans": 0, "note": "no gap_scans file for the day (the archive starts 2026-11-25)"}
+    s, e = et_bounds(day)
+    covers = []
+    for i, (ts, _r) in enumerate(scans):
+        nxt = scans[i + 1][0] if i + 1 < len(scans) else e
+        c = max(0.0, min(nxt, ts + WHOLE_DAY_GAP_CAP_S) - ts)
+        if i == 0 and ts - s <= WHOLE_DAY_GAP_CAP_S:
+            c += ts - s
+        covers.append(c)
+    ev: Dict[str, dict] = {}
+    for (ts, r), c in zip(scans, covers):
+        w = c / 86400.0
+        for x in r["rows"]:
+            if not isinstance(x, dict) or not x.get("event"):
+                continue
+            a = ev.setdefault(x["event"], {"series": x.get("series"), "pool_days": 0.0, "est_days": 0.0,
+                                           "unread_pool_days": 0.0, "hours": 0.0})
+            a["pool_days"] += _f(x.get("pool")) * w
+            a["hours"] += c / 3600.0
+            if x.get("est") is not None:
+                a["est_days"] += _f(x.get("est")) * w
+            else:
+                a["unread_pool_days"] += _f(x.get("pool")) * w
+            a["reason"] = x.get("reason") or ""
+    by_cls = defaultdict(lambda: {"events": 0, "pool_days": 0.0, "est_days": 0.0, "unread_pool_days": 0.0})
+    for a in ev.values():
+        b = by_cls[reason_class(a["reason"])]
+        b["events"] += 1
+        for k in ("pool_days", "est_days", "unread_pool_days"):
+            b[k] += a[k]
+
+    def slim_day(name, a):
+        fam, tax = tax_of({"series": a["series"], "event": name})
+        adj = a["est_days"] * fac
+        return {"event": name, "series": a["series"], "reason": a["reason"], "class": reason_class(a["reason"]),
+                "hours": round(a["hours"], 1), "pool_days": round(a["pool_days"], 2),
+                "est_days": round(a["est_days"], 2), "est_adj": round(adj, 2), "family": fam, "tax": tax,
+                "est_net": round(adj * (1.0 - tax), 2) if tax is not None else round(adj, 2),
+                "in_morning_scan": name in morning_events}
+    tops = sorted((slim_day(k, a) for k, a in ev.items() if a["est_days"] > 0), key=lambda x: -x["est_net"])
+    ended = [x for x in tops if not x["in_morning_scan"]]
+    iso = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"scans": len(scans), "first": iso(scans[0][0]), "last": iso(scans[-1][0]),
+            "covered_hours": round(sum(covers) / 3600.0, 1),
+            "by_class": {k: {"events": v["events"], "pool_days": round(v["pool_days"], 2),
+                             "est_days": round(v["est_days"], 2), "est_adj": round(v["est_days"] * fac, 2),
+                             "unread_pool_days": round(v["unread_pool_days"], 2)}
+                         for k, v in sorted(by_cls.items(), key=lambda kv: -kv[1]["est_days"])},
+            "top": tops[:20],
+            "ended_before_review": {"events": len(ended), "est_days": round(sum(x["est_days"] for x in ended), 2),
+                                    "est_net": round(sum(x["est_net"] for x in ended), 2), "top": ended[:10]},
+            "unread_pool_days": round(sum(a["unread_pool_days"] for a in ev.values()), 2),
+            "basis": (f"MODELLED: each scan's est $/day x the share of the day it covers (to the next scan, "
+                      f"<= 2h); net = x {fac} realisation x (1 - family trading tax); x1 size")}
 
 
 def log_predictions(day: date, rows: List[dict], fac: float) -> None:
@@ -2715,6 +2801,27 @@ def render_evidence(ev: dict) -> str:
             else:
                 est = "none"
             a(f"| {k} | {v['events']} | {usd0(v['pool'], False)} | {est} | {v['by']} |")
+    wd = cf.get("whole_day") or {}
+    if wd.get("scans"):
+        eb = wd.get("ended_before_review") or {}
+        a(f"\nTHE WHOLE ET DAY from every hourly gap scan (R-261124-24): {wd['scans']} scans "
+          f"{et_str(_ts_of(wd.get('first')))} to {et_str(_ts_of(wd.get('last')))} ET, {wd.get('covered_hours')}h covered. "
+          f"{eb.get('events')} estimated events ENDED BEFORE THIS REVIEW (not in the morning scan): "
+          f"{usd(eb.get('est_days'), False)} modelled over the day, net {usd(eb.get('est_net'), False)}. "
+          f"Pool nothing read: {usd0(wd.get('unread_pool_days'), False)} pool-days. {wd.get('basis')}.")
+        a("| Reason class | Events | Pool-days | Modelled $ over the day | Adj $ | Unread pool-days |")
+        a("|---|---:|---:|---:|---:|---:|")
+        for k, v in (wd.get("by_class") or {}).items():
+            a(f"| {k} | {v['events']} | {usd0(v['pool_days'], False)} | {usd(v['est_days'], False)} | "
+              f"{usd(v['est_adj'], False)} | {usd0(v['unread_pool_days'], False)} |")
+        if wd.get("top"):
+            a("Top misses over the whole day, ranked by NET:")
+            for x in wd["top"][:12]:
+                a(f"- {x['event']} [{x['class']}: {x['reason']}] {x['hours']}h unquoted, {usd(x['est_days'], False)} "
+                  f"modelled over the day -> net {usd(x['est_net'], False)} ({x.get('family')}, tax {x.get('tax')})"
+                  f"{'' if x.get('in_morning_scan') else ' -- ENDED BEFORE THE REVIEW'}")
+    elif wd.get("note") or wd.get("error"):
+        a(f"\nWhole-day gap scans: {wd.get('note') or 'ERROR ' + str(wd.get('error'))}")
     r = cf.get("realisation") or {}
     a(f"Estimates shown raw and x{r.get('factor')} ({r.get('note')}).")
     if cf.get("by_class"):

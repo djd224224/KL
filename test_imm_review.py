@@ -397,6 +397,49 @@ class CounterfactualTests(Base):
         self.assertEqual(fm["cost_7d"]["quoted_to_end"], {"pnl": 0.0, "fills": 0, "rest_avg": 0.0})
         self.assertEqual(fm["size_needed"]["<=2x"], 1)
 
+    def test_whole_day_from_every_hourly_scan(self):
+        # R-261124-24: the review adds up the day's archived gap scans, each scan
+        # standing for the time to the next (<= 2h; the first also since midnight)
+        s, _e = rv.et_bounds(DAY)
+        iso = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        A = {"event": "KXA-1", "series": "KXA", "n": 2, "n_est": 2, "pool": 100.0, "est": 24.0,
+             "reason": "screened: extreme_mid"}
+        B = {"event": "KXB-1", "series": "KXB", "n": 1, "n_est": 1, "pool": 200.0, "est": 48.0,
+             "reason": "not in allowlist"}
+        C = {"event": "KXC-1", "series": "KXC", "n": 3, "n_est": 0, "pool": 50.0, "est": None,
+             "reason": "blocklisted"}
+        by_u = defaultdict(list)
+        for ts, scan in ((s + 3600, [A, B, C]), (s + 3900, [A, C]), (s + 13 * 3600, [A, C])):
+            by_u[datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")].append(
+                {"ts": iso(ts), "source": "scan", "ctx": {}, "rows": scan})
+        for u, recs in by_u.items():
+            self.jsonl(f"gap_scans_{u}.jsonl", recs)
+        with open(os.path.join(rv.CACHE_DIR, "api_gaps.pkl"), "wb") as fh:      # the morning scan: A, C
+            pickle.dump({"at": 1.0, "val": {"rows": [dict(A), dict(C)], "ctx": {"unest_pool": 50}}}, fh)
+        cf = rv.sec_counterfactual(DAY)
+        wd = cf["whole_day"]
+        cover = 3900 + 7200 + 7200
+        self.assertEqual(wd["scans"], 3)
+        self.assertEqual(wd["covered_hours"], round(cover / 3600, 1))
+        top = {x["event"]: x for x in wd["top"]}
+        self.assertAlmostEqual(top["KXA-1"]["est_days"], round(24.0 * cover / 86400, 2))
+        self.assertAlmostEqual(top["KXB-1"]["est_days"], round(48.0 * 3900 / 86400, 2))
+        self.assertFalse(top["KXB-1"]["in_morning_scan"])
+        self.assertTrue(top["KXA-1"]["in_morning_scan"])
+        self.assertEqual(wd["ended_before_review"]["events"], 1)
+        self.assertEqual(wd["ended_before_review"]["top"][0]["event"], "KXB-1")
+        self.assertAlmostEqual(wd["unread_pool_days"], round(50.0 * cover / 86400, 2))
+        md = rv.render_evidence({"day": DAY.isoformat(), "window_et": ["a", "b"], "generated": 0,
+                                 "counterfactual": cf})
+        self.assertIn("THE WHOLE ET DAY", md)
+        self.assertIn("KXB-1 [not enrolled: not in allowlist]", md)
+        self.assertIn("ENDED BEFORE THE REVIEW", md)
+
+    def test_whole_day_without_an_archive_says_so(self):
+        wd = rv.sec_counterfactual(DAY)["whole_day"]
+        self.assertEqual(wd["scans"], 0)
+        self.assertIn("no gap_scans file", wd["note"])
+
     def test_reason_class(self):
         self.assertEqual(rv.reason_class("screened: extreme_mid, under payout floor"), "market screen")
         self.assertEqual(rv.reason_class("under payout floor, screened: x"), "economics")

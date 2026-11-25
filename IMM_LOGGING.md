@@ -45,6 +45,7 @@ Every row carries `run_id` and `config_hash`.
 | `ws_stale_*.jsonl` | per stale-quote episode event | would a fast WS cancel have paid (2026-10-04) |
 | `ws_sweep_*.jsonl` | per sweep-breaker trip | would pulling an event on a sweep have paid (2026-10-04) |
 | `join_wait_*.jsonl` | per join-wait hold / join / gone | which better prices an at-ref rung waited on, for how long (2026-11-02) |
+| `gap_scans_*.jsonl` | per gap scan (hourly, plus the 7:20 email) | every unquoted paying event, why, and its modelled $/day, all day long (2026-11-25) |
 
 ### fills
 
@@ -193,6 +194,21 @@ resetting, being carried by near-cliff, or the size boost arming. A row is
 written when `(reaches_min_raw, reaches_min, near_cliff_boost_armed)` changes,
 with `prev_state` and the full decision inputs. Its own file, so
 `selection_events` still means one row per decision change.
+
+### gap_scans (2026-11-25)
+
+Written by `imm_quote_gaps.archive_scan` at the end of every
+`classify_and_estimate`: the dashboard's hourly scan (`source` "scan") and the
+7:20 email ("email"). There is one line per scan: `ts`, `source`, the scan's
+scalar `ctx` (books read, batch calls, unestimated pool, ...) and `rows`, one
+per unquoted paying event (`event`, `series`, `n`, `n_est`, `pool` $/day, `est`
+$/day or null, `yld`, `reason`, `end` epoch). A line is about 100 KB, about 3 MB
+a day.
+
+The daily review adds up the ET day (`imm_review.whole_day_misses`). Each scan
+stands for the time to the next one, capped at 2h. This catches pools that ended
+before the 04:30 morning scan. `IMM_GAPS_ARCHIVE=0` stops the writes, and
+`IMM_GAPS_ARCHIVE_DIR` moves them (tests).
 
 ### ws_stale (2026-10-04)
 
