@@ -141,14 +141,19 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 ```json
 {
   "day": "2026-11-24",
-  "subject": "net +$415 (rewards $875 | trading -$461) | 2 decisions | sync fixed",
-  "headline": "one sentence verdict",
+  "verdict": "A quiet, clean day, but we parked twice the usual collateral for the lowest rewards in two weeks.",
   "findings": [
     {
       "fingerprint": "ops:health-alert-false-down-on-restart",
       "kind": "ops",
       "severity": "P2",
       "title": "Health alert reports DOWN on every deploy restart",
+      "email": {
+        "headline": "Health alerts cry wolf when the bot restarts",
+        "why": "All 4 'IMM DOWN' alerts yesterday came while the bot was restarting after a code update. A real outage would look the same.",
+        "fix": "Treat a restart in progress as 'restarting', not 'down'.",
+        "value": "Trustworthy alerts"
+      },
       "summary": "what, why it matters, evidence in one paragraph",
       "evidence": ["evidence.md 6: 4 DOWN lines, 4 within 10 min of the 4 process starts", "imm_health_alert.py:212 ..."],
       "impact": {"usd_day": 0, "basis": "measured", "confidence": "high"},
@@ -173,6 +178,23 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 }
 ```
 
+**The email is built from this file, not from review.md** (Jack 11/25: "make the email way clearer and easier to read"). `send_imm_review.py` lays it out the same way every day:
+- the day's net in one big number;
+- your `verdict`;
+- up to 3 "Needs your OK" cards (the decision_needed findings, most severe first);
+- one line per finding that is new today or P0/P1;
+- follow-ups;
+- a numbers table and green/amber/red health checks.
+
+So write the short fields for a phone:
+- **`verdict`:** one or two plain sentences, at most 240 characters. How the day went in risk-adjusted terms, and the one thing that matters.
+- **`email.headline`:** at most 80 characters, plain English, the problem or opportunity. No tickers unless the ticker is the point, no internal names (est_frac, cr/cs, fingerprint, MTM).
+- **`email.why`:** one or two short sentences, at most 220 characters: what is wrong and what it costs, in dollars per day where you can.
+- **`email.fix`:** one short sentence, at most 160 characters: what changes.
+- **`email.value`:** at most 40 characters, e.g. "+$25/day (modelled)", "-$235/day leak (measured)" or "avoids a full disk Jan 11".
+
+Round to whole dollars. Write "modelled" or "measured" once per number, not per sentence.
+
 Fingerprints are stable keys, `kind:short-slug`, the same every day for the same problem. That is how the ledger knows it has seen something before. `kind`: bug / ops / data / missed / loss / strategy / experiment / review. `severity`: P0 to P3 (section 6). `impact.basis`: measured / modelled / n/a. To update an existing item, reuse its fingerprint, or set `ledger_id`.
 
 The `plan` must be executable by a fresh Claude with no other context:
@@ -185,9 +207,14 @@ The `plan` must be executable by a fresh Claude with no other context:
 
 The `metric.recipe` must be a command or a precise evidence-pack reading.
 
-## 5. review.md (the email body)
+## 5. review.md (the full write-up, attached to the email)
 
-Plain Markdown that `md_report_email.py` renders: headings, pipe tables, bullets, **bold**, `code`. No emoji. Under about 120 lines: Jack reads it on his phone. The body names about 10 findings at most. P3 items go in the ledger only, closing with one line: "N more P3 items in the ledger: <ids>". Order:
+The email body is generated from findings.json (section 4). review.md is the attachment for when Jack wants the reasoning, so it can carry the analysis. Still write it to be read:
+- short paragraphs, at most 4 lines;
+- a table where there are more than 3 numbers;
+- no walls of tickers.
+
+Plain Markdown that `md_report_email.py` renders: headings, pipe tables, bullets, **bold**, `code`. No emoji. Under about 150 lines. It names about 10 findings at most. P3 items go in the ledger only, closing with one line: "N more P3 items in the ledger: <ids>". Order:
 
 ```
 # <Day>: <one-line verdict>
@@ -217,7 +244,7 @@ Gaps found and what to log.
 One line per item proposed 3+ days ago.
 ```
 
-The sender appends the exact-number tables from evidence.json, so don't paste the scorecard. Cite the numbers you argue from.
+The email carries the exact-number tables from evidence.json, so don't paste the scorecard. Cite the numbers you argue from.
 
 ## 6. Severity
 

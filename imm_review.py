@@ -1695,7 +1695,7 @@ def ledger_state() -> Dict[str, dict]:
             if d and d not in it["seen_days"]:
                 it["seen_days"].append(d)
             it["last_seen"] = d
-            for k in ("severity", "title", "summary", "impact", "evidence", "ask", "plan", "metric"):
+            for k in ("severity", "title", "summary", "impact", "evidence", "ask", "plan", "metric", "email"):
                 if ev.get(k):
                     it[k] = ev[k]
             if ev.get("status"):
@@ -1740,6 +1740,7 @@ def _clean_finding(f: dict) -> dict:
         sev = "P3"
     fp = _slug(f.get("fingerprint") or (kind + "-" + (f.get("title") or "untitled")))
     imp = f.get("impact") if isinstance(f.get("impact"), dict) else {}
+    em = f.get("email") if isinstance(f.get("email"), dict) else {}
     ev = f.get("evidence") if isinstance(f.get("evidence"), list) else (
         [str(f["evidence"])] if f.get("evidence") else [])
     return {"kind": kind, "severity": sev, "fingerprint": fp,
@@ -1752,6 +1753,7 @@ def _clean_finding(f: dict) -> dict:
             "plan": f.get("plan") if isinstance(f.get("plan"), dict) else (
                 {"change": str(f["plan"])} if f.get("plan") else {}),
             "metric": f.get("metric") if isinstance(f.get("metric"), dict) else {},
+            "email": {k: str(em.get(k))[:260] for k in ("headline", "why", "fix", "value") if em.get(k)},
             "ledger_id": f.get("ledger_id")}
 
 
@@ -1773,7 +1775,7 @@ def ledger_ingest(day: date, path: Optional[str] = None) -> dict:
         f = _clean_finding(raw)
         iid = f["ledger_id"] if f["ledger_id"] in items else by_fp.get(f["fingerprint"])
         body = {k: f[k] for k in ("kind", "severity", "fingerprint", "title", "summary",
-                                  "evidence", "impact", "ask", "plan", "metric")}
+                                  "evidence", "impact", "ask", "plan", "metric", "email")}
         if iid:
             it = items[iid]
             if iso not in (it.get("seen_days") or []):

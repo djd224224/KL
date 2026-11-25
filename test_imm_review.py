@@ -491,20 +491,50 @@ class CollectAndSendTests(Base):
             ev2 = rv.collect(DAY, bootstrap_days=0)
         self.assertIn("boom", ev2["errors"]["attribution"])
 
-    def test_send_substitutes_ids_and_appends_numbers(self):
-        self._collect()
+    def _write_review(self):
         d = os.path.join(self.review, DAY.isoformat())
         with open(os.path.join(d, "review.md"), "w", encoding="utf-8") as fh:
             fh.write("# Verdict\n\n1. Fix the sync [[fp:ops:sync-wedged]]\n")
         with open(os.path.join(d, "findings.json"), "w") as fh:
-            json.dump({"subject": "net +$40 | 1 decision", "findings": [
-                {"fingerprint": "ops:sync-wedged", "kind": "ops", "title": "t", "decision_needed": True}]}, fh)
+            json.dump({"verdict": "A clean day; one thing needs you.", "findings": [
+                {"fingerprint": "ops:sync-wedged", "kind": "ops", "severity": "P1", "title": "t",
+                 "decision_needed": True,
+                 "email": {"headline": "The repo sync is stuck", "why": "GitHub and the box diverged.",
+                           "fix": "Merge and push.", "value": "keeps code backed up"}},
+                {"fingerprint": "bug:long", "kind": "bug", "severity": "P2",
+                 "title": "A very long technical title " + "x" * 120,
+                 "summary": "First sentence explains it. Second sentence does not show.",
+                 "impact": {"usd_day": 12.4, "basis": "measured"}}]}, fh)
         rv.ledger_ingest(DAY)
-        subject, page, text = sr.build(DAY)
-        self.assertIn("R-261124-01", text)
-        self.assertNotIn("[[fp:", text)
-        self.assertIn("The numbers (generated from the evidence pack", text)
-        self.assertTrue(subject.startswith("IMM review Tue 11/24: net +$40"))
+        return d
+
+    def test_email_fields_fall_back_to_short_versions(self):
+        f = {"title": "word " * 40, "summary": "It breaks. Then more.", "plan": {"change": "Do X. And Y."},
+             "impact": {"usd_day": 25, "basis": "modelled"}}
+        e = sr.email_fields(f)
+        self.assertLessEqual(len(e["headline"]), 93)
+        self.assertTrue(e["headline"].endswith("..."))
+        self.assertEqual(e["why"], "It breaks.")
+        self.assertEqual(e["fix"], "Do X.")
+        self.assertEqual(e["value"], "~$25/day (modelled)")
+
+    def test_email_cards_numbers_and_attachment(self):
+        self._collect()
+        d = self._write_review()
+        subject, page, text, attach = sr.build(DAY)
+        self.assertEqual(subject, "IMM review Tue 11/24: +$40 net | 1 needs your OK | The repo sync is stuck")
+        self.assertIn("Needs your OK", page)
+        self.assertIn("The repo sync is stuck", page)
+        self.assertIn("do R-261124-01", page)
+        self.assertIn("A very long technical title", page)          # FYI line, shortened
+        self.assertIn("A clean day; one thing needs you.", page)
+        self.assertIn("Health checks", page)
+        self.assertNotIn("[[fp:", page)
+        self.assertIn('Approve: text "do R-261124-01"', text)
+        name, full = attach[0]
+        self.assertEqual(name, "IMM-review-2026-11-24-full.html")
+        self.assertIn("R-261124-01", full)
+        self.assertNotIn("[[fp:", full)
         sent = []
 
         class FakeSMTP:
@@ -533,19 +563,23 @@ class CollectAndSendTests(Base):
 
     def test_fallback_when_no_review(self):
         self._collect()
-        subject, page, text = sr.build(DAY, fallback=True, reason="claude exit 1")
-        self.assertIn("DATA ONLY (claude exit 1)", subject)
+        subject, page, text, attach = sr.build(DAY, fallback=True, reason="claude exit 1")
+        self.assertEqual(subject, "IMM review Tue 11/24: +$40 net | numbers only, analysis did not run")
+        self.assertIn("The analysis did not run", page)
+        self.assertIn("claude exit 1", page)
+        self.assertNotIn("Needs your OK", page)
         self.assertIn("The analysis did not run (claude exit 1)", text)
-        self.assertIn("## 1. Scorecard", text)
-        s2, _, t2 = sr.build(DAY)                                          # no review.md at all
-        self.assertIn("DATA ONLY (review.md missing)", s2)
+        self.assertEqual(attach[0][0], "IMM-evidence-2026-11-24.html")
+        self.assertIn("Scorecard", attach[0][1])
+        _, p2, _, _ = sr.build(DAY)                                         # no review.md at all
+        self.assertIn("no review was written", p2)
 
     def test_dry_run_writes_html_only(self):
         self._collect()
         with mock.patch.object(sr, "send") as snd:
             self.assertEqual(sr.main(["--day", DAY.isoformat(), "--dry", "--fallback"]), 0)
         snd.assert_not_called()
-        self.assertTrue(os.path.exists(os.path.join(self.review, DAY.isoformat(), "review.html")))
+        self.assertTrue(os.path.exists(os.path.join(self.review, DAY.isoformat(), "email.html")))
 
 
 if __name__ == "__main__":

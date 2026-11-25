@@ -1,29 +1,42 @@
 #!/usr/bin/env python3
 r"""send_imm_review.py -- email the IMM daily review (Jack 2026-11-25: "... and
-suggests fixes to me in a morning email").
+suggests fixes to me in a morning email"; then "make the email way clearer and
+easier to read").
 
-    python send_imm_review.py --day D                  # review.md + exact-number appendix -> email
-    python send_imm_review.py --day D --dry            # write review.html only, send nothing
+    python send_imm_review.py --day D                  # build + send; once a day (marker)
+    python send_imm_review.py --day D --dry            # write email.html only, send nothing
     python send_imm_review.py --day D --test           # send with [TEST] in the subject, no marker
     python send_imm_review.py --day D --fallback --reason "why"
-                                                       # evidence-only email: the analysis did not run
+                                                       # numbers-only email: the analysis did not run
 
-Reads run-logs/incentive-mm/daily_review/<D>/: review.md and findings.json (the
-skill's), evidence.json (imm_review.py collect), ids.json (ledger ingest).
-`[[fp:<fingerprint>]]` in review.md becomes that finding's ledger id. The
-appendix is generated here from evidence.json, so the headline numbers in the
-email never pass through a model. Writes <D>/review.html and, once sent,
-<D>/sent.marker (a second run the same day sends nothing unless --force).
+THE EMAIL is built here, not written by the model, so it looks the same every
+day and fits a phone:
+  1. the day's net in one big number, rewards / trading / the 7-day average,
+     and the model's one-sentence verdict;
+  2. NEEDS YOUR OK: at most three cards (headline, why, fix, what it's worth,
+     the exact text that approves it);
+  3. WORTH KNOWING: one line per finding that is new today (or P0/P1);
+  4. did past fixes work, and what is still waiting on Jack;
+  5. the numbers (day / 7d / 30d, best and worst families) and a row of
+     health checks, coloured green / amber / red.
+The words in the cards come from each finding's short "email" block in
+findings.json (headline / why / fix / value); a finding without one falls back
+to a shortened title, summary and plan. The model's long review.md rides along
+as an attachment ("full write-up"). Numbers come from evidence.json only.
+
+Reads run-logs/incentive-mm/daily_review/<D>/: evidence.json (imm_review.py
+collect), findings.json + review.md (the skill), ids.json + ingested.json
+(ledger ingest), and the ledger itself. Writes <D>/email.html and, once sent,
+<D>/sent.marker.
 
 Mail goes through the ALERT_EMAIL_* account send_alert_email.py uses, to
 IMM_REVIEW_TO, else ALERT_EMAIL_TO, else the sender; each is read from the
-environment first, then from HKCU\Environment (Task Scheduler sessions do not
-always carry user variables).
+environment first, then from HKCU\Environment.
 """
 from __future__ import annotations
 
 import argparse
-import json
+import html as _html
 import os
 import re
 import smtplib
@@ -32,7 +45,7 @@ import time
 from datetime import date, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -49,6 +62,16 @@ except Exception:
 
 SEND_TRIES = 4
 SEND_WAIT = 90
+MAX_DECISIONS = 3
+MAX_FYI = 7
+
+# palette (inline styles: Gmail keeps those)
+FONT = "-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+INK, MUTED, LINE, PAGE, CARD = "#1f2328", "#5f6368", "#e3e6ea", "#f4f5f7", "#ffffff"
+GREEN, RED, AMBER, BLUE = "#137333", "#c5221f", "#b06000", "#1a56db"
+SEV_STYLE = {"P0": ("#fce8e6", RED), "P1": ("#fce8e6", RED),
+             "P2": ("#fef3e0", AMBER), "P3": ("#eef0f2", MUTED)}
+DOT = {"green": GREEN, "amber": AMBER, "red": RED, "gray": "#9aa0a6"}
 
 
 def setting(name: str) -> str:
@@ -75,6 +98,10 @@ def _read(path: str) -> str:
         return ""
 
 
+def esc(s) -> str:
+    return _html.escape(str(s if s is not None else ""), quote=True)
+
+
 def substitute_ids(md: str, ids: dict) -> str:
     """[[fp:<fingerprint>]] -> the ledger id (or nothing when it was never ingested)."""
     def rep(m):
@@ -87,132 +114,417 @@ def _dow(day: date) -> str:
     return day.strftime("%a ") + f"{day.month}/{day.day}"
 
 
-def subject_for(day: date, ev: dict, findings: dict, fallback: bool = False,
-                reason: str = "") -> str:
-    d = ((ev.get("scorecard") or {}).get("day_totals") or {})
-    nums = ""
-    if d:
-        nums = (f"net {rv.usd0(d.get('net'))} (rewards {rv.usd0(d.get('rew'), False)} | "
-                f"trading {rv.usd0(d.get('pnl'))})")
-    if fallback:
-        return f"IMM review {_dow(day)}: {nums or 'no numbers'} -- DATA ONLY ({reason or 'analysis did not run'})"[:200]
-    s = str((findings or {}).get("subject") or "").strip()
-    if s:
-        s = re.sub(r"\s+", " ", s)
-        return (s if s.lower().startswith("imm review") else f"IMM review {_dow(day)}: {s}")[:200]
-    n_dec = sum(1 for f in (findings or {}).get("findings") or []
-                if isinstance(f, dict) and f.get("decision_needed"))
-    return f"IMM review {_dow(day)}: {nums} | {n_dec} decision{'s' if n_dec != 1 else ''}"[:200]
+def money(x, signed: bool = True) -> str:
+    """$ rounded to whole dollars: +$415, -$461, $875."""
+    v = rv._f(x)
+    s = "${:,.0f}".format(abs(v))
+    return (("-" if v < 0 else "+") + s) if signed else s
 
 
-def appendix_md(ev: dict) -> str:
-    """Exact numbers straight from evidence.json (never model-written)."""
-    sc = ev.get("scorecard") or {}
-    d = sc.get("day_totals") or {}
-    L = ["---", "## The numbers (generated from the evidence pack, not written by the model)"]
-    if d:
-        w7, w30 = sc.get("7d") or {}, sc.get("30d") or {}
-        L += ["| | Day | 7d avg | 30d avg |", "|---|---:|---:|---:|",
-              f"| Rewards (modelled) | {rv.usd(d.get('rew'))} | {rv.usd(w7.get('rew_mean'))} | {rv.usd(w30.get('rew_mean'))} |",
-              f"| Trading, marked at last trade | {rv.usd(d.get('pnl'))} | {rv.usd(w7.get('pnl_mean'))} | {rv.usd(w30.get('pnl_mean'))} |",
-              f"| Net | {rv.usd(d.get('net'))} | {rv.usd(w7.get('mean'))} | {rv.usd(w30.get('mean'))} |",
-              f"| Fills / contracts | {int(rv._f(d.get('fills')))} / {rv._f(d.get('cts')):,.0f} | | |",
-              ""]
-        if w30.get("n"):
-            L.append(f"30d risk: Sharpe {rv._fmt(w30.get('sharpe'))}, max drawdown {rv.usd(w30.get('max_dd'))}, "
-                     f"worst day {rv.usd(w30.get('worst'))}, green {w30.get('green')}/{w30.get('n')}, "
-                     f"trading ate {rv._fmt(w30.get('tax'), 3)} of rewards.")
-        chk = sc.get("dash_check")
-        if chk:
-            ok = abs(rv._f(chk["diff_rew"])) < 1 and abs(rv._f(chk["diff_pnl"])) < 1
-            L.append(f"Dashboard tie-out: {'matches' if ok else 'MISMATCH'} (page {chk['dash_rew']} / {chk['dash_pnl']}).")
-    fams = (ev.get("attribution") or {}).get("families") or []
-    if fams:
-        L += ["", "| Family | Day net | 7d net | 30d net |", "|---|---:|---:|---:|"]
-        ranked = sorted(fams, key=lambda f: rv._f(f["d30"]["net"]))
-        for f in ranked[:5] + ([] if len(ranked) <= 10 else [None]) + ranked[-5:]:
-            if f is None:
-                L.append("| ... | | | |")
-                continue
-            L.append(f"| {f['family']} | {rv.usd(f['day']['net'])} | {rv.usd(f['d7']['net'])} | {rv.usd(f['d30']['net'])} |")
+def _short(text, n: int) -> str:
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    t = re.sub(r"\[\[fp:[^\]]+\]\]", "", t)
+    if len(t) <= n:
+        return t
+    cut = t[:n].rsplit(" ", 1)[0].rstrip(",;:-")
+    return cut + "..."
+
+
+def _first_sentence(text, n: int) -> str:
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    m = re.match(r"(.+?[.!?])(\s|$)", t)
+    return _short(m.group(1) if m else t, n)
+
+
+def email_fields(f: dict) -> dict:
+    """The four short phrases a card shows. The skill writes them in the
+    finding's "email" block; older findings fall back to shortened fields."""
+    e = f.get("email") if isinstance(f.get("email"), dict) else {}
+    imp = f.get("impact") if isinstance(f.get("impact"), dict) else {}
+    plan = f.get("plan") if isinstance(f.get("plan"), dict) else {}
+    value = e.get("value") or ""
+    if not value and imp.get("usd_day") not in (None, "", 0, 0.0):
+        value = f"~{money(imp.get('usd_day'), False)}/day ({imp.get('basis') or 'modelled'})"
+    return {"headline": _short(e.get("headline") or f.get("title"), 90),
+            "why": _short(e.get("why") or _first_sentence(f.get("summary"), 230), 240),
+            "fix": _short(e.get("fix") or _first_sentence(plan.get("change"), 170), 180),
+            "value": _short(value, 60)}
+
+
+def load_ctx(day: date) -> dict:
+    dd = day_dir(day)
+    ev = rv._load_json(os.path.join(dd, "evidence.json"), {}) or {"day": day.isoformat()}
+    findings = rv._load_json(os.path.join(dd, "findings.json"), {}) or {}
+    ids = rv._load_json(os.path.join(dd, "ids.json"), {}) or {}
+    ing = rv._load_json(os.path.join(dd, "ingested.json"), {}) or {}
+    created = set(ing.get("created") or [])
+    try:
+        ledger = rv.ledger_state()
+    except Exception:
+        ledger = {}
+    rows = []
+    for f in findings.get("findings") or []:
+        if not isinstance(f, dict):
+            continue
+        fp = rv._slug(f.get("fingerprint") or "")
+        iid = ids.get(fp) or (f.get("ledger_id") if f.get("ledger_id") in ledger else None) or ""
+        sev = str(f.get("severity") or "P3").upper()
+        rows.append({"id": iid, "sev": sev if sev in SEV_STYLE else "P3",
+                     "decision": bool(f.get("decision_needed")), "new": iid in created or not iid,
+                     "usd": abs(rv._f((f.get("impact") or {}).get("usd_day")))
+                     if isinstance(f.get("impact"), dict) else 0.0,
+                     **email_fields(f)})
+    order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+    rows.sort(key=lambda r: (order[r["sev"]], -r["usd"]))
+    decisions = [r for r in rows if r["decision"]][:MAX_DECISIONS]
+    extra_dec = [r for r in rows if r["decision"]][MAX_DECISIONS:]
+    fyi_all = [r for r in rows if not r["decision"]] + extra_dec
+    fyi = [r for r in fyi_all if r["new"] or r["sev"] in ("P0", "P1")]
+    today_ids = {r["id"] for r in rows}
+    waiting = []
+    for iid, it in sorted(ledger.items()):
+        if it.get("status") == "proposed" and iid not in today_ids and (it.get("first_seen") or "") < day.isoformat():
+            age = (day - date.fromisoformat(it["first_seen"])).days if it.get("first_seen") else 0
+            head = (it.get("email") or {}).get("headline") if isinstance(it.get("email"), dict) else None
+            waiting.append({"id": iid, "headline": _short(head or it.get("title"), 80), "age": age})
+    evals = []
+    for e in findings.get("evaluations") or []:
+        if isinstance(e, dict) and e.get("id"):
+            it = ledger.get(e["id"]) or {}
+            evals.append({"id": e["id"], "verdict": e.get("verdict") or "inconclusive",
+                          "headline": _short(it.get("title") or e.get("note"), 80),
+                          "delta": e.get("delta_usd_day"), "note": _short(e.get("note"), 140)})
+    closures = [{"id": c.get("id"), "status": c.get("status"), "note": _short(c.get("note"), 120)}
+                for c in findings.get("closures") or [] if isinstance(c, dict) and c.get("id")]
+    return {"day": day, "ev": ev, "findings": findings, "decisions": decisions,
+            "fyi": fyi[:MAX_FYI], "fyi_more": max(0, len(fyi) - MAX_FYI),
+            "repeat_quiet": len(fyi_all) - len(fyi), "waiting": waiting[:6],
+            "evals": evals, "closures": closures,
+            "open": sum(1 for it in ledger.values() if it.get("status") not in rv.TERMINAL),
+            "verdict": _short(findings.get("verdict") or findings.get("headline") or "", 260)}
+
+
+# ---------------------------------------------------------------------------
+# health checks: (label, colour) chips from the evidence pack
+# ---------------------------------------------------------------------------
+
+def health_checks(ev: dict) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    cv = ev.get("coverage") or {}
     sy = ev.get("system") or {}
-    m = sy.get("machine") or {}
+    if cv.get("cycles") is not None:
+        dark = rv._f(cv.get("dark_minutes"))
+        out.append(("Bot up all day" if dark <= 0 else f"Bot dark {dark:.0f} min",
+                    "green" if dark <= 0 else ("amber" if dark < 30 else "red")))
+    lg = sy.get("log") or {}
+    if lg:
+        sev = lg.get("by_severity") or {}
+        crashes = int(rv._f(sev.get("TB"))) + int(rv._f(sev.get("!!")))
+        new = len(lg.get("new") or [])
+        out.append(("No crashes" if not crashes else f"{crashes} crash line(s)", "green" if not crashes else "red"))
+        out.append(("No new errors" if not new else f"{new} new error type(s)", "green" if not new else "amber"))
+    tk = sy.get("tasks") or {}
+    if tk and not tk.get("error"):
+        fails = tk.get("failing") or []
+        imm = [t for t in fails if re.search(r"imm|incentive|portfolio|sync|dashboard", t.get("task") or "", re.I)]
+        if not fails:
+            out.append(("All jobs OK", "green"))
+        elif imm:
+            out.append((f"{len(imm)} IMM job(s) failing", "red"))
+        else:
+            out.append((f"{len(fails)} other job(s) failing", "gray"))
     sn = sy.get("sync") or {}
     g = sy.get("git") or {}
-    lg = sy.get("log") or {}
-    tk = sy.get("tasks") or {}
-    checks = []
-    if lg:
-        checks.append(f"bot log {lg.get('by_severity')}, {len(lg.get('new') or [])} new signature(s), "
-                      f"{lg.get('starts')} process start(s)")
-    if sn:
-        checks.append(f"repo sync last success {sn.get('last_success')}, failure streak {sn.get('failure_streak')}")
-    if g:
-        checks.append(f"live tree {g.get('ahead')} ahead / {g.get('behind')} behind GitHub, "
-                      f"{g.get('dirty_count')} uncommitted tracked files")
-    if m:
-        checks.append(f"disk {m.get('disk_free_gb')} GB free, ~{m.get('days_to_full')} days to full at "
-                      f"{m.get('growth_gb_day')} GB/day")
-    if tk and not tk.get("error"):
-        checks.append(f"{len(tk.get('failing') or [])} failing scheduled task(s)")
+    if sn or g:
+        streak = int(rv._f(sn.get("failure_streak")))
+        unp = len(g.get("unpushed") or [])
+        if streak == 0 and unp == 0:
+            out.append(("Repo in sync", "green"))
+        else:
+            out.append((f"Repo sync failing x{streak}" if streak else f"{unp} unpushed commit(s)", "red" if streak > 2 else "amber"))
+    m = sy.get("machine") or {}
+    if m.get("days_to_full") is not None:
+        d = rv._f(m["days_to_full"])
+        out.append((f"Disk: {d:.0f} days left", "green" if d > 60 else ("amber" if d > 21 else "red")))
     dh = (ev.get("data") or {}).get("alerts") or []
-    if dh:
-        checks.append("data sinks off their normal size: " + ", ".join(dh[:8]))
+    if ev.get("data"):
+        out.append(("Data feeds normal" if not dh else f"{len(dh)} data feed(s) off", "green" if not dh else "amber"))
+    cr = (ev.get("scorecard") or {}).get("credits") or {}
+    if cr.get("age_days") is not None:
+        a = int(rv._f(cr["age_days"]))
+        out.append((f"Rewards statement {a}d old", "green" if a <= 4 else ("amber" if a <= 10 else "red")))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------------------
+
+def _num(x, signed=True, size=None, bold=False) -> str:
+    v = rv._f(x)
+    col = INK if not signed else (GREEN if v > 0 else RED if v < 0 else INK)
+    st = f"color:{col};" + (f"font-size:{size}px;" if size else "") + ("font-weight:700;" if bold else "")
+    return f'<span style="{st}">{esc(money(x, signed))}</span>'
+
+
+def _chip(text: str, colour: str) -> str:
+    return (f'<span style="display:inline-block;margin:0 6px 6px 0;padding:3px 9px;border-radius:12px;'
+            f'border:1px solid {LINE};background:{CARD};font-size:13px;color:{INK};white-space:nowrap">'
+            f'<span style="color:{DOT.get(colour, MUTED)};font-size:14px">&#9679;</span> {esc(text)}</span>')
+
+
+def _sev(sev: str) -> str:
+    bg, fg = SEV_STYLE.get(sev, SEV_STYLE["P3"])
+    return (f'<span style="display:inline-block;padding:1px 7px;border-radius:9px;background:{bg};color:{fg};'
+            f'font-size:11px;font-weight:700;vertical-align:2px">{esc(sev)}</span>')
+
+
+def _h2(text: str, count: Optional[int] = None) -> str:
+    c = f' <span style="color:{MUTED};font-weight:400">({count})</span>' if count is not None else ""
+    return (f'<div style="margin:26px 0 8px;font-size:13px;font-weight:700;letter-spacing:.06em;'
+            f'text-transform:uppercase;color:{MUTED}">{esc(text)}{c}</div>')
+
+
+def _card(inner: str, accent: str = LINE) -> str:
+    return (f'<div style="background:{CARD};border:1px solid {LINE};border-left:4px solid {accent};'
+            f'border-radius:10px;padding:14px 16px;margin:0 0 10px">{inner}</div>')
+
+
+def render_html(ctx: dict, fallback_reason: str = "") -> str:
+    day: date = ctx["day"]
+    ev = ctx["ev"]
+    sc = ev.get("scorecard") or {}
+    d = sc.get("day_totals") or {}
+    w7, w30 = sc.get("7d") or {}, sc.get("30d") or {}
+    P = []
+    a = P.append
+    pre = ctx["verdict"] or (f"Net {money(d.get('net'))} on {_dow(day)}" if d else "")
+    a(f'<div style="display:none;max-height:0;overflow:hidden;opacity:0">{esc(pre)}</div>')
+    a(f'<div style="background:{PAGE};padding:16px 0;font-family:{FONT};color:{INK};font-size:15px;line-height:1.45">')
+    a('<div style="max-width:640px;margin:0 auto;padding:0 12px">')
+    # header
+    a(f'<div style="font-size:13px;color:{MUTED}">IMM daily review &middot; {esc(day.strftime("%A, %B %d").replace(" 0", " "))}</div>')
+    if d:
+        a(f'<div style="margin:6px 0 2px">{_num(d.get("net"), size=34, bold=True)}'
+          f'<span style="font-size:16px;color:{MUTED}"> net</span></div>')
+        a(f'<div style="font-size:14px;color:{MUTED}">Rewards {_num(d.get("rew"))} &middot; Trading {_num(d.get("pnl"))}'
+          f' &middot; 7-day avg {_num(w7.get("mean"))}/day</div>')
+    if fallback_reason:
+        a(_card(f'<b style="color:{RED}">The analysis did not run</b> ({esc(fallback_reason)}). Numbers and checks '
+                'below come straight from the data; nothing was judged. The full evidence pack is attached.', RED))
+    elif ctx["verdict"]:
+        a(f'<div style="margin:12px 0 0;font-size:16px">{esc(ctx["verdict"])}</div>')
+    # decisions
+    if not fallback_reason:
+        dec = ctx["decisions"]
+        a(_h2("Needs your OK", len(dec)))
+        if not dec:
+            a(f'<div style="color:{MUTED}">Nothing today.</div>')
+        for i, r in enumerate(dec, 1):
+            idt = r["id"] or "(not filed)"
+            inner = [f'<div style="font-size:16px;font-weight:700;margin-bottom:6px">{i}. {esc(r["headline"])} {_sev(r["sev"])}</div>']
+            if r["why"]:
+                inner.append(f'<div style="margin-bottom:6px">{esc(r["why"])}</div>')
+            if r["fix"]:
+                inner.append(f'<div style="margin-bottom:6px"><b>Fix:</b> {esc(r["fix"])}</div>')
+            if r["value"]:
+                inner.append(f'<div style="margin-bottom:8px"><b>Worth:</b> {esc(r["value"])}</div>')
+            inner.append(f'<div style="font-size:14px;color:{BLUE}">Approve: text '
+                         f'<b style="white-space:nowrap">do {esc(idt)}</b></div>'
+                         f'<div style="font-size:12px;color:{MUTED}">or text '
+                         f'<span style="white-space:nowrap">no {esc(idt)}</span> to drop it</div>')
+            a(_card("".join(inner), SEV_STYLE[r["sev"]][1]))
+        # fyi
+        if ctx["fyi"]:
+            a(_h2("Worth knowing"))
+            items = []
+            for r in ctx["fyi"]:
+                why = f'<div style="color:{MUTED};font-size:14px">{esc(r["why"])}</div>' if r["why"] else ""
+                items.append(f'<div style="padding:8px 0;border-top:1px solid {LINE}">{_sev(r["sev"])} '
+                             f'<b>{esc(r["headline"])}</b> <span style="color:{MUTED};font-size:12px;'
+                             f'white-space:nowrap">{esc(r["id"])}</span>{why}</div>')
+            more = []
+            if ctx["fyi_more"]:
+                more.append(f'{ctx["fyi_more"]} more new')
+            if ctx["repeat_quiet"]:
+                more.append(f'{ctx["repeat_quiet"]} already known')
+            if more:
+                items.append(f'<div style="padding:8px 0;border-top:1px solid {LINE};color:{MUTED};font-size:13px">'
+                             f'{esc(" and ".join(more))} - in the full write-up and the ledger.</div>')
+            a(_card("".join(items)))
+        # past changes
+        if ctx["evals"] or ctx["closures"] or ctx["waiting"]:
+            a(_h2("Follow-ups"))
+            items = []
+            mark = {"verified": ("Worked", GREEN), "failed": ("Didn't work", RED), "inconclusive": ("Too early to tell", AMBER)}
+            for e in ctx["evals"]:
+                lab, col = mark.get(e["verdict"], ("Checked", MUTED))
+                dl = f' ({esc(money(e["delta"]))}/day)' if e.get("delta") not in (None, "") else ""
+                items.append(f'<div style="padding:6px 0"><b style="color:{col}">{lab}:</b> {esc(e["headline"])}{dl} '
+                             f'<span style="color:{MUTED};font-size:12px;white-space:nowrap">{esc(e["id"])}</span></div>')
+            for c in ctx["closures"]:
+                items.append(f'<div style="padding:6px 0"><b>Closed</b> ({esc(c["status"])}): {esc(c["note"])} '
+                             f'<span style="color:{MUTED};font-size:12px;white-space:nowrap">{esc(c["id"])}</span></div>')
+            for w in ctx["waiting"]:
+                items.append(f'<div style="padding:6px 0"><b style="color:{AMBER}">Still waiting on you</b> '
+                             f'({w["age"]}d): {esc(w["headline"])} <span style="color:{MUTED};font-size:12px;'
+                             f'white-space:nowrap">text do {esc(w["id"])}</span></div>')
+            a(_card("".join(items)))
+    # numbers
+    if d:
+        a(_h2("The numbers"))
+        rows = [("Net", d.get("net"), w7.get("mean"), w30.get("mean"), True),
+                ("Rewards (modelled)", d.get("rew"), w7.get("rew_mean"), w30.get("rew_mean"), True),
+                ("Trading (marked to last trade)", d.get("pnl"), w7.get("pnl_mean"), w30.get("pnl_mean"), True)]
+        td = f'style="padding:6px 8px;text-align:right;border-top:1px solid {LINE}"'
+        tl = f'style="padding:6px 8px;text-align:left;border-top:1px solid {LINE}"'
+        t = [f'<table style="width:100%;border-collapse:collapse;font-size:14px">'
+             f'<tr><th style="text-align:left;padding:4px 8px;color:{MUTED};font-weight:600"></th>'
+             f'<th style="text-align:right;padding:4px 8px;color:{MUTED};font-weight:600">{esc(_dow(day))}</th>'
+             f'<th style="text-align:right;padding:4px 8px;color:{MUTED};font-weight:600">7-day avg</th>'
+             f'<th style="text-align:right;padding:4px 8px;color:{MUTED};font-weight:600">30-day avg</th></tr>']
+        for lab, x, y, z, sg in rows:
+            t.append(f'<tr><td {tl}>{esc(lab)}</td><td {td}>{_num(x, sg)}</td><td {td}>{_num(y, sg)}</td>'
+                     f'<td {td}>{_num(z, sg)}</td></tr>')
+        t.append(f'<tr><td {tl}>Fills / contracts</td><td {td}>{int(rv._f(d.get("fills")))} / '
+                 f'{rv._f(d.get("cts")):,.0f}</td><td {td}></td><td {td}></td></tr></table>')
+        risk = []
+        if w30.get("n"):
+            risk.append(f'30 days: worst day {money(w30.get("worst"))}, max drawdown {money(w30.get("max_dd"))}, '
+                        f'{w30.get("green")} of {w30.get("n")} days green')
+            if w30.get("tax") is not None:
+                risk.append(f'trading gave back {rv._f(w30.get("tax")) * 100:.0f}% of rewards')
+        fams = (ev.get("attribution") or {}).get("families") or []
+        famline = ""
+        if fams:
+            ranked = sorted((f for f in fams if abs(rv._f(f["day"]["net"])) >= 1), key=lambda f: -rv._f(f["day"]["net"]))
+            best = [f'{f["family"]} {money(f["day"]["net"])}' for f in ranked[:3] if rv._f(f["day"]["net"]) > 0]
+            worst = [f'{f["family"]} {money(f["day"]["net"])}' for f in ranked[::-1][:3] if rv._f(f["day"]["net"]) < 0]
+            if best:
+                famline += f'<div style="margin-top:8px"><b style="color:{GREEN}">Best:</b> {esc(", ".join(best))}</div>'
+            if worst:
+                famline += f'<div><b style="color:{RED}">Worst:</b> {esc(", ".join(worst))}</div>'
+        a(_card("".join(t) + (f'<div style="margin-top:10px;color:{MUTED};font-size:13px">{esc("; ".join(risk))}.</div>' if risk else "") + famline))
+    checks = health_checks(ev)
     if checks:
-        L += ["", "System checks: " + "; ".join(checks) + "."]
-    led = ev.get("ledger") or {}
-    if led:
-        st = led.get("stats") or {}
-        L += ["", f"Ledger: {led.get('open')} open items; {len(led.get('awaiting_decision') or [])} awaiting you; "
-                  f"{len(led.get('due') or [])} due a re-measure; verified gains so far "
-                  f"{rv.usd(st.get('verified_delta_usd_day'))}/day."]
-    errs = ev.get("errors") or {}
-    if errs:
-        L += ["", "Evidence sections that failed: " + "; ".join(f"{k}: {v}" for k, v in errs.items())]
-    L += ["", f"Files: {day_dir(date.fromisoformat(ev['day']))} (evidence.md, review.md, findings.json). "
-              "Approve a decision by texting \"do <id>\" or in any Claude session: /imm-daily-review apply <id>."]
+        a(_h2("Health checks"))
+        a('<div>' + "".join(_chip(t, c) for t, c in checks) + '</div>')
+    # footer
+    foot = [f'{ctx["open"]} open item(s) in the ledger.'] if ctx.get("open") else []
+    foot.append("The full write-up is attached." if not fallback_reason else "The evidence pack is attached.")
+    foot.append("Approve by text (do R-...) or in any Claude session (/imm-daily-review apply R-...).")
+    foot.append("Rewards are the bot's model until Kalshi pays them (1-2 days later); trading is marked to the last trade.")
+    a(f'<div style="margin:22px 0 8px;font-size:12px;color:{MUTED}">{esc(" ".join(foot))}</div>')
+    a('</div></div>')
+    return "\n".join(P)
+
+
+# ---------------------------------------------------------------------------
+# plain text (previews, old clients)
+# ---------------------------------------------------------------------------
+
+def render_text(ctx: dict, fallback_reason: str = "") -> str:
+    day: date = ctx["day"]
+    sc = (ctx["ev"].get("scorecard") or {})
+    d = sc.get("day_totals") or {}
+    w7 = sc.get("7d") or {}
+    L = [f"IMM daily review - {_dow(day)}"]
+    if d:
+        L.append(f"Net {money(d.get('net'))} (rewards {money(d.get('rew'))}, trading {money(d.get('pnl'))}); "
+                 f"7-day avg {money(w7.get('mean'))}/day.")
+    if fallback_reason:
+        L.append(f"The analysis did not run ({fallback_reason}). Numbers only; evidence attached.")
+    elif ctx["verdict"]:
+        L.append(ctx["verdict"])
+    if not fallback_reason:
+        L += ["", f"NEEDS YOUR OK ({len(ctx['decisions'])})"]
+        for i, r in enumerate(ctx["decisions"], 1):
+            L.append(f"{i}. {r['headline']} [{r['sev']}]")
+            for k, lab in (("why", ""), ("fix", "Fix: "), ("value", "Worth: ")):
+                if r[k]:
+                    L.append(f"   {lab}{r[k]}")
+            L.append(f"   Approve: text \"do {r['id']}\"")
+        if not ctx["decisions"]:
+            L.append("Nothing today.")
+        if ctx["fyi"]:
+            L += ["", "WORTH KNOWING"]
+            for r in ctx["fyi"]:
+                L.append(f"- [{r['sev']}] {r['headline']} ({r['id']})")
+        for e in ctx["evals"]:
+            L.append(f"- Follow-up {e['id']}: {e['verdict']} - {e['headline']}")
+        for w in ctx["waiting"]:
+            L.append(f"- Still waiting on you ({w['age']}d): {w['headline']} - text do {w['id']}")
+    checks = health_checks(ctx["ev"])
+    if checks:
+        L += ["", "HEALTH: " + "; ".join(t for t, _ in checks)]
+    L += ["", "Full write-up attached."]
     return "\n".join(L)
 
 
-def build(day: date, fallback: bool = False, reason: str = "") -> Tuple[str, str, str]:
+# ---------------------------------------------------------------------------
+# build + send
+# ---------------------------------------------------------------------------
+
+def subject_for(ctx: dict, fallback_reason: str = "") -> str:
+    day: date = ctx["day"]
+    d = ((ctx["ev"].get("scorecard") or {}).get("day_totals") or {})
+    net = f"{money(d.get('net'))} net" if d else "no numbers"
+    if fallback_reason:
+        return f"IMM review {_dow(day)}: {net} | numbers only, analysis did not run"
+    n = len(ctx["decisions"])
+    s = f"IMM review {_dow(day)}: {net} | " + (f"{n} need{'s' if n == 1 else ''} your OK" if n else "nothing needs you")
+    if ctx["decisions"]:
+        top = ctx["decisions"][0]["headline"]
+        if len(s) + len(top) + 3 <= 110:
+            s += " | " + top
+    return s
+
+
+def full_writeup(day: date, ctx: dict, fallback_reason: str = "") -> Tuple[str, str]:
+    """(file name, HTML page) of the long version: the model's review.md, or
+    the evidence pack when the analysis did not run."""
     dd = day_dir(day)
-    ev = rv._load_json(os.path.join(dd, "evidence.json"), {}) or {}
-    findings = rv._load_json(os.path.join(dd, "findings.json"), {}) or {}
+    if fallback_reason:
+        md = _read(os.path.join(dd, "evidence.md"))
+        return f"IMM-evidence-{day.isoformat()}.html", mdr.page(f"IMM evidence {day.isoformat()}", [mdr.render(md)])
     ids = rv._load_json(os.path.join(dd, "ids.json"), {}) or {}
-    review = substitute_ids(_read(os.path.join(dd, "review.md")), ids).strip()
-    if not ev:
-        ev = {"day": day.isoformat()}
-    if fallback or not review:
-        why = reason or ("review.md missing" if not review else "")
-        head = (f"# IMM review {day.isoformat()}: data only\n\n**The analysis did not run ({why}).** "
-                f"Below is the evidence pack the collector built; nothing in it was judged.\n")
-        body_md = head + "\n" + _read(os.path.join(dd, "evidence.md"))
-        subject = subject_for(day, ev, findings, fallback=True, reason=why)
-        text = body_md
-    else:
-        body_md = review + "\n\n" + appendix_md(ev)
-        subject = subject_for(day, ev, findings)
-        text = body_md
-    page = mdr.page(f"IMM review {day.isoformat()}", [mdr.render(body_md)])
-    with open(os.path.join(dd, "review.html"), "w", encoding="utf-8") as fh:
+    md = substitute_ids(_read(os.path.join(dd, "review.md")), ids).strip()
+    return f"IMM-review-{day.isoformat()}-full.html", mdr.page(f"IMM review {day.isoformat()} (full write-up)",
+                                                               [mdr.render(md)])
+
+
+def build(day: date, fallback: bool = False, reason: str = "") -> Tuple[str, str, str, List[Tuple[str, str]]]:
+    dd = day_dir(day)
+    os.makedirs(dd, exist_ok=True)
+    ctx = load_ctx(day)
+    has_review = bool(_read(os.path.join(dd, "review.md")).strip()) and bool(ctx["findings"])
+    why = ""
+    if fallback or not has_review:
+        why = reason or ("no review was written" if not has_review else "fallback requested")
+    page = render_html(ctx, why)
+    text = render_text(ctx, why)
+    subject = subject_for(ctx, why)
+    attach = [full_writeup(day, ctx, why)]
+    with open(os.path.join(dd, "email.html"), "w", encoding="utf-8") as fh:
         fh.write(page)
-    return subject, page, text
+    return subject, page, text, attach
 
 
-def send(subject: str, html: str, text: str) -> bool:
+def send(subject: str, html: str, text: str, attachments: Optional[List[Tuple[str, str]]] = None) -> bool:
     frm, pw = setting("ALERT_EMAIL_FROM"), setting("ALERT_EMAIL_PASSWORD")
     to = setting("IMM_REVIEW_TO") or setting("ALERT_EMAIL_TO") or frm
     if not frm or not pw:
         print("send: ALERT_EMAIL_FROM / ALERT_EMAIL_PASSWORD not configured")
         return False
-    try:
-        import send_html_email as she
-        html_body = she.wrap_body_for_email(html)
-    except Exception:
-        html_body = html
-    msg = MIMEMultipart("alternative")
-    msg.attach(MIMEText(text, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    body = MIMEMultipart("alternative")
+    body.attach(MIMEText(text, "plain", "utf-8"))
+    body.attach(MIMEText(html, "html", "utf-8"))
+    msg = MIMEMultipart("mixed")
+    msg.attach(body)
+    for name, content in attachments or []:
+        part = MIMEText(content, "html", "utf-8")
+        part.add_header("Content-Disposition", "attachment", filename=name)
+        msg.attach(part)
     msg["Subject"] = subject
     msg["From"] = frm
     msg["To"] = to
@@ -248,14 +560,15 @@ def main(argv: Optional[list] = None) -> int:
     if os.path.exists(marker) and not (a.force or a.dry or a.test):
         print(f"already sent for {day} ({marker}); --force to resend")
         return 0
-    subject, page, text = build(day, fallback=a.fallback, reason=a.reason)
+    subject, page, text, attach = build(day, fallback=a.fallback, reason=a.reason)
     if a.test:
         subject = "[TEST] " + subject
     print("subject: " + subject)
-    print(f"html: {os.path.join(dd, 'review.html')} ({len(page):,} bytes)")
+    print(f"html: {os.path.join(dd, 'email.html')} ({len(page):,} bytes); attachments: "
+          + ", ".join(f"{n} ({len(c):,} bytes)" for n, c in attach))
     if a.dry:
         return 0
-    if not send(subject, page, text):
+    if not send(subject, page, text, attach):
         return 1
     if not a.test:
         with open(marker, "w", encoding="utf-8") as fh:
