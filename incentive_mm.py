@@ -15767,6 +15767,49 @@ def account_value_dollars(balance: dict) -> Optional[float]:
     return None
 
 
+# BALANCE READ RESILIENCE (2026-11-25, review R-261124-05; Jack: "also fix the
+# 'worth knowing' issues"). A rate-limited balance read skips that cycle's
+# account-value check: 24 times on 11/24, the account's read bucket being
+# shared with the dashboards and reports. One cycle late is harmless; a RUN of
+# failures leaves ACCOUNT_DROP_HALT blind and nothing said so. A 429 now gets
+# one retry after BALANCE_READ_RETRY_SECS (0 = no retry), and a run of failed
+# reads is logged, then emailed once it reaches BALANCE_BLIND_ALERT_CYCLES in a
+# row (~20 min at ~40 s a cycle; 0 = never emailed).
+BALANCE_READ_RETRY_SECS = _env_float("IMM_BALANCE_READ_RETRY_SECS", 1.0)
+BALANCE_BLIND_ALERT_CYCLES = _env_int("IMM_BALANCE_BLIND_ALERT_CYCLES", 30)
+
+
+def rate_limited(exc: BaseException) -> bool:
+    """A Kalshi 429 by its text (HttpError carries the status in its message)."""
+    s = str(exc)
+    return "429" in s or "Too Many Requests" in s
+
+
+# STATE SAVE RETRY (2026-11-25, review R-261124-06). On Windows os.replace() is
+# refused (WinError 5, PermissionError) while any reader holds the target open
+# -- the dashboard, a report or the health check reading the file -- and the
+# save was dropped: imm_state.json 7 times on 11/24. The order journal kept the
+# orders, so nothing was lost, but the state lagged until the next save. The
+# swap is retried briefly (0.15 s, 0.30 s, 0.45 s) before giving up as before.
+# 1 = the old single attempt.
+STATE_SAVE_REPLACE_TRIES = _env_int("IMM_STATE_SAVE_REPLACE_TRIES", 4)
+
+
+def replace_with_retry(src: str, dst: str, tries: Optional[int] = None,
+                       pause_s: float = 0.15) -> None:
+    """os.replace(src, dst), retried on PermissionError up to `tries` times
+    (STATE_SAVE_REPLACE_TRIES by default); the last failure is raised."""
+    n = max(1, STATE_SAVE_REPLACE_TRIES if tries is None else int(tries))
+    for i in range(n):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == n - 1:
+                raise
+            time.sleep(pause_s * (i + 1))
+
+
 def balance_halt_email(drop: float, anchor: float, value: float, cash: float,
                        n_cancelled: int, halted_until: float, imm_pnl_today: float,
                        live: bool) -> Tuple[str, str]:
@@ -32836,7 +32879,7 @@ class IncentiveMarketMaker:
                            # every other breaker / hold still running
                            # (GUARDS ACROSS RESTARTS)
                            **self._guard_holds_payload()}, f)
-            os.replace(tmp, self.PERSIST_PATH)
+            replace_with_retry(tmp, self.PERSIST_PATH)
             # Journal contents are now in the main file; truncate so a later
             # crash-load doesn't re-merge stale (already-pruned) ids.
             try:
@@ -43231,12 +43274,31 @@ class IncentiveMarketMaker:
         the day's anchor, set on first sight; a failed or partial read (no
         positions value) = no action."""
         try:
-            b = self.client.get_balance()
+            try:
+                b = self.client.get_balance()
+            except Exception as e:
+                if not (BALANCE_READ_RETRY_SECS > 0 and rate_limited(e)):
+                    raise
+                time.sleep(BALANCE_READ_RETRY_SECS)          # one retry on a 429
+                b = self.client.get_balance()
             value = account_value_dollars(b)
             cash = float(b.get("balance_dollars") or 0.0)
         except Exception as e:
-            log(f"{self.tag} ! balance read failed ({e}); floor check skipped")
+            streak = getattr(self, "_balance_fail_streak", 0) + 1
+            self._balance_fail_streak = streak
+            log(f"{self.tag} ! balance read failed ({e}); floor check skipped"
+                + (f" ({streak} cycles in a row)" if streak > 1 else ""))
+            if BALANCE_BLIND_ALERT_CYCLES > 0 and streak == BALANCE_BLIND_ALERT_CYCLES:
+                self.alerter.alert(
+                    "balance_blind",
+                    f"the balance read has failed {streak} cycles in a row ({e}): "
+                    f"the account-value halt (${ACCOUNT_DROP_HALT:,.0f} drop) cannot "
+                    f"see the account until a read succeeds",
+                    key="balance_blind")
             return False
+        if getattr(self, "_balance_fail_streak", 0) >= 2:
+            log(f"{self.tag} balance read back after {self._balance_fail_streak} failed cycles")
+        self._balance_fail_streak = 0
         lc = ladder_cash(b)
         self._ladder_asks_latch(cash if lc is None else lc, now_utc)
         if value is None:

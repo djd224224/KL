@@ -5509,6 +5509,103 @@ class TestBalanceFloor(unittest.TestCase):
             data = json.load(f)
         self.assertEqual((data["halted_until"], data["account_value_day_start"]), (0.0, 0.0))
 
+    # BALANCE READ RESILIENCE (2026-11-25, review R-261124-05)
+    def test_a_429_is_retried_once(self):
+        bot = self._bot()
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("HttpError(429 Too Many Requests)")
+            return _bal(9000.0, 15000.0)
+        bot.client.get_balance = flaky
+        with mock.patch.object(imm, "BALANCE_READ_RETRY_SECS", 0.001):
+            self.assertFalse(bot._check_balance_floor(datetime.now(timezone.utc)))
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(bot.state.account_value_day_start, 24000.0)   # the retry anchored
+
+    def test_other_failures_are_not_retried(self):
+        bot = self._bot()
+        calls = {"n": 0}
+
+        def down():
+            calls["n"] += 1
+            raise RuntimeError("api down")
+        bot.client.get_balance = down
+        self.assertFalse(bot._check_balance_floor(datetime.now(timezone.utc)))
+        self.assertEqual(calls["n"], 1)
+
+    def test_a_run_of_failures_is_counted_then_emailed_once(self):
+        bot = self._bot()
+
+        def limited():
+            raise RuntimeError("HttpError(429 Too Many Requests)")
+        bot.client.get_balance = limited
+        now = datetime.now(timezone.utc)
+        with mock.patch.object(imm, "BALANCE_READ_RETRY_SECS", 0.0), \
+                mock.patch.object(imm, "BALANCE_BLIND_ALERT_CYCLES", 3), \
+                mock.patch.object(bot.alerter, "alert") as alert:
+            for _ in range(5):
+                self.assertFalse(bot._check_balance_floor(now))
+        self.assertEqual(bot._balance_fail_streak, 5)
+        self.assertEqual(alert.call_count, 1)                           # at the 3rd, not after
+        self.assertEqual(alert.call_args[0][0], "balance_blind")
+        self.assertEqual(bot.state.halted_until, 0.0)
+        bot.client.get_balance = lambda: _bal(9000.0, 15000.0)
+        self.assertFalse(bot._check_balance_floor(now))
+        self.assertEqual(bot._balance_fail_streak, 0)                   # a good read resets it
+
+
+class TestStateSaveReplaceRetry(unittest.TestCase):
+    """2026-11-25 (review R-261124-06): os.replace() is refused (WinError 5)
+    while a reader holds imm_state.json open; the save retries the swap."""
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.dir = td.name
+        self.src = os.path.join(self.dir, "a.tmp")
+        self.dst = os.path.join(self.dir, "a.json")
+        with open(self.src, "w") as f:
+            f.write("new")
+        self.real = os.replace
+
+    def _refusing(self, n):
+        calls = {"n": 0}
+
+        def fake(src, dst):
+            calls["n"] += 1
+            if calls["n"] <= n:
+                raise PermissionError(13, "Access is denied")
+            return self.real(src, dst)
+        return fake, calls
+
+    def test_retries_through_a_held_target(self):
+        fake, calls = self._refusing(2)
+        with mock.patch.object(imm.os, "replace", fake):
+            imm.replace_with_retry(self.src, self.dst, tries=4, pause_s=0.0)
+        self.assertEqual(calls["n"], 3)
+        with open(self.dst) as f:
+            self.assertEqual(f.read(), "new")
+
+    def test_gives_up_after_the_last_try(self):
+        fake, calls = self._refusing(9)
+        with mock.patch.object(imm.os, "replace", fake):
+            with self.assertRaises(PermissionError):
+                imm.replace_with_retry(self.src, self.dst, tries=3, pause_s=0.0)
+        self.assertEqual(calls["n"], 3)
+
+    def test_save_persist_survives_a_brief_lock(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        fake, calls = self._refusing(2)
+        with mock.patch.object(imm.os, "replace", fake), \
+                mock.patch.object(imm.time, "sleep", lambda s: None):
+            self.assertTrue(bot._save_persist())
+        self.assertTrue(os.path.exists(bot.PERSIST_PATH))
+        self.assertGreaterEqual(calls["n"], 3)
+
 
 class TestHaltUntilRoll(unittest.TestCase):
     """Jack 2026-10-01: the daily-loss, balance-floor and open-scan halts last
