@@ -654,6 +654,22 @@ class MoatTests(Base):
         self.assertAlmostEqual(sh["Fam KXAA"]["pool_cov"], 400.0)       # per cycle, 2 cycles
         self.assertNotIn("Fam KXBB", sh)
 
+    def test_a_rerun_for_an_old_day_reads_compressed_logs(self):
+        # R-261124-03: day files older than 35 days are .gz; a re-run for one reads the same
+        import imm_log_retention as ret
+        self._cycle_log(DAY, [(9, 0, "KXAAA-1-T1", 0.10, 100), (9, 1, "KXAAA-1-T1", 0.10, 100),
+                              (21, 0, "KXAAA-1-T1", 0.20, 100)])           # 21:00 ET is the next UTC day
+        snap = self.jsonl(f"selection_snapshot_{DAY.isoformat()}.jsonl", [{"ts": "x", "ticker": "KXAAA-1-T1"}])
+        share, times = rv.cycle_share(DAY), rv.cycle_times(DAY)
+        rows = list(rv._iter_jsonl(snap))
+        for name in os.listdir(self.status):
+            if name.startswith(("cycle_log_", "selection_snapshot_")):
+                self.assertEqual(ret.compress_file(os.path.join(self.status, name))["action"], "compressed")
+        self.assertFalse(os.path.exists(snap))
+        self.assertEqual((rv.cycle_share(DAY), rv.cycle_times(DAY)), (share, times))
+        self.assertEqual(list(rv._iter_jsonl(snap)), rows)
+        self.assertEqual(len(times), 3)
+
     def test_history_priors_and_edge_watch(self):
         # 28 days: KXGOOD steady; KXFADE's reward per $ resting halves in the last 7
         for i in range(28):
@@ -718,6 +734,41 @@ class MoatTests(Base):
                                  "share_ratio": None}]}}
         self.assertEqual(sr.edge_line(ev), "Elections pool share -35% (eroding); "
                                            "Rotten Tomatoes rewards per $1k resting +40% (strengthening)")
+
+
+class RetentionStatusTests(Base):
+    """R-261124-03: the evidence pack reports imm_log_retention's last run."""
+
+    def test_reads_last_run_and_the_manifest(self):
+        import time
+        self.assertEqual(rv.retention_status(), {"present": False})
+        rdir = os.path.join(self.status, "retention")
+        os.makedirs(rdir)
+        now = time.time()
+        with open(os.path.join(rdir, "last_run.json"), "w") as fh:
+            json.dump({"ts": datetime.fromtimestamp(now - 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "mode": "apply", "compressed": 2, "in_gb": 1.5, "freed_gb": 1.2, "remaining": 3,
+                       "remaining_gb": 4.0, "held": 1, "held_reasons": {"ET day not in the day archive": 1},
+                       "failed": [{"file": "orders_2026-10-01.jsonl", "reason": "verify failed"}],
+                       "conflicts": []}, fh)
+        with open(os.path.join(rdir, "manifest.jsonl"), "w") as fh:
+            for r in ({"action": "compressed", "size": 1000, "gz_size": 100},
+                      {"action": "removed_plain", "size": 500},
+                      {"action": "failed", "size": 7},
+                      {"action": "restored", "size": 1000}):
+                fh.write(json.dumps(r) + "\n")
+        rt = rv.retention_status(now=now)
+        self.assertEqual((rt["mode"], rt["compressed"], rt["age_h"]), ("apply", 2, 1.0))
+        self.assertEqual((rt["lifetime_files"], rt["lifetime_restored"]), (2, 1))
+        md = rv.render_evidence({"day": DAY.isoformat(), "window_et": ["a", "b"], "generated": now,
+                                 "system": {"retention": rt}})
+        self.assertIn("Log retention (imm_log_retention, R-261124-03)", md)
+        self.assertIn("2 files compressed (1.5 GB in), 1.2 GB freed", md)
+        self.assertIn("Log retention FAILURES", md)
+        self.assertNotIn("STALE", md)
+        md0 = rv.render_evidence({"day": DAY.isoformat(), "window_et": ["a", "b"], "generated": now,
+                                  "system": {"retention": {"present": False}}})
+        self.assertIn("Log retention: no run yet", md0)
 
 
 class MeasureTests(Base):

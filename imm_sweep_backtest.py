@@ -28,6 +28,7 @@ from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ws_stale_score as wss  # noqa: E402
+import imm_logfiles  # noqa: E402
 
 D = wss.DEFAULT_DIR
 START, END = (sys.argv[1], sys.argv[2]) if len(sys.argv) > 2 else ("2026-09-06", "2026-10-04")
@@ -57,13 +58,14 @@ def ts_of(s, cache={}):
 
 def load_day(day, want):
     """(mids: ticker -> [(ts, mid)], event $/day rate, cycles that day)"""
-    p = os.path.join(D, f"cycle_log_{day}.csv")
+    # plain, or .gz once imm_log_retention compressed it (R-261124-03)
+    p = imm_logfiles.resolve(os.path.join(D, f"cycle_log_{day}.csv"))
     mids = defaultdict(list)
     ev_sum = defaultdict(float)
     rows_per_ticker = defaultdict(int)
     if not os.path.exists(p):
         return mids, {}, 0
-    with open(p, encoding="utf-8", newline="") as f:
+    with imm_logfiles.open_text(p, encoding="utf-8", newline="") as f:
         idx = {}
         for row in csv.reader(f):
             if not row:
@@ -127,7 +129,7 @@ for day in days(START, END):
     mids, rate, ncyc = load_day(day, want)
     # the next day's early rows mark late fills
     nxt = (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-    if os.path.exists(os.path.join(D, f"cycle_log_{nxt}.csv")):
+    if os.path.exists(imm_logfiles.resolve(os.path.join(D, f"cycle_log_{nxt}.csv"))):
         m2, _, _ = load_day(nxt, want)
         for t, v in m2.items():
             mids[t].extend(x for x in v if x[0] < v[0][0] + 7200) if v else None

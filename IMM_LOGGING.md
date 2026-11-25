@@ -331,6 +331,47 @@ reward estimate the whole realization factor rests on. They go to
 carries a re-emitted 34-column header inline at each restart. The reconciler
 already skips rows whose first field is `ts`. Files from 09-07 on are clean.
 
+## Retention: text sinks are gzipped after 35 days
+
+Decided 2026-11-25 (review R-261124-03, Jack: "Yes, 35 days"). The directory
+grew ~2.4 GB a day with nothing compressing it. `imm_log_retention.py`
+(Task Scheduler `KL imm log-retention`, 02:40 ET) now gzips the text sinks in
+place once they are 35 days old, so `cycle_log_2026-10-01.csv` becomes
+`cycle_log_2026-10-01.csv.gz`. Nothing is deleted.
+
+- **What:** an allowlist. `cycle_log`, `orders`, `marks`, `selection_snapshot`,
+  `selection_events`, `floor_state`, `guard_skips`, `back_of_line`, `ws_stale`,
+  `risk_dry`, and the console logs `incentive-mm-<date>.log`, judged by their
+  last write.
+  - **Never:** `fills` (the bot reads 30 days of them for its marks),
+    `settlements`, `realized`, `book_depth` (already gzip).
+  - A new sink stays plain until it is added to `ALLOW`.
+- **When:**
+  - The cutoff is the dashboard's `IMM_DASH_HISTORY_DAYS` (30) + 5, because
+    the dashboard rebuilds its last 30 days of day archive from these files.
+  - A UTC day goes only once both ET days that read it are in
+    `dashboard/cache/day_archive`.
+  - Never a file written in the last 2 days, or one another program holds open.
+- **How:**
+  - The compressed copy is verified first (decompressed size + sha1 against
+    the original). Only then does the plain file go.
+  - The `.gz` keeps the original's mtime and gzip keeps its size, so the
+    readers' caches carry over with no rescan.
+  - A `.gz` is never overwritten.
+  - `retention/manifest.jsonl` gets one line per file. `retention/last_run.json`
+    is the summary the daily review reports.
+- **Reading old days:** go through `imm_logfiles` (`day_files`, `resolve`,
+  `open_text`, `open_bin`, `sig`). A reader that globs the plain names silently
+  loses every compressed day.
+  - `imm_reward_recon`, `imm_saturday_tracker`, `imm_dashboard`, `imm_review`
+    and `imm_sweep_backtest` already do.
+  - The job refuses `--apply` unless the first four import it.
+  - Ad hoc: `pd.read_csv("x.csv.gz")` and `gzip.open(path, "rt")` read them
+    directly; in Git Bash use `zcat` / `zgrep`.
+- **Stop / undo:** `IMM_LOG_RETENTION=0`, or a `retention/STOP` file, stops it.
+  `python imm_log_retention.py restore --all` gives every original back
+  (create STOP first).
+
 ## Helper scripts
 
 - `imm_reward_recon.py` → `program_history.jsonl`, a daily per-series roll-up of
@@ -352,16 +393,18 @@ already skips rows whose first field is `ts`. Files from 09-07 on are clean.
 `IMM_BOOK_LOG=0`, `IMM_BOOK_LOG_CANDIDATES=0`, `IMM_GUARD_LOG=0`,
 `IMM_SELECTION_INPUTS=0`, `IMM_WS_STALE_LOG=0`, `IMM_SWEEP_BREAKER=off`. Setting any of them in the launcher changes
 `CONFIG_HASH`, like every `IMM_*` variable. Tests prove order placement is
-identical with the logging on or off.
+identical with the logging on or off. The nightly compression is outside the
+bot: `IMM_LOG_RETENTION=0` (in the task's environment) or a
+`retention/STOP` file stops it.
 
 ## Still open
 
 - **Storage.** The book log roughly doubles IMM's disk growth (~385 MB/day
   before it; ESTIMATED 100-200 MB/day more for `book_depth`, possibly higher),
-  on a directory with no rotation and no off-box backup. Retention should be a
-  deliberate, registered decision, not a side effect. Do not gzip
-  `cycle_log_*.csv` in place: `imm_reward_recon.py` globs and signature-caches
-  them, and compression would break it.
+  on a directory with no off-box backup. Retention is now a deliberate,
+  registered decision (see "Retention" above: text sinks gzip after 35 days,
+  read through `imm_logfiles`). There is still no backup: a dead disk loses
+  everything.
 - **Memory.** Queued books are held until the flush at the end of each cycle,
   which makes the bot's existing full-GC pauses roughly twice as frequent.
   Trading was unaffected in replay.

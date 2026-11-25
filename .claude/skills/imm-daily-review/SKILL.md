@@ -132,6 +132,12 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   For uncommitted files, raise only the ones untouched for 24h+ (`dirty_stale_24h`), naming the commit they belong in. An edit made today is probably a session at work: committing it would sweep up that session's in-flight hunks (the 9/09 incident). The plan for a stale file is to commit exactly those paths in the live tree after their own tests pass, then push at once.
 - **Check the claim, not the label.** The first run called the 429 balance skip a "$1 payout floor" check when it is the account-value halt (`_check_balance_floor`). Read the emitting code before naming what a log line means.
 - **(f)** Machine: days-to-full under 60 is P1, under 21 is P0; research token older than 330 days is P1; memory pressure.
+  - Log retention (the evidence's "Log retention" line; `imm_log_retention.py`, R-261124-03) is P1 when any of these hold:
+    - a file failed or a .gz conflicted (the original is kept, so nothing is lost, but the backlog stops);
+    - the mode is `refused` (a reader lost its .gz support);
+    - the run is STALE (no run in 30 h).
+  - A dry run before 11/27 is expected.
+  - Old days are `.gz` past 35 days: read them through `imm_logfiles`, never a plain glob.
 - **(g)** Data health: MISSING or LOW sinks; sinks not in IMM_LOGGING.md (a docs finding).
 - **(h)** Code review of D's commits that touch incentive_mm.py, biggest first: `git show <sha> -- incentive_mm.py`. Look for:
   - logic errors, inverted conditions, units (cents vs dollars, contracts vs $);

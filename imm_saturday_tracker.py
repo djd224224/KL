@@ -116,6 +116,8 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
 
 import incentive_mm as imm                      # noqa: E402
 from incentive_mm import ET, STATUS_DIR, log    # noqa: E402
+# cycle logs older than 35 days are .csv.gz (imm_log_retention, R-261124-03)
+import imm_logfiles                             # noqa: E402
 
 import numpy as np                              # noqa: E402
 import pandas as pd                             # noqa: E402
@@ -203,8 +205,10 @@ LOG_SETTLE_SECS = 600
 
 
 def _log_sig(path: str) -> dict:
-    st = os.stat(path)
-    return {"v": CACHE_VERSION, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    """The original bytes' size + mtime: a log compressed by imm_log_retention
+    keeps both (gzip trailer + os.utime), so its cache entry is still served."""
+    return {"v": CACHE_VERSION, "size": imm_logfiles.orig_size(path),
+            "mtime_ns": os.stat(path).st_mtime_ns}
 
 
 def _log_complete(day: str, sig: dict, now: float) -> bool:
@@ -254,8 +258,7 @@ def load_cycle_data(first_file_day: str, now: float = None):
     now = time.time() if now is None else now
     today_utc = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
     sers, cycs, mids = [], [], []
-    for path in sorted(glob.glob(os.path.join(STATUS_DIR, "cycle_log_*.csv"))):
-        day = os.path.basename(path)[10:20]
+    for day, path in imm_logfiles.day_files(STATUS_DIR, "cycle_log", "csv"):
         if day < first_file_day or day > today_utc:
             continue
         try:

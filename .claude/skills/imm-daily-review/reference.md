@@ -193,7 +193,7 @@ Calibrate: each day's top predictions are logged, and when those events get quot
 | Persistence | `state save failed` lines; stale `.tmp` files; muted sinks |
 | Data sinks | each daily sink present and within 0.3-3x its 14-day median |
 | Repo | sync streak; unpushed commits; dirty tracked files in the live tree; prunable worktrees |
-| Machine | disk days-to-full; research-token age; memory |
+| Machine | disk days-to-full; research-token age; memory; log retention's last run (mode, GB freed, failures, conflicts, STALE) |
 | Ops | failing scheduled tasks (new vs chronic); task-log errors |
 | Selection | config gaps (fail-closed); floor misses |
 

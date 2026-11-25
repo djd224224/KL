@@ -76,6 +76,11 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
+# Cycle logs older than 35 days are gzip-compressed in place by
+# imm_log_retention.py (R-261124-03): list and open them through imm_logfiles,
+# or a compressed day silently drops out of every estimate.
+import imm_logfiles  # noqa: E402
+
 STATUS_DIR = os.environ.get(
     "IMM_STATUS_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -307,18 +312,19 @@ def rebuild_estimates(max_dt=900.0):
                 cache = json.load(f)
         except (OSError, ValueError):
             cache = {}
-    files = sorted(glob.glob(os.path.join(STATUS_DIR, "cycle_log_*.csv")))
+    # plain or .gz; the cache keys stay on the plain name and the sig is the
+    # original bytes', so a compressed day reuses its cached entry
+    files = imm_logfiles.day_files(STATUS_DIR, "cycle_log", "csv")
     out = defaultdict(lambda: {"est": 0.0, "first": None, "last": None,
                                "cycles": 0, "two_sided": 0})
-    for path in files:
-        st = os.stat(path)
-        key = os.path.basename(path)
-        sig = f"{st.st_size}:{int(st.st_mtime)}"
+    for _day, path in files:
+        key = imm_logfiles.plain_name(path)
+        sig = imm_logfiles.sig(path)
         entry = cache.get(key)
         if not entry or entry.get("sig") != sig:
             entry = {"sig": sig, "markets": _scan_cycle_log(path, max_dt)}
             cache[key] = entry
-            log(f"  scanned {key} ({st.st_size / 1e6:.0f} MB)")
+            log(f"  scanned {key} ({imm_logfiles.orig_size(path) / 1e6:.0f} MB)")
         for t, v in entry["markets"].items():
             d = out[t]
             d["est"] += v[0]
@@ -364,7 +370,7 @@ def _scan_cycle_log(path, max_dt, hourly=None):
             r[3] += 1
             r[4] += 1 if sides == 2 else 0
 
-    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+    with imm_logfiles.open_text(path, newline="", encoding="utf-8", errors="replace") as f:
         rdr = csv.reader(f)
         next(rdr, None)
         for row in rdr:
@@ -405,13 +411,12 @@ def rebuild_hourly(max_dt=900.0, max_date=None):
                 cache = json.load(f)
         except (OSError, ValueError):
             cache = {}
-    files = sorted(glob.glob(os.path.join(STATUS_DIR, "cycle_log_*.csv")))
+    files = imm_logfiles.day_files(STATUS_DIR, "cycle_log", "csv")
     out = defaultdict(lambda: defaultdict(float))
     dirty = False
-    for path in files:
-        key = os.path.basename(path)
-        st = os.stat(path)
-        sig = f"{st.st_size}:{int(st.st_mtime)}"
+    for _day, path in files:
+        key = imm_logfiles.plain_name(path)   # send_comp_lead_monitor reads this key
+        sig = imm_logfiles.sig(path)
         entry = cache.get(key)
         if not entry or entry.get("sig") != sig:
             hourly = {}
@@ -421,7 +426,7 @@ def rebuild_hourly(max_dt=900.0, max_date=None):
                 for t, hs in hourly.items()}}
             cache[key] = entry
             dirty = True
-            log(f"  scanned {key} by hour ({st.st_size / 1e6:.0f} MB)")
+            log(f"  scanned {key} by hour ({imm_logfiles.orig_size(path) / 1e6:.0f} MB)")
         m = re.match(r"cycle_log_(\d{4}-\d{2}-\d{2})\.csv$", key)
         if max_date and m and m.group(1) > max_date:
             continue
