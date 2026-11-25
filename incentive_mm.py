@@ -15385,6 +15385,7 @@ _CONFIG_CODE_KNOBS = (
     "HOME_FAR_FOLLOW_BOOK", "HOME_XMONTH_TOL_CENTS", "HOME_XMONTH_MIN_QTY",
     "HOME_EXPECTED_RELEASE_DAY", "HOME_PRE_RELEASE_DAYS", "HOME_PRE_RELEASE_MAX_DAY",
     "HOME_PRE_RELEASE_MODE",
+    "HOME_QUOTE_THROUGH_DAY",     # home cutoff = end of the 3rd of next month (2026-11-25)
     "HOME_AUTO", "HOME_AUTO_PATTERN",
     # placement queue priority (2026-11-14)
     "PLACE_PRIORITY", "RENEW_URGENT_SECS",
@@ -22901,9 +22902,10 @@ def mort_cap_quotes(quotes: List["Quote"], bid_cap: Optional[int],
 #     at most fair - HOME_FAIR_TOL_CENTS and every ask at least fair +
 #     HOME_FAIR_TOL_CENTS (mort_cap_quotes) -- a 1c bid and a 99c ask always
 #     allowed (HOME_EDGES).
-#   - CUTOFF 00:00 ET on the ticker's day (30NOV26 -> Nov 30), before the
-#     target month's first print; the generic date rule reads "30NOV26" as
-#     2030-11-26, so home_cutoff_utc sets it. Unparseable -> stood down.
+#   - CUTOFF the end of the 3rd of the month after the ticker's (30NOV26 ->
+#     00:00 ET Dec 4; QUOTE THROUGH THE 3RD below), before the target month's
+#     first print; the generic date rule reads "30NOV26" as 2030-11-26, so
+#     home_cutoff_utc sets it. Unparseable -> stood down.
 # Price band 1-99c (the fair bound does the band's job), size x
 # HOME_SIZE_MULT. Kill switch IMM_HOME_ENABLE=0.
 HOME_ENABLE = _HOME_LIVE
@@ -22941,8 +22943,20 @@ HOME_PRE_RELEASE_MODE = os.environ.get("IMM_HOME_PRE_RELEASE_MODE", "off").strip
 if HOME_PRE_RELEASE_MODE not in ("off", "x1"):
     HOME_PRE_RELEASE_MODE = "off"
 HOME_SIZE_MULT = _env_float("IMM_HOME_SIZE_MULT", 1.0)
+# QUOTE THROUGH THE 3RD (Jack 2026-11-25: "home value markets like
+# KXPHLHOME-30NOV26 can quote through the 3rd of the following month"). The
+# cutoff was 00:00 ET on the ticker's day (Nov 30), but the month's first
+# print is Zillow's files on the ~16th of the next month, and the markets
+# stay open until then (KXPHLHOME-30NOV26 closes 12/17 15:00Z). Now a Zillow
+# market quotes through day HOME_QUOTE_THROUGH_DAY of the month after its
+# ticker's -- the cutoff is 00:00 ET the day after (30NOV26 -> Dec 4,
+# 31DEC26 -> Jan 4 2027) -- ahead of Zillow's monthly market report (the 4th
+# to the 8th; October's came Nov 5). THE PRE-RELEASE WINDOW from the 15th is
+# untouched. IMM_HOME_QUOTE_THROUGH_DAY=0: 00:00 ET on the ticker's day
+# again (env => task-level restart).
+HOME_QUOTE_THROUGH_DAY = max(0, min(27, _env_int("IMM_HOME_QUOTE_THROUGH_DAY", 3)))
 # THE FAR MONTHS, x5 (Jack 2026-11-18: "you can go heavier on markets 3M out,
-# 5x the size"). A Zillow market whose cutoff (00:00 ET on its ticker day) is
+# 5x the size"). A Zillow market whose cutoff (home_cutoff_utc) is
 # HOME_FAR_DAYS or more away rests HOME_FAR_SIZE_MULT its size -- the rungs
 # (_market_size_mult: the quote loop, estimator, collateral and placement
 # guard alike), the per-market position cap (market_max_position), the event
@@ -23113,8 +23127,10 @@ def home_note_programs(tickers: Iterable[str]) -> frozenset:
 
 
 def home_cutoff_utc(event_ticker: str) -> Optional[datetime]:
-    """00:00 ET on the ticker's day (KXSEAHOME-30NOV26 -> 2026-11-30), else
-    None (unparseable)."""
+    """QUOTE THROUGH THE 3RD: 00:00 ET on the day after HOME_QUOTE_THROUGH_DAY
+    of the month after the ticker's (KXSEAHOME-30NOV26 -> 2026-12-04 00:00
+    ET); HOME_QUOTE_THROUGH_DAY 0 -> 00:00 ET on the ticker's day
+    (2026-11-30). None = unparseable."""
     seg = (event_ticker or "").partition("-")[2]
     m = _HOME_SEG_RE.match(seg)
     if not m or m.group(2) not in _MONTHS:
@@ -23123,6 +23139,9 @@ def home_cutoff_utc(event_ticker: str) -> Optional[datetime]:
         d = datetime(2000 + int(m.group(3)), _MONTHS[m.group(2)], int(m.group(1)))
     except ValueError:
         return None
+    if HOME_QUOTE_THROUGH_DAY > 0:
+        d = datetime(d.year + d.month // 12, d.month % 12 + 1, 1) \
+            + timedelta(days=HOME_QUOTE_THROUGH_DAY)
     return ET.localize(d).astimezone(timezone.utc)
 
 
@@ -26227,8 +26246,9 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
                         f"standing it down (fail closed)")
         cutoff = mc if cutoff is None else min(cutoff, mc)
     if home_series(series):
-        # ZILLOW HOME VALUE CUTOFF (2026-11-12, see HOME_ENABLE): 00:00 ET on
-        # the ticker's day -- the generic rule reads 30NOV26 as 2030-11-26.
+        # ZILLOW HOME VALUE CUTOFF (2026-11-12, see HOME_ENABLE): the end of
+        # the 3rd of the next month since 2026-11-25 (QUOTE THROUGH THE 3RD)
+        # -- the generic rule reads 30NOV26 as 2030-11-26.
         # Unparseable -> stood down, logged once.
         hc = home_cutoff_utc(event_ticker)
         if hc is None:

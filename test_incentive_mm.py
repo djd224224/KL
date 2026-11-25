@@ -27195,18 +27195,40 @@ class TestZillowHomeGate(unittest.TestCase):
         with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
             self.assertFalse(IncentiveMarketMaker._allowed(
                 "KXHOUHOME-28FEB27-LT111000"))
-        # 00:00 ET Nov 30 -- the generic rule reads 30NOV26 as 2030-11-26
-        nov30 = datetime(2026, 11, 30, 5, 0, tzinfo=timezone.utc)
-        self.assertEqual(imm.home_cutoff_utc("KXSEAHOME-30NOV26"), nov30)
+        # QUOTE THROUGH THE 3RD: 00:00 ET Dec 4 -- the generic rule reads
+        # 30NOV26 as 2030-11-26
+        dec4 = datetime(2026, 12, 4, 5, 0, tzinfo=timezone.utc)
+        self.assertEqual(imm.home_cutoff_utc("KXSEAHOME-30NOV26"), dec4)
         generic = imm.trade_cutoff_utc("KXSEAHOME-30NOV26", None, None)
-        self.assertGreater(generic, nov30)
+        self.assertGreater(generic, dec4)
         close = datetime(2026, 12, 17, 15, 0, tzinfo=timezone.utc)
         self.assertEqual(imm.apply_series_cutoff_adjustments(
-            "KXSEAHOME", "KXSEAHOME-30NOV26", generic, close_time=close), nov30)
+            "KXSEAHOME", "KXSEAHOME-30NOV26", generic, close_time=close), dec4)
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXSEAHOME", "KXSEAHOME-NOV26", None, close_time=close),
             imm.RELEASE_GUARD_UNKNOWN)
         self.assertIsNone(imm.home_cutoff_utc("KXSEAHOME-31FEB26"))
+
+    def test_quotes_through_the_3rd_of_the_next_month(self):
+        # Jack 2026-11-25: "home value markets like KXPHLHOME-30NOV26 can
+        # quote through the 3rd of the following month"
+        self.assertEqual(imm.HOME_QUOTE_THROUGH_DAY, 3)
+        self.assertIn("HOME_QUOTE_THROUGH_DAY", imm._CONFIG_CODE_KNOBS)
+        cut = imm.home_cutoff_utc
+        self.assertEqual(cut("KXPHLHOME-30NOV26"),
+                         datetime(2026, 12, 4, 5, 0, tzinfo=timezone.utc))
+        self.assertEqual(cut("KXMEMHOME-31DEC26"),                  # the year rolls
+                         datetime(2027, 1, 4, 5, 0, tzinfo=timezone.utc))
+        self.assertEqual(cut("KXHOUHOME-31MAR27"),                  # EDT
+                         datetime(2027, 4, 4, 4, 0, tzinfo=timezone.utc))
+        # still quoting late on the 3rd ET, out at midnight
+        dec3_late = imm.ET.localize(datetime(2026, 12, 3, 23, 59)).astimezone(timezone.utc)
+        self.assertLess(dec3_late, cut("KXPHLHOME-30NOV26"))
+        with mock.patch.object(imm, "HOME_QUOTE_THROUGH_DAY", 0):    # the old rule
+            self.assertEqual(cut("KXPHLHOME-30NOV26"),
+                             datetime(2026, 11, 30, 5, 0, tzinfo=timezone.utc))
+            self.assertEqual(cut("KXMEMHOME-31DEC26"),
+                             datetime(2026, 12, 31, 5, 0, tzinfo=timezone.utc))
 
     def test_gate_reasons_fail_closed(self):
         now = time.time()
@@ -27669,8 +27691,8 @@ class TestHomeAutoFamily(TestZillowHomeGate):
         self.assertEqual(imm.in_fair_lead_series(s_), imm.HOME_AUTO_LEAD)
         self.assertTrue(imm.HOME_AUTO_LEAD)
         self.assertEqual(imm.fair_lead_margin(s_), imm.HOME_FAIR_TOL_CENTS)
-        nov30 = imm.home_cutoff_utc("KXMEMHOME-31DEC26")
-        self.assertEqual(nov30, datetime(2026, 12, 31, 5, 0, tzinfo=timezone.utc))
+        jan4 = imm.home_cutoff_utc("KXMEMHOME-31DEC26")
+        self.assertEqual(jan4, datetime(2027, 1, 4, 5, 0, tzinfo=timezone.utc))
         # the kill switches
         with mock.patch.object(imm, "HOME_AUTO", False):
             self.assertFalse(imm.home_series(s_))
