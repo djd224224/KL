@@ -51,10 +51,14 @@ Reason labels (why a paying market isn't quoted):
   zero est yield              estimator sees no earnable share
   capacity (cap/budget)       eligible, positive — lost to the event cap /
                               collateral budget / candidate-cap truncation
+  not read (budget)           eligible, but no book read reached it this run
 
-Estimation is bounded (IMM_GAPS_MAX_BOOKS orderbook reads, IMM_GAPS_MAX_PER_EV
-per event, biggest pools first); events not reached are shown with their pool
-only and flagged unestimated — never silently dropped.
+Books are read in batches of 100 (GET /markets/orderbooks, IMM_GAPS_MAX_BOOK_CALLS
+calls, review R-261124-22), so every unquoted market with details is estimated,
+blocked and screened ones included. IMM_GAPS_BATCH_BOOKS=0, or a failed batch
+call, falls back to the bounded single reads: IMM_GAPS_MAX_BOOKS orderbook reads,
+IMM_GAPS_MAX_PER_EV per event, biggest pools first. Events not reached are shown
+with their pool only and flagged unestimated — never silently dropped.
 
 Scheduled daily 7:20 AM ET ("KL imm quote-gaps"), after the 6:45 overrides/
 auto-enroll task and the 7:10 digest. Idempotent via a sent-marker; --test
@@ -136,6 +140,19 @@ TOP_EVENTS = int(os.environ.get("IMM_GAPS_TOP", "12"))
 MIN_SHOW_DOLLARS = float(os.environ.get("IMM_GAPS_MIN_EST", "1.00"))
 # Detail reads are cheap (50/call); estimate-worthy disallowed tail is bounded.
 MAX_DETAIL_MARKETS = int(os.environ.get("IMM_GAPS_MAX_DETAILS", "900"))
+# BATCH BOOK READS (review R-261124-22, Jack 2026-11-25: "Yes, all four"): GET
+# /markets/orderbooks returns up to 100 books a call, each in the single read's
+# shape ({"orderbook_fp": ...}), so the scan reads EVERY unquoted market's book
+# -- blocklisted and screened ones too, which the 210-read budget never reached
+# (the blocked families' 40-read reserve never fired: they got no details once
+# allowed rows filled the 900-detail cap) -- and each blocked family gets a
+# modelled price. About 45 calls an hour for ~4,300 books. Screened events are
+# read last. A failed batch call falls back to the bounded single reads below;
+# IMM_GAPS_BATCH_BOOKS=0 is the old bounded path exactly.
+BATCH_BOOKS = os.environ.get("IMM_GAPS_BATCH_BOOKS", "1") != "0"
+BATCH_SIZE = 100
+MAX_BOOK_CALLS = int(os.environ.get("IMM_GAPS_MAX_BOOK_CALLS", "60"))
+MAX_DETAIL_MARKETS_BATCH = int(os.environ.get("IMM_GAPS_MAX_DETAILS_BATCH", "6000"))
 
 # _screen verdicts that mean "genuinely unquotable now" — excluded entirely
 # rather than listed as opportunities (matches STICKY_DEATH_REASONS + no_target).
@@ -259,6 +276,90 @@ def build_meta(bot, t: str, info: dict, m: dict, now_utc: datetime):
         meta.pool_listed_per_day = info["dollars_per_day"]
         meta.pool_end_eff = pool_end
     return meta
+
+
+def fetch_books(client, tickers) -> dict:
+    """{ticker: book} for up to BATCH_SIZE tickers in ONE call (GET
+    /markets/orderbooks), each book in the single read's shape. Raises on a
+    failed call; a ticker Kalshi leaves out is simply missing."""
+    resp = client.get(getattr(client, "markets_url", "/markets") + "/orderbooks",
+                      {"tickers": list(tickers)})
+    out = {}
+    for it in (resp or {}).get("orderbooks") or []:
+        t = it.get("ticker") if isinstance(it, dict) else None
+        if t:
+            out[t] = {k: v for k, v in it.items() if k != "ticker"}
+    return out
+
+
+def _estimate_row(bot, r: dict) -> None:
+    """The bot's own estimator on one row (r["meta"]), as the 7:20 email has
+    always run it: est $/day, and the fill-weighted exposure for the yield."""
+    if bot._estimate_candidate_yield(r["meta"], []):
+        r["est"] = r["meta"].est_dollars_per_day
+        # Effective $ exposure of the modeled ladder, weighted by
+        # PER-ORDER fill intensity (incentive_mm's
+        # _fill_weighted_exposure): each order's collateral scaled
+        # by (1 + min(side flow / queue ahead of it, 3)) — an
+        # at-touch lot on a churning book counts ~4x (it WILL be
+        # bought up); a 1c pad with the whole book ahead of it
+        # counts ~1x. Falls back to book-wide turnover scaling,
+        # then plain collateral (older incentive_mm without the
+        # fields degrades to no yield estimate).
+        coll = getattr(r["meta"], "est_collateral_dollars", 0.0)
+        exp = getattr(r["meta"], "est_exposure_dollars", 0.0)
+        if exp <= 0 and coll > 0:
+            depth = getattr(r["meta"], "book_depth_contracts", 0.0)
+            v24 = getattr(r["meta"], "volume_24h", 0.0)
+            turns = min(v24 / depth, 3.0) if depth > 0 else 0.0
+            exp = coll * (1.0 + turns)
+        r["exp"] = exp if exp > 0 else None
+    elif r["reason"] is None:
+        r["reason"] = "book unreadable"
+
+
+def estimate_batched(client, bot, queue: list, max_calls: int = None) -> dict:
+    """Estimate every row of `queue` (rows with meta, in read order) on books
+    read BATCH_SIZE at a time; the bot's candidate-book read is pointed at the
+    batch for the duration (the throwaway scan bot only -- never the live one).
+    Rows the batch did not return are left untried for the bounded single
+    reads. Returns {"calls", "books", "error"}."""
+    max_calls = MAX_BOOK_CALLS if max_calls is None else max_calls
+    held: dict = {}
+    had_own = "_read_candidate_book" in vars(bot)
+    orig = bot._read_candidate_book
+
+    def _read(t, _orig=orig):
+        ob = held.pop(t, None)
+        return ob if ob is not None else _orig(t)
+
+    bot._read_candidate_book = _read
+    out = {"calls": 0, "books": 0, "error": None}
+    try:
+        for i in range(0, len(queue), BATCH_SIZE):
+            if out["calls"] >= max_calls:
+                break
+            chunk = queue[i:i + BATCH_SIZE]
+            out["calls"] += 1
+            try:
+                held.update(fetch_books(client, [r["ticker"] for r in chunk]))
+            except Exception as e:
+                out["error"] = f"{type(e).__name__}: {str(e)[:160]}"
+                log(f"! [GAPS] batch book read failed ({out['error']}); bounded single reads for the rest")
+                break
+            for r in chunk:
+                if r["ticker"] not in held:
+                    continue
+                r["tried"] = True
+                out["books"] += 1
+                _estimate_row(bot, r)
+            held.clear()
+    finally:
+        if had_own:
+            bot._read_candidate_book = orig
+        else:
+            del bot._read_candidate_book
+    return out
 
 
 def bulk_market_details(client, tickers) -> dict:
@@ -521,7 +622,7 @@ def classify_and_estimate(client, bot, now_utc: datetime):
                         key=lambda r: -r["pool"])
     detail_set = [r["ticker"] for r in allowed_rows]
     detail_set += [r["ticker"] for r in other_rows][:max(
-        0, MAX_DETAIL_MARKETS - len(detail_set))]
+        0, (MAX_DETAIL_MARKETS_BATCH if BATCH_BOOKS else MAX_DETAIL_MARKETS) - len(detail_set))]
     details = bulk_market_details(client, detail_set)
 
     # Candidate-cap truncation (top-N by pool over the ALLOWED universe incl.
@@ -585,6 +686,16 @@ def classify_and_estimate(client, bot, now_utc: datetime):
     # candidates always outnumber the budget, so without it the awareness
     # table would never carry estimates.
     delib_reserve = min(40, MAX_BOOKS // 5)
+    batch = {"calls": 0, "books": 0, "error": None}
+    if BATCH_BOOKS:
+        def _screened_ev(ev: str) -> bool:
+            return all((r["reason"] or "").startswith("screened:") for r in by_event[ev])
+        # actionable events, then the deliberately-off ones, screened ones last
+        batch_order = sorted(by_event, key=lambda ev: (
+            _screened_ev(ev), _deliberate_ev(ev), -sum(r["pool"] for r in by_event[ev])))
+        queue = [r for ev in batch_order
+                 for r in sorted(by_event[ev], key=lambda r: -r["pool"]) if r["meta"] is not None]
+        batch = estimate_batched(client, bot, queue)
     books = 0
     for ev in event_order:
         cap = MAX_BOOKS - (0 if _deliberate_ev(ev) else delib_reserve)
@@ -593,30 +704,11 @@ def classify_and_estimate(client, bot, now_utc: datetime):
         for r in sorted(by_event[ev], key=lambda r: -r["pool"])[:MAX_PER_EVENT]:
             if books >= cap:
                 break
-            if r["meta"] is None:
+            if r["meta"] is None or r.get("tried"):
                 continue
             books += 1
-            if bot._estimate_candidate_yield(r["meta"], []):
-                r["est"] = r["meta"].est_dollars_per_day
-                # Effective $ exposure of the modeled ladder, weighted by
-                # PER-ORDER fill intensity (incentive_mm's
-                # _fill_weighted_exposure): each order's collateral scaled
-                # by (1 + min(side flow / queue ahead of it, 3)) — an
-                # at-touch lot on a churning book counts ~4x (it WILL be
-                # bought up); a 1c pad with the whole book ahead of it
-                # counts ~1x. Falls back to book-wide turnover scaling,
-                # then plain collateral (older incentive_mm without the
-                # fields degrades to no yield estimate).
-                coll = getattr(r["meta"], "est_collateral_dollars", 0.0)
-                exp = getattr(r["meta"], "est_exposure_dollars", 0.0)
-                if exp <= 0 and coll > 0:
-                    depth = getattr(r["meta"], "book_depth_contracts", 0.0)
-                    v24 = getattr(r["meta"], "volume_24h", 0.0)
-                    turns = min(v24 / depth, 3.0) if depth > 0 else 0.0
-                    exp = coll * (1.0 + turns)
-                r["exp"] = exp if exp > 0 else None
-            elif r["reason"] is None:
-                r["reason"] = "book unreadable"
+            r["tried"] = True
+            _estimate_row(bot, r)
 
     # ---- resolve remaining reasons via the bot's floor math ----------------
     for r in rows:
@@ -624,7 +716,9 @@ def classify_and_estimate(client, bot, now_utc: datetime):
             continue
         meta = r["meta"]
         if r["est"] is None:
-            r["reason"] = "capacity (cap/budget)"   # not estimated this run
+            # not estimated this run: the book budget never reached it (was
+            # mislabelled "capacity (cap/budget)" until R-261124-22)
+            r["reason"] = "not read (budget)"
             continue
         # day-size projection and THIS period's credit, as the bot reads
         # them (2026-09-25 / 2026-09-22)
@@ -711,7 +805,12 @@ def classify_and_estimate(client, bot, now_utc: datetime):
         "quoted": len(quoted), "quoted_events": len(quoted_events),
         "event_cap": imm.MAX_MARKETS,
         "unquoted_rows": len(rows),
-        "books_read": books,
+        "books_read": books + batch["books"],
+        "books_single": books,
+        "books_batched": batch["books"],
+        "book_calls": batch["calls"],
+        "batch_books": BATCH_BOOKS,
+        "batch_error": batch["error"] or "",
         "est_missed_total": sum(r["est"] for r in rows if r["est"] is not None),
         "unest_pool": sum(r["pool"] for r in rows if r["est"] is None),
         "reward_today": _f(status.get("reward_est_today")),

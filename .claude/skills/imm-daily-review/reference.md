@@ -31,7 +31,7 @@ The facts the runbook (`SKILL.md`) leans on. Sourced from the 11/25 survey of th
 | Attribution | day archive x `imm_dashboard.family_of` (falls back to the series), events from `dashboard/cache/markets_meta.json` | |
 | Adverse | archive `fx`, `toxic_halts_<utc>.jsonl`, `ws_sweep_<utc>.jsonl` | |
 | Monitors | `toxic_halts_profit.json`, `lone_ref_monitor.json`, `join_wait_report.json`, `bol_report.json`, `cheap_report.json`, `rt_settled_report.json`, `risk_controls_history.json` | They run 06:45-08:30, so at 04:30 they show D-1 |
-| Counterfactual | `dashboard/cache/api_gaps.pkl` (hourly `imm_quote_gaps.classify_and_estimate`, about 210 books), `api_unquoted.pkl` (not-enrolled series with an ADD/PASS call, 300 books, 3-hour cache), `config_gaps.json`, `selection_snapshot_<utc>.jsonl` | Each day's top 40 predictions go to `counterfactual.jsonl` |
+| Counterfactual | `dashboard/cache/api_gaps.pkl` (hourly `imm_quote_gaps.classify_and_estimate`: every unquoted book, 100 per call, since R-261124-22), `api_unquoted.pkl` (not-enrolled series with an ADD/PASS call, 300 books, 3-hour cache), `config_gaps.json`, `selection_snapshot_<utc>.jsonl` | Each day's top 40 predictions go to `counterfactual.jsonl` |
 | Coverage | `cycle_log_<utc>.csv` timestamps, `guard_skips_<utc>.jsonl` enters | Dark minutes = cycle gaps beyond 10 min |
 | System | `incentive-mm-<local launch date>.log`, `config_history_<utc>.jsonl`, Task Scheduler (`KL *`), task logs, `health-alert.log`, `run-logs/sync-kl-main.log`, git, disk, token mtime | Signatures in `error_signatures.json` |
 | Data | sizes of each sink's UTC-day file vs its 14-day median | LOW < 0.3x, HIGH > 3x, MISSING when present 10+ of 14 days |
@@ -150,10 +150,11 @@ Known biases (all point the same way, so treat raw estimates as upper bounds):
 3. Books before a program starts are thin, so upcoming estimates lean high.
 4. Totals add up independent markets. That is not a feasible portfolio: caps, slots and per-event room are ignored.
 5. The average tape maker's P&L understates our pick-offs. On the 10/26 gas test, makers lost 3.2c a contract and we lost 31c.
-6. The gap scan's book-read budget (~210 books) limits the gap scan's own view, not the bot's.
-   - The bot estimates every allowed candidate on each refresh (`selection_snapshot`), and the not-enrolled scan scores every series outside the allowlist.
-   - Only `counterfactual.unmeasured.unmeasured_pool` goes unread by all three. On 11/24 that was $24.7k/day, $20.2k of it blocked on purpose; the allowed markets nobody quotes were worth $35/day (all under $1/day each).
-   - Unmeasured is not zero, but it is also not the $65k the gap scan counts (R-261124-21).
+6. Unmeasured pool (R-261124-21, -22).
+   - Until 11/25 the gap scan read about 210 books, so its `unest_pool` ($65k/day on 11/24) mostly counted markets that other tools already estimate. The bot estimates every allowed candidate on each refresh (`selection_snapshot`), and the not-enrolled scan scores every series outside the allowlist.
+   - Only `counterfactual.unmeasured.unmeasured_pool` goes unread by all three. On 11/24 that was $24.7k/day, $20.2k of it blocked on purpose. The allowed markets nobody quotes were worth $35/day, all from markets under $1/day each.
+   - Since R-261124-22 the gap scan reads every unquoted book, 100 per call (11/25: 4,377 books in 44 calls, 15 s), so `unest_pool` should be near 0. If it is not, `batch_error` or `book_calls` in the universe line says why.
+   - Blocked families now carry a modelled price (`by_class.deliberate`: $111/day gross at x1 on 11/25, before realisation and trading tax). Report the price of a block as a decision for Jack, never as money left on the table.
 
 Calibrate: each day's top predictions are logged, and when those events get quoted later the realised modelled $/day over the predicted $/day sets the factor (median, clamped 0.05-2.0).
 

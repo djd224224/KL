@@ -163,6 +163,7 @@ REASON_CLASSES = (
     ("deliberate", ("blocklist", "frozen", "excluded family", "yielded to manual")),
     ("not enrolled", ("not in allowlist",)),
     ("capacity", ("capacity",)),
+    ("unread", ("not read",)),          # imm_quote_gaps: no book read reached it (R-261124-22)
     ("economics", ("under payout floor", "under rate floor", "zero est yield",
                    "admission clock", "no-new")),
     ("market screen", ("screened",)),
@@ -839,7 +840,8 @@ def sec_counterfactual(day: date) -> dict:
         out["gaps_as_of"] = gaps.get("at")
         out["universe"] = {k: (val.get("ctx") or {}).get(k) for k in (
             "programs", "pool_total", "quoted", "quoted_events", "event_cap", "unquoted_rows",
-            "books_read", "est_missed_total", "unest_pool", "updated_at")}
+            "books_read", "books_batched", "book_calls", "batch_error", "est_missed_total",
+            "unest_pool", "updated_at")}
         by_cls = defaultdict(lambda: {"rows": 0, "pool": 0.0, "est": 0.0})
         for r in rows:
             c = by_cls[reason_class(r.get("reason") or "")]
@@ -2693,7 +2695,9 @@ def render_evidence(ev: dict) -> str:
     if u:
         a(f"Universe (dashboard cache {et_str(cf.get('gaps_as_of'))}): {u.get('programs')} programs, pool "
           f"{usd0(u.get('pool_total'), False)}/day; quoted {u.get('quoted')} mkts in {u.get('quoted_events')} events "
-          f"(cap {u.get('event_cap')}); {u.get('unquoted_rows')} unquoted rows; {u.get('books_read')} books read; "
+          f"(cap {u.get('event_cap')}); {u.get('unquoted_rows')} unquoted rows; {u.get('books_read')} books read "
+          f"({u.get('books_batched') or 0} in {u.get('book_calls') or 0} batch calls"
+          f"{'; batch error: ' + str(u.get('batch_error')) if u.get('batch_error') else ''}); "
           f"the gap scan left {usd0(u.get('unest_pool'), False)}/day unread (its own count, most of it estimated "
           f"elsewhere: see the classes below); estimated missed total {usd(u.get('est_missed_total'), False)}/day.")
     um = cf.get("unmeasured") or {}
