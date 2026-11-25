@@ -1517,8 +1517,9 @@ def build_digest(now_utc: datetime, record_risk: bool = False):
     dw = dashboard_windows(load_dashboard_summary(), now_utc.timestamp())
     _rows, _tot, resting = event_rows(client)     # resting quotes, for capacity
     risk_ev, risk_rows = risk_section(client, state, status, resting, now_utc)
-    # Kalshi's event starts vs ours, for the PICK-OFF block (never raises).
-    # First, so the audit rows below can print Kalshi's start beside ours.
+    # Kalshi's event starts vs ours (never raises), for the cutoff audit
+    # below. Its PICK-OFF WINDOWS block is out of the email (Jack 2026-11-23:
+    # "remove 'Pick-off windows' from daily email digest and dashboard").
     pick = imm_pickoff.scan(client, now_utc,
                             meta=load_json(OVERRIDE_META_PATH))
     # pos (own_book, above) gives the audit its only real exposure number;
@@ -1556,13 +1557,6 @@ def build_digest(now_utc: datetime, record_risk: bool = False):
 
     # ---- plain text ---------------------------------------------------------
     L = ["=" * 66, "INCENTIVE MM — {} (the IMM bot's own book)".format(today_et), ""]
-    # An opportunity, not a risk: its own marker, above the red banner,
-    # because a window can be open right now.
-    _pick = imm_pickoff.text_lines(pick, now_utc)
-    if _pick:
-        L.append(">> " + _pick[0])
-        L.extend(_pick[1:])
-        L.append("")
     _banner = cutoff_banner(audit)
     if _banner:
         L.append("!! " + _banner)
@@ -1598,10 +1592,6 @@ def build_digest(now_utc: datetime, record_risk: bool = False):
     # still raises the banner above when a live override disagrees with
     # Kalshi's date; _cutoff_audit_text / _html and _calibration_caveat_*
     # stay for a look by hand.
-    _perr = imm_pickoff.error_text(pick)
-    if _perr:
-        L.append("")
-        L.append(_perr)
     if health:
         L.append("")
         L.append(health)
@@ -1630,7 +1620,6 @@ def build_digest(now_utc: datetime, record_risk: bool = False):
              'color:#999"> &nbsp;= trading {:+,.2f} + rewards {:,.2f}</span>'
              '</div>'.format(_pnl_span(nl) if nl is not None else "n/a",
                              w["life"]["raw"], w["life"]["reward"]))
-    h.append(imm_pickoff.html_block(pick, now_utc))        # "" when none
     if _banner:
         h.append('<div style="background:#fdecea;border-left:4px solid #c0392b;'
                  'color:#8e2b21;padding:8px 10px;margin:8px 0;font-weight:600">'
@@ -1687,9 +1676,6 @@ def build_digest(now_utc: datetime, record_risk: bool = False):
     if tot_note:
         h.append('<div style="color:#888;font-size:12px;margin-top:4px">{}.</div>'
                  .format(tot_note))
-    if _perr:
-        h.append('<div style="color:#888;font-size:11px;margin-top:4px">{}'
-                 '</div>'.format(imm_pickoff._esc(_perr)))
     if health:
         h.append('<div style="color:#c0392b;font-size:12px;font-weight:600;margin-top:12px;'
                  'border-top:1px solid #eee;padding-top:8px">{}</div>'.format(health))
