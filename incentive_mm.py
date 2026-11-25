@@ -7269,8 +7269,15 @@ def awards_auto_rules(series: str) -> bool:
 # (59 programs, $4,830, 11/25 21:01Z - 11/29 05:00Z; no period of its own
 # yet). The same wire on the awards rule set it clones, its own knob so it
 # reverts apart from the winners: IMM_GRAMMY_COUNT_SIZE_MULT=1.
-GRAMMY_WIN_SIZE_MULT = _env_float("IMM_GRAMMY_WIN_SIZE_MULT", 2.0)
-GRAMMY_COUNT_SIZE_MULT = _env_float("IMM_GRAMMY_COUNT_SIZE_MULT", 2.0)
+# BOTH x3 (Jack 2026-11-25: "3x grammy markets instead of 2x"): size_mult
+# 3.0 on the winners and the count ladder alike, the same wire. Under the
+# launcher env a rung goes 20 -> 60 by day and 60 -> 180 overnight, the
+# per-market cap 150 -> 450; the 5/event cap is unchanged. The nominees
+# (GRAMMY_NOM_SIZE_MULT) stay x2: the 69th's resolved at the Nov 16
+# nominations and none was in the 11/25 cycle log. Each knob =2 goes
+# back to x2, =1 to x1.
+GRAMMY_WIN_SIZE_MULT = _env_float("IMM_GRAMMY_WIN_SIZE_MULT", 3.0)
+GRAMMY_COUNT_SIZE_MULT = _env_float("IMM_GRAMMY_COUNT_SIZE_MULT", 3.0)
 GRAMMY_WIN_SERIES = "KXGRAMMY"
 GRAMMY_COUNT_SERIES = "KXGRAMMYCOUNT"
 GRAMMY_WIN_CATEGORY_RE = re.compile(r"KXGRAM(?!MY)[A-Z0-9]+")
@@ -15485,8 +15492,8 @@ _CONFIG_CODE_KNOBS = (
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     "CONTROLS_SIZE_MULT",         # CONTROLS (2028 Senate) x6 (2026-11-24)
     "SEATS_SIZE_MULT",            # the 2029 seat-count ladders x4 (2026-11-25)
-    "GRAMMY_WIN_SIZE_MULT",       # the Grammy winner families x2 (2026-11-24)
-    "GRAMMY_COUNT_SIZE_MULT",     # KXGRAMMYCOUNT x2 (2026-11-24)
+    "GRAMMY_WIN_SIZE_MULT",       # the Grammy winner families x3 (2026-11-25)
+    "GRAMMY_COUNT_SIZE_MULT",     # KXGRAMMYCOUNT x3 (2026-11-25)
     "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
     "SPRLVLDATE_SIZE_MULT",       # KXSPRLVLDATE x2 (2026-11-10)
     "GTEMP_SIZE_MULT",            # KXGTEMP x3 (2026-11-24)
@@ -25238,7 +25245,7 @@ SERIES_OVERRIDES["KXCRITICS"] = replace(SERIES_OVERRIDES["KXCRITICS"],
 GRAMMY_NOM_SIZE_MULT = _env_float("IMM_GRAMMY_NOM_SIZE_MULT", 2.0)
 SERIES_OVERRIDES["KXGRAMMYNOM"] = replace(SERIES_OVERRIDES["KXGRAMMYNOM"],
                                           size_mult=GRAMMY_NOM_SIZE_MULT)
-# GRAMMY WINNERS x2 (2026-11-24, see GRAMMY_WIN_SIZE_MULT): KXGRAMMY's own
+# GRAMMY WINNERS x3 (2026-11-25, see GRAMMY_WIN_SIZE_MULT): KXGRAMMY's own
 # override here; the KXGRAM<CATEGORY> tag members in ensure_family_override
 if GRAMMY_WIN_SIZE_MULT != 1.0:
     SERIES_OVERRIDES[GRAMMY_WIN_SERIES] = replace(

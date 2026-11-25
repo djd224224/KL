@@ -33574,15 +33574,16 @@ class TestAwardsByKalshiTag(unittest.TestCase):
         imm.ensure_family_override("KXGRAMMYNOMCOUNTKL")
         self.assertNotIn("KXGRAMMYNOMCOUNTKL", imm.SERIES_OVERRIDES)
 
-    def test_the_grammy_winners_quote_at_x2(self):
+    def test_the_grammy_winners_quote_at_x3(self):
         # Jack 2026-11-24: "Yes, x2", on "Size up the Grammy winner families
         # to x2?" -- KXGRAMMY on its own override, the KXGRAMAOTY / KXGRAMBNA
-        # tag members on the awards rule set at x2, the 5/event cap kept
-        self.assertEqual(imm.GRAMMY_WIN_SIZE_MULT, 2.0)
+        # tag members on the awards rule set, the 5/event cap kept; x3 since
+        # Jack 2026-11-25: "3x grammy markets instead of 2x"
+        self.assertEqual(imm.GRAMMY_WIN_SIZE_MULT, 3.0)
         self.assertIn("GRAMMY_WIN_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
         win = imm.SERIES_OVERRIDES["KXGRAMMY"]
         self.assertEqual((win.size_mult, win.safe_join, win.pre_event_days,
-                          win.pre_event_dates_only), (2.0, True, 1.0, True))
+                          win.pre_event_dates_only), (3.0, True, 1.0, True))
         self.assertEqual(imm.event_top_n_for("KXGRAMMY"), 5)
         self._write(["KXGRAMAOTY", "KXGRAMBNA", "KXGRAMMYCOUNT", "KXGAMEAWARDS"])
         parent = imm.SERIES_OVERRIDES[imm.AWARDS_AUTO_PARENT]
@@ -33592,19 +33593,19 @@ class TestAwardsByKalshiTag(unittest.TestCase):
         with mock.patch.object(imm, "size_test_mult", return_value=1.0):
             for s in ("KXGRAMMY", "KXGRAMAOTY", "KXGRAMBNA"):
                 self.assertTrue(imm.grammy_win_series(s), s)
-                self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+                self.assertEqual(imm.applied_mention_mult(s), 3.0, s)
                 self.assertEqual(imm.series_max_position(s),
-                                 2.0 * imm.MAX_POSITION_CONTRACTS, s)
-            # ...and the count ladder at its own x2 (Jack 2026-11-24: "also
-            # x2 KXGRAMMYCOUNT"), not a winner series by name
-            self.assertEqual(imm.GRAMMY_COUNT_SIZE_MULT, 2.0)
+                                 3.0 * imm.MAX_POSITION_CONTRACTS, s)
+            # ...and the count ladder at its own knob, x3 with the winners
+            # (2026-11-25), not a winner series by name
+            self.assertEqual(imm.GRAMMY_COUNT_SIZE_MULT, 3.0)
             self.assertIn("GRAMMY_COUNT_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
-            self.assertEqual(imm.applied_mention_mult("KXGRAMMYCOUNT"), 2.0)
+            self.assertEqual(imm.applied_mention_mult("KXGRAMMYCOUNT"), 3.0)
             self.assertEqual(imm.series_max_position("KXGRAMMYCOUNT"),
-                             2.0 * imm.MAX_POSITION_CONTRACTS)
+                             3.0 * imm.MAX_POSITION_CONTRACTS)
             for s in ("KXGRAMAOTY", "KXGRAMBNA", "KXGRAMMYCOUNT"):
                 self.assertEqual(imm.SERIES_OVERRIDES[s],
-                                 imm.replace(parent, size_mult=2.0), s)
+                                 imm.replace(parent, size_mult=3.0), s)
                 self.assertTrue(imm.awards_auto_rules(s), s)   # still a member
                 self.assertEqual(imm.event_top_n_for(s), 5, s)
             # another show stays x1 on the parent's clone
@@ -33616,10 +33617,10 @@ class TestAwardsByKalshiTag(unittest.TestCase):
         with mock.patch.object(imm, "GRAMMY_COUNT_SIZE_MULT", 1.0):
             imm.ensure_family_override("KXGRAMMYCOUNT")
             self.assertEqual(imm.SERIES_OVERRIDES["KXGRAMMYCOUNT"], parent)
-            self.assertEqual(imm.grammy_size_mult("KXGRAMAOTY"), 2.0)
+            self.assertEqual(imm.grammy_size_mult("KXGRAMAOTY"), 3.0)
         with mock.patch.object(imm, "GRAMMY_WIN_SIZE_MULT", 1.0):
             self.assertEqual(imm.grammy_size_mult("KXGRAMAOTY"), 1.0)
-            self.assertEqual(imm.grammy_size_mult("KXGRAMMYCOUNT"), 2.0)
+            self.assertEqual(imm.grammy_size_mult("KXGRAMMYCOUNT"), 3.0)
         self.assertEqual(imm.grammy_size_mult("KXGAMEAWARDS"), 1.0)
         for s in ("KXGRAMMYCOUNT", "KXGRAMMYNOM", "KXGRAMMYNOMAOTY",
                   "KXGRAMMYNOMCOUNTKL", "KXGAMEAWARDS"):
@@ -33631,7 +33632,7 @@ class TestAwardsByKalshiTag(unittest.TestCase):
         # a member whose override differs in more than size is not on the
         # awards rules (a code family keeps its own)
         imm.SERIES_OVERRIDES["KXGRAMBNA"] = imm.replace(
-            parent, size_mult=2.0, safe_join=False)
+            parent, size_mult=3.0, safe_join=False)
         self.assertFalse(imm.awards_auto_rules("KXGRAMBNA"))
 
     def test_the_edition_is_read_from_either_end_of_the_segment(self):
@@ -33662,7 +33663,7 @@ class TestAwardsByKalshiTag(unittest.TestCase):
             self.assertEqual(imm.event_top_n_for(s), 5, s)      # before inheriting
             imm.ensure_family_override(s)
             ov = imm.series_override(s)
-            # a Grammy winner category at the winners' x2 (2026-11-24)
+            # a Grammy winner category at the winners' size (x3, 2026-11-25)
             size = imm.GRAMMY_WIN_SIZE_MULT if s == "KXGRAMAOTY" else None
             self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join,
                               ov.size_mult), (1.0, True, True, size), s)
