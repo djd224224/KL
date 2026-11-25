@@ -33430,11 +33430,59 @@ class TestAwardsByKalshiTag(unittest.TestCase):
             self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
             self.assertEqual(imm.series_max_position(s),
                              2.0 * imm.MAX_POSITION_CONTRACTS, s)
-        # the winner series stay x1, the count ladders stay out
-        self.assertIsNone(imm.series_override("KXGRAMMY").size_mult)
+        # the winner series take their own x2 since 2026-11-24
+        # (GRAMMY_WIN_SIZE_MULT), the awards parent none; the count ladders
+        # stay out
+        self.assertEqual(imm.series_override("KXGRAMMY").size_mult,
+                         imm.GRAMMY_WIN_SIZE_MULT)
         self.assertIsNone(imm.SERIES_OVERRIDES[imm.AWARDS_AUTO_PARENT].size_mult)
         imm.ensure_family_override("KXGRAMMYNOMCOUNTKL")
         self.assertNotIn("KXGRAMMYNOMCOUNTKL", imm.SERIES_OVERRIDES)
+
+    def test_the_grammy_winners_quote_at_x2(self):
+        # Jack 2026-11-24: "Yes, x2", on "Size up the Grammy winner families
+        # to x2?" -- KXGRAMMY on its own override, the KXGRAMAOTY / KXGRAMBNA
+        # tag members on the awards rule set at x2, the 5/event cap kept
+        self.assertEqual(imm.GRAMMY_WIN_SIZE_MULT, 2.0)
+        self.assertIn("GRAMMY_WIN_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
+        win = imm.SERIES_OVERRIDES["KXGRAMMY"]
+        self.assertEqual((win.size_mult, win.safe_join, win.pre_event_days,
+                          win.pre_event_dates_only), (2.0, True, 1.0, True))
+        self.assertEqual(imm.event_top_n_for("KXGRAMMY"), 5)
+        self._write(["KXGRAMAOTY", "KXGRAMBNA", "KXGRAMMYCOUNT", "KXGAMEAWARDS"])
+        parent = imm.SERIES_OVERRIDES[imm.AWARDS_AUTO_PARENT]
+        for s in ("KXGRAMAOTY", "KXGRAMBNA", "KXGRAMMYCOUNT", "KXGAMEAWARDS"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+            imm.ensure_family_override(s)
+        with mock.patch.object(imm, "size_test_mult", return_value=1.0):
+            for s in ("KXGRAMMY", "KXGRAMAOTY", "KXGRAMBNA"):
+                self.assertTrue(imm.grammy_win_series(s), s)
+                self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+                self.assertEqual(imm.series_max_position(s),
+                                 2.0 * imm.MAX_POSITION_CONTRACTS, s)
+            for s in ("KXGRAMAOTY", "KXGRAMBNA"):
+                self.assertEqual(imm.SERIES_OVERRIDES[s],
+                                 imm.replace(parent, size_mult=2.0), s)
+                self.assertTrue(imm.awards_auto_rules(s), s)   # still a member
+                self.assertEqual(imm.event_top_n_for(s), 5, s)
+            # the count ladder (no period yet) and another show stay x1 on the
+            # parent's clone; the nominee families are not winners
+            for s in ("KXGRAMMYCOUNT", "KXGAMEAWARDS"):
+                self.assertEqual(imm.SERIES_OVERRIDES[s], parent, s)
+                self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+                self.assertEqual(imm.event_top_n_for(s), 5, s)
+        for s in ("KXGRAMMYCOUNT", "KXGRAMMYNOM", "KXGRAMMYNOMAOTY",
+                  "KXGRAMMYNOMCOUNTKL", "KXGAMEAWARDS"):
+            self.assertFalse(imm.grammy_win_series(s), s)
+        # a KXGRAM* series outside the awards tag file never inherits it
+        imm.SERIES_OVERRIDES.pop("KXGRAMROTY", None)
+        imm.ensure_family_override("KXGRAMROTY")
+        self.assertNotIn("KXGRAMROTY", imm.SERIES_OVERRIDES)
+        # a member whose override differs in more than size is not on the
+        # awards rules (a code family keeps its own)
+        imm.SERIES_OVERRIDES["KXGRAMBNA"] = imm.replace(
+            parent, size_mult=2.0, safe_join=False)
+        self.assertFalse(imm.awards_auto_rules("KXGRAMBNA"))
 
     def test_the_edition_is_read_from_either_end_of_the_segment(self):
         self.assertEqual(imm._awards_edition("69BPDGP"), "69")
@@ -33464,8 +33512,10 @@ class TestAwardsByKalshiTag(unittest.TestCase):
             self.assertEqual(imm.event_top_n_for(s), 5, s)      # before inheriting
             imm.ensure_family_override(s)
             ov = imm.series_override(s)
+            # a Grammy winner category at the winners' x2 (2026-11-24)
+            size = imm.GRAMMY_WIN_SIZE_MULT if s == "KXGRAMAOTY" else None
             self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join,
-                              ov.size_mult), (1.0, True, True, None), s)
+                              ov.size_mult), (1.0, True, True, size), s)
             self.assertEqual(imm.event_top_n_for(s), 5, s)
         # KXGRAMAOTY-69 (the 69th's Album of the Year winner): the Nov 16
         # nominations are its first narrowing (out Nov 15), then the Feb 7

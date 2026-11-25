@@ -7234,8 +7234,45 @@ def awards_auto_rules(series: str) -> bool:
     ensure_family_override). A code family that covers the series as well
     (KXCMA's undated guard set) keeps its own caps too."""
     ov = SERIES_OVERRIDES.get(series)
+    parent = SERIES_OVERRIDES.get(AWARDS_AUTO_PARENT)
     return awards_extra_series(series) and (
-        ov is None or ov == SERIES_OVERRIDES.get(AWARDS_AUTO_PARENT))
+        ov is None or ov == parent
+        # a Grammy winner category clones the rule set at its own size
+        # (GRAMMY_WIN_SIZE_MULT, 2026-11-24): still a member, same 5/event
+        or (grammy_win_series(series) and parent is not None
+            and replace(ov, size_mult=parent.size_mult) == parent))
+
+
+# GRAMMY WINNERS x2 (Jack 2026-11-24: "Yes, x2", on "Size up the Grammy
+# winner families to x2?"). The 69th's winner books -- KXGRAMMY (the category
+# in the event segment) and the per-category KXGRAM<CATEGORY> series the
+# awards tag enrolls (KXGRAMAOTY, KXGRAMBNA) -- lit 11/18 on the nominees.
+# Over that first ~3.4-day period 354 markets in 69 events took $372 of
+# rewards against -$96 of trading (dashboard day archive, MTM at last
+# trade), but at a 1.2% share (a median 45 bid / 60 ask resting against the
+# 1,000 target) the median market made $1.05, right at Kalshi's $1
+# per-market floor, and the bottom tenth $0.18. The 5/event cap rarely bound
+# (51 event_top_n skips; a median event has 6 programs and we earned on 5),
+# so size, not width. The size_mult wire (applied_mention_mult): the rungs,
+# the per-market and per-event caps, the skew knees and the payout-floor
+# projection scale together; the hour windows still compose. Safe-join, the
+# 5/event cap and the stand-down (00:00 ET Feb 6 2027) are unchanged.
+# KXGRAMMY takes it on its own override (beside the AWARDS_SERIES loop); a
+# KXGRAM<CATEGORY> tag member in ensure_family_override, on top of the awards
+# rule set it clones. NOT the nominees (KXGRAMMYNOM*, their own x2) nor
+# KXGRAMMYCOUNT (enrolled 11/24, no period yet): the (?!MY) keeps every
+# KXGRAMMY* name out of the category pattern. IMM_GRAMMY_WIN_SIZE_MULT=1
+# reverts (a *_SIZE_MULT name, so env_overrides.txt can carry it).
+GRAMMY_WIN_SIZE_MULT = _env_float("IMM_GRAMMY_WIN_SIZE_MULT", 2.0)
+GRAMMY_WIN_SERIES = "KXGRAMMY"
+GRAMMY_WIN_CATEGORY_RE = re.compile(r"KXGRAM(?!MY)[A-Z0-9]+")
+
+
+def grammy_win_series(series: str) -> bool:
+    """A Grammy WINNER series: KXGRAMMY, or a KXGRAM<CATEGORY> one
+    (KXGRAMAOTY, KXGRAMBNA); never a KXGRAMMY* nominee / count series."""
+    return series == GRAMMY_WIN_SERIES or bool(
+        GRAMMY_WIN_CATEGORY_RE.fullmatch(series))
 
 
 # NFL GAME / SEASON FAMILIES, AUTO-ENROLLED (Jack 2026-10-12: "can you
@@ -13489,6 +13526,11 @@ def ensure_family_override(series: str) -> None:
             # family size (KXSUEZWEEKLY x2, 2026-10-11, FAMILY_X2_1011): a
             # graduate clones the scan's guard set, never that size.
             ov = replace(ov, size_mult=None)
+        if parent == AWARDS_AUTO_PARENT and grammy_win_series(series) \
+                and GRAMMY_WIN_SIZE_MULT != 1.0:
+            # a Grammy winner category by tag (KXGRAMAOTY, KXGRAMBNA): the
+            # awards rule set at the winners' size (2026-11-24)
+            ov = replace(ov, size_mult=GRAMMY_WIN_SIZE_MULT)
         SERIES_OVERRIDES[series] = ov
         log(f"[IMM] {series}: family override inherited from {parent}")
         return
@@ -15371,6 +15413,7 @@ _CONFIG_CODE_KNOBS = (
     "TRUMPVH_SIZE_MULT",          # the weekly VoteHub approval x3 (2026-10-31)
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     "CONTROLS_SIZE_MULT",         # CONTROLS (2028 Senate) x6 (2026-11-24)
+    "GRAMMY_WIN_SIZE_MULT",       # the Grammy winner families x2 (2026-11-24)
     "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
     "SPRLVLDATE_SIZE_MULT",       # KXSPRLVLDATE x2 (2026-11-10)
     "GTEMP_SIZE_MULT",            # KXGTEMP x3 (2026-11-24)
@@ -25055,11 +25098,17 @@ SERIES_OVERRIDES["KXCRITICS"] = replace(SERIES_OVERRIDES["KXCRITICS"],
 # Oct 16 stand-down. Set on the family parent "KXGRAMMYNOM": the bare series
 # reads it directly and every KXGRAMMYNOM<CATEGORY> member clones it, so the
 # rungs, caps and skew knees scale together; the hour windows still compose.
-# The Grammy WINNER series (KXGRAMMY, the tag-enrolled KXGRAMAOTY) stay x1.
+# The Grammy WINNER series (KXGRAMMY, the tag-enrolled KXGRAMAOTY) were x1
+# until 2026-11-24 (GRAMMY_WIN_SIZE_MULT, below).
 # IMM_GRAMMY_NOM_SIZE_MULT=1 reverts (env => task-level restart).
 GRAMMY_NOM_SIZE_MULT = _env_float("IMM_GRAMMY_NOM_SIZE_MULT", 2.0)
 SERIES_OVERRIDES["KXGRAMMYNOM"] = replace(SERIES_OVERRIDES["KXGRAMMYNOM"],
                                           size_mult=GRAMMY_NOM_SIZE_MULT)
+# GRAMMY WINNERS x2 (2026-11-24, see GRAMMY_WIN_SIZE_MULT): KXGRAMMY's own
+# override here; the KXGRAM<CATEGORY> tag members in ensure_family_override
+if GRAMMY_WIN_SIZE_MULT != 1.0:
+    SERIES_OVERRIDES[GRAMMY_WIN_SERIES] = replace(
+        SERIES_OVERRIDES[GRAMMY_WIN_SERIES], size_mult=GRAMMY_WIN_SIZE_MULT)
 # OSCARS 1-99c (Jack 2026-11-13: "be open to quoting oscars when they launch
 # KXOSCARS-EDIT27, KXOSCARS-SOUND27, etc"). Kalshi listed KXOSCARS, the 99th
 # Oscars' winners with the category in the event segment: 10 events (EDIT,
