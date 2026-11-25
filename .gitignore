@@ -43,3 +43,6 @@ run-logs/gas-bot/
 
 # Migration bundle (migrate_export.ps1) — task XMLs + LIVE CREDENTIALS, never commit
 migration_export/
+
+# Polymarket IMM runtime logs + state (polymarket_imm.py) -- trading data, repo is public
+run-logs/polymarket-imm/
