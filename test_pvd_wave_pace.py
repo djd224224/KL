@@ -895,6 +895,26 @@ class FloorPass(unittest.TestCase):
             pp.pass_resize("wt", dict(w, tune=w["tune"] + ["--fair-file", self.fair]), now=NOW)
         self.assertEqual(self.calls[-1].max_mult, 1.0)               # only offs
 
+    def test_off_only_without_a_fair_when_max_mult_is_1(self):
+        """R-261124-08 (Jack 2026-11-25: "Yes, all four"): a fair is needed only to size up"""
+        tune = list(pw.PRESETS["default"]) + ["--size-mult-file", self.mult]      # no fair file
+        out = io.StringIO()
+        with redirect_stdout(out):
+            pp.pass_resize("wt", _wave(tune=tune, floor_auto=True), now=NOW)            # 5x cap: skipped
+            self.assertEqual(self.calls, [])
+            pp.pass_resize("wt", _wave(tune=tune, floor_auto=True, floor={"max_mult": 1.0, "trim": True}), now=NOW)
+        a = self.calls[0]
+        self.assertTrue(a.off_only)
+        self.assertEqual((a.max_mult, a.keep_within, a.trim, a.reach_to, a.reach_lo), (1.0, 0.20, False, 0.0, None))
+        self.assertIn("off-only", out.getvalue())
+        self.assertIn("runs it off-only", out.getvalue())
+        with redirect_stdout(io.StringIO()):
+            pp.pass_resize("wt", _wave(tune=tune, floor_auto=True, floor={"max_mult": 1.0, "keep_within": 0.1}), now=NOW)
+            pp.pass_resize("wt", dict(self.w, floor={"max_mult": 1.0}), now=NOW)         # a live fair: as before
+        self.assertEqual(self.calls[1].keep_within, 0.1)
+        self.assertFalse(self.calls[2].off_only)
+        self.assertEqual(self.calls[2].keep_within, 0.05)
+
     def test_the_pass_runs_it_after_the_fair_and_before_the_tune_only_when_on(self):
         order = []
         real_one, real_load = pw.run_one, pw.load
@@ -943,6 +963,49 @@ class ResizeNoRun(unittest.TestCase):
         with open(mult, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh), {"KXA-2": 2.5, "KXA-6": 0})   # up; off on its 2nd read
         self.assertEqual(runs, [])
+
+    def test_off_only_writes_offs_and_nothing_else(self):
+        """R-261124-08: no size-up, trim or reach; a market within $0.20 of $1 is kept"""
+        mult = os.path.join(TMP, "size_mult_oo.json")
+        state = os.path.join(TMP, "resize_state_oo.json")
+        with open(mult, "w", encoding="utf-8") as fh:
+            json.dump({"KXA-3": 1.5}, fh)
+        with open(state, "w", encoding="utf-8") as fh:
+            json.dump({"at": (datetime.now(timezone.utc) - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "off_candidates": ["KXA-6", "KXA-7", "KXA-8"]}, fh)
+        res = {"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "since_restart_min": 200.0,
+               "dash_age_min": 2.0,
+               "markets": [_m("KXA-2", 0.6, x_aim=2.5, proj_max=1.9),           # an up: not applied
+                           _m("KXA-3", 0.5, proj_max=0.5, m0=1.5),              # first read under: next pass
+                           _m("KXA-6", 0.1, proj_max=0.3),                      # 2nd read under $0.80: off
+                           _m("KXA-7", 0.85, proj_max=0.85),                    # within $0.20 of $1: kept
+                           _m("KXA-8", 0.7, proj_max=0.7)]}                     # 2nd read under $0.80: off
+        saved = (pp.measure, pp.print_pace, pp.size_mult_path, pp.resize_state_path, pp.subprocess.run,
+                 pp.apply_trims, pp.apply_reach)
+        called = []
+        pp.measure = lambda name, a, now=None: res
+        pp.print_pace = lambda r: None
+        pp.size_mult_path = lambda n: mult
+        pp.resize_state_path = lambda n: state
+        pp.subprocess.run = lambda *a, **k: called.append("run")
+        pp.apply_trims = lambda *a, **k: called.append("trims") or (0, 0)
+        pp.apply_reach = lambda *a, **k: called.append("reach") or (0, 0, 0)
+        try:
+            a = argparse.Namespace(name="oo", aim=1.20, max_mult=1.0, real=0.65, window_min=60.0, keep_within=0.20,
+                                   no_off=False, json=None, apply=True, force=False, no_run=True, trim=False,
+                                   reach_to=0.0, reach_lo=None, off_only=True)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(pp.cmd_resize(a), 0)
+        finally:
+            (pp.measure, pp.print_pace, pp.size_mult_path, pp.resize_state_path, pp.subprocess.run,
+             pp.apply_trims, pp.apply_reach) = saved
+        with open(mult, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), {"KXA-3": 1.5, "KXA-6": 0, "KXA-8": 0})
+        self.assertEqual(called, [])
+        self.assertIn("OFF-ONLY", out.getvalue())
+        with open(state, encoding="utf-8") as fh:
+            self.assertEqual(set(json.load(fh)["off_candidates"]), {"KXA-3", "KXA-6", "KXA-8"})
 
 
 if __name__ == "__main__":

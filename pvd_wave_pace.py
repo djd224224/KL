@@ -785,8 +785,12 @@ def cmd_resize(a) -> int:
         print(f"  tier reach to {a.reach_to:g}c (a side past the {a.reach_lo:g}c tier, where the multiple can't "
               f"reach the aim): {len(plan['reach'])} given, {len(plan['reach_restore'])} back from off at 1x; "
               f"{len(a.reach_granted)} held one already")
+    off_only = bool(getattr(a, "off_only", False))
+    if off_only:
+        print(f"  OFF-ONLY (no live fair): {len(plan['up'])} size-up(s) not applied; a market pacing under "
+              f"${1.0 - a.keep_within:.2f} that can't reach $1 goes off on its second read")
     by = collections.Counter(round(x, 2) for x in plan["up"].values())
-    if by:
+    if by and not off_only:
         print("  new multiples: " + ", ".join(f"{k:g}x {v}" for k, v in sorted(by.items())))
     # the read is recorded for the two-read rule even on a dry run (a read is a read)
     if not low or a.force:
@@ -810,7 +814,7 @@ def cmd_resize(a) -> int:
     except (OSError, ValueError):
         cur = {}
     n_up = n_off = 0
-    for t, x in plan["up"].items():
+    for t, x in ({} if off_only else plan["up"]).items():
         if cur.get(t, 1.0) != 0 and x > cur.get(t, 1.0) + 1e-9:     # never lowers; an off stays off
             cur[t] = x
             n_up += 1
@@ -818,8 +822,11 @@ def cmd_resize(a) -> int:
         if cur.get(t, 1.0) != 0:
             cur[t] = 0
             n_off += 1
-    n_down, n_back = apply_trims(a.name, res, plan, cur, bool(a.trim))
-    n_reach, n_rest, n_rdrop = apply_reach(a.name, res, plan, cur, float(a.reach_to or 0), a.reach_lo)
+    if off_only:                     # offs only: no trims, trim give-backs or tier reach
+        n_down = n_back = n_reach = n_rest = n_rdrop = 0
+    else:
+        n_down, n_back = apply_trims(a.name, res, plan, cur, bool(a.trim))
+        n_reach, n_rest, n_rdrop = apply_reach(a.name, res, plan, cur, float(a.reach_to or 0), a.reach_lo)
     os.makedirs(os.path.dirname(mp), exist_ok=True)
     with open(mp + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(cur, fh, indent=0, sort_keys=True)
@@ -848,6 +855,17 @@ def cmd_resize(a) -> int:
 
 
 FLOOR_MAX_MULT = 5.0       # never above 5x (Jack 2026-11-14: "go up to 5x every market")
+
+# OFF-ONLY FLOOR CHECK (review R-261124-08, Jack 2026-11-25: "Yes, all four"): a wave with
+# no live fair still gets the check when its floor max_mult is 1 (`set NAME floor_max_mult 1`)
+# -- a fair is needed only to SIZE UP. It then only turns markets off: no size-ups, trims,
+# trim give-backs or tier reach. It keeps a market pacing within OFF_ONLY_KEEP_WITHIN of $1
+# (the floor's "keep_within" overrides). Wave entries force their whole event past the bot's
+# payout floor and hopeless exit, so without this a long-shot strike rides to the period end:
+# 134 of the 2028 election wave's markets closed 11/24 under $0.90, and the forced misses lost
+# -$148 of trading over 11/18-24. Backtest on that period: off under $0.80 at 11/20 06:00Z cut
+# 62 of 125 misses, avoided -$92 and cut no market that cleared; at $0.95 it cut 16 that did.
+OFF_ONLY_KEEP_WITHIN = 0.20
 
 
 # THE BOT'S OWN LIVE FAIRS (Jack 2026-11-15: "build these to generalize into the market-wave
@@ -899,8 +917,10 @@ def pass_resize(name: str, w: dict, now: "datetime | None" = None) -> int:
     the wave's tune, which reads the multiples file. Two reads as by hand: a market goes off
     only when the previous read, 5-90 min earlier (the last pass), judged it the same way.
     Skips -- and changes nothing -- unless the wave's tune has --size-mult-file and a fresh
-    --fair-file (the floor protocol needs a live fair); cmd_resize itself skips within 15
-    min of a bot restart and on a stale dashboard read. Never above 5x; an off stays off.
+    --fair-file (the floor protocol needs a live fair to size up); with no live fair and the
+    floor's max_mult at 1 it runs OFF-ONLY (OFF_ONLY_KEEP_WITHIN: offs only, kept within
+    $0.20 of $1). cmd_resize itself skips within 15 min of a bot restart and on a stale
+    dashboard read. Never above 5x; an off stays off.
     With the wave's floor "trim" on, a market over its target comes down to it (TRIM in the
     module docstring); with it off, the trims it made are given back. With its floor
     "tier_to" set (and --tier-file in its tune), a market the multiple can't take to the aim
@@ -910,17 +930,25 @@ def pass_resize(name: str, w: dict, now: "datetime | None" = None) -> int:
     if not pw._vals(tune, "--size-mult-file"):
         print("    skipped: no --size-mult-file in its tune (`set NAME floor_auto on` adds it)")
         return 0
-    why = _fair_live(w, now)
-    if why:
-        print(f"    skipped: {why} (the floor protocol needs a live fair)")
-        return 0
     fl = w.get("floor") if isinstance(w.get("floor"), dict) else {}
-    reach_to, reach_lo = reach_of(w)
-    a = argparse.Namespace(name=name, aim=float(fl.get("aim", 1.20)),
-                           max_mult=min(FLOOR_MAX_MULT, float(fl.get("max_mult", FLOOR_MAX_MULT))),
-                           real=0.65, window_min=60.0, keep_within=0.05, no_off=False, json=None,
-                           apply=True, force=False, no_run=True, trim=bool(fl.get("trim")),
-                           reach_to=reach_to, reach_lo=reach_lo)
+    max_mult = min(FLOOR_MAX_MULT, float(fl.get("max_mult", FLOOR_MAX_MULT)))
+    why = _fair_live(w, now)
+    off_only = False
+    if why:
+        if max_mult > 1.0 + 1e-9:
+            print(f"    skipped: {why} (the floor protocol needs a live fair to size up; "
+                  f"`set NAME floor_max_mult 1` runs it off-only)")
+            return 0
+        off_only = True
+        print(f"    off-only: {why}, and the floor's max_mult is 1 -- the check only turns markets off")
+    keep = fl.get("keep_within")
+    keep_within = ((OFF_ONLY_KEEP_WITHIN if off_only else 0.05) if keep is None
+                   else min(max(float(keep), 0.0), 0.5))
+    reach_to, reach_lo = (0.0, None) if off_only else reach_of(w)
+    a = argparse.Namespace(name=name, aim=float(fl.get("aim", 1.20)), max_mult=max_mult,
+                           real=0.65, window_min=60.0, keep_within=keep_within, no_off=False, json=None,
+                           apply=True, force=False, no_run=True, trim=bool(fl.get("trim")) and not off_only,
+                           reach_to=reach_to, reach_lo=reach_lo, off_only=off_only)
     return cmd_resize(a)
 
 
