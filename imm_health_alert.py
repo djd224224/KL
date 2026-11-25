@@ -103,6 +103,18 @@ READ_RETRY_SECS = float(os.environ.get("IMM_HEALTH_READ_RETRY_SECS", "1.0"))
 RESTART_REQUEST_PATH = os.path.join(STATUS_DIR, RESTART_REQUEST_FILE)
 RESTART_HANDOFF_PATH = os.path.join(STATUS_DIR, RESTART_HANDOFF_FILE)
 RESTARTING_MAX_SECS = float(os.environ.get("IMM_HEALTH_RESTARTING_MAX_SECS", "660"))
+# A DEPLOY RESTART IS NOT AN OUTAGE EITHER (2026-11-25, review R-261124-04;
+# Jack: "also fix the 'worth knowing' issues"). The bot exits on its own when
+# its source changes (a synced deploy) and the launcher -- still Running --
+# brings python back within ~1-2 min, with no request or handoff file. All 4
+# DOWN lines on 11/24 and 8 on the 11/25 morning were that gap, or a probe
+# whose two PowerShell reads both came back empty (task "?"), each with a
+# heartbeat under 3 minutes old: a DOWN email and a recovered email each time.
+# While the heartbeat is this fresh, "no python + launcher Running" reads as
+# restarting and "task state unreadable" as unknown, not DOWN; past it they
+# alert as before. A launcher that is NOT Running with no python is still the
+# 2026-08-05 crash shape and alerts at once. 0 turns the grace off.
+RESTART_GRACE_MIN = float(os.environ.get("IMM_HEALTH_RESTART_GRACE_MIN", "3"))
 
 
 def restart_in_progress(now_ts=None) -> bool:
@@ -162,6 +174,11 @@ def probe():
     base = f"pid={pid or 'NONE'} task={state or '?'} heartbeat={age:.1f}m"
     if (not pid or state != "Running") and restart_in_progress():
         return True, "restarting", base + " (planned restart under way)"
+    fresh = RESTART_GRACE_MIN > 0 and age <= RESTART_GRACE_MIN
+    if not pid and fresh and state == "Running":
+        return True, "restarting", base + " (deploy restart: launcher up, python coming back)"
+    if not state and fresh:
+        return True, "alive" if pid else "restarting", base + " (task state unread; heartbeat fresh)"
     if not pid:
         return False, "PROCESS GONE", base
     if state != "Running":

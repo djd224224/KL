@@ -188,6 +188,64 @@ class ProbeRestartWindow(_ProbeFixture):
         self.assertFalse(ok)
         self.assertIn("HEARTBEAT STALE", headline)
 
+
+class ProbeDeployRestart(_ProbeFixture):
+    """2026-11-25 (review R-261124-04): a synced deploy restarts the bot with
+    no request or handoff file -- the launcher stays Running and python comes
+    back within ~1-2 min -- and a busy box can return nothing from both
+    PowerShell reads. Neither is an outage while the heartbeat is fresh."""
+
+    def _ps_as(self, pid, state):
+        return mock.patch.object(ha, "_ps", side_effect=lambda c: pid
+                                 if "Win32_Process" in c else state)
+
+    def _age(self, minutes):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(_status(age_min=minutes))
+
+    def test_self_restart_gap_reads_as_restarting(self):
+        self._age(0.3)                        # 11/24 08:16 "PROCESS GONE ... heartbeat=0.3m"
+        with self._ps_as("", "Running"):
+            ok, headline, detail = ha.probe()
+        self.assertTrue(ok)
+        self.assertEqual(headline, "restarting")
+        self.assertIn("deploy restart", detail)
+
+    def test_both_reads_empty_with_a_fresh_heartbeat_does_not_alert(self):
+        self._age(0.6)                        # "pid=NONE task=? heartbeat=0.6m"
+        with self._ps_as("", ""):
+            ok, headline, _ = ha.probe()
+        self.assertTrue(ok)
+        self.assertEqual(headline, "restarting")
+
+    def test_live_process_with_an_unread_task_state_is_alive(self):
+        self._age(0.6)                        # 11/24 16:31 "task  ... pid=134200 task=?"
+        with self._ps_as("134200", ""):
+            ok, headline, _ = ha.probe()
+        self.assertTrue(ok)
+        self.assertEqual(headline, "alive")
+
+    def test_a_gap_past_the_grace_still_alerts(self):
+        self._age(ha.RESTART_GRACE_MIN + 1.0)  # under STALE_MIN, over the grace
+        with self._ps_as("", "Running"):
+            ok, headline, _ = ha.probe()
+        self.assertFalse(ok)
+        self.assertEqual(headline, "PROCESS GONE")
+
+    def test_launcher_down_and_no_python_still_alerts_at_once(self):
+        self._age(0.2)                        # the 2026-08-05 crash shape
+        with self._ps_as("", "Ready"):
+            ok, headline, _ = ha.probe()
+        self.assertFalse(ok)
+        self.assertEqual(headline, "PROCESS GONE")
+
+    def test_grace_off_restores_the_old_reading(self):
+        self._age(0.3)
+        with self._ps_as("", "Running"), mock.patch.object(ha, "RESTART_GRACE_MIN", 0.0):
+            ok, headline, _ = ha.probe()
+        self.assertFalse(ok)
+        self.assertEqual(headline, "PROCESS GONE")
+
 class TestHeartbeat(unittest.TestCase):
     """Jack 2026-10-12: an outside heartbeat (healthchecks.io), so a restart
     that leaves the box at the sign-in screen is noticed from outside. No test
