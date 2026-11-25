@@ -437,6 +437,11 @@ class LedgerTests(Base):
         self.assertEqual(rv.main(["ledger", "decide", "R-261124-01", "rejected", "--note", "no"]), 0)
         self.assertEqual(rv.ledger_state()["R-261124-01"]["status"], "rejected")
         self.assertEqual(rv.main(["ledger", "show", "R-999999-01"]), 1)
+        self.findings(DAY, [{"fingerprint": "data:z", "kind": "data", "title": "z"}])
+        rv.ledger_ingest(DAY)
+        iid = [k for k, v in rv.ledger_state().items() if v["fingerprint"] == "data-z"][0]
+        self.assertEqual(rv.main(["ledger", "close", iid, "--status", "fixed-elsewhere", "--note", "x"]), 0)
+        self.assertEqual(rv.ledger_state()[iid]["status"], "fixed-elsewhere")
 
 
 class MeasureTests(Base):

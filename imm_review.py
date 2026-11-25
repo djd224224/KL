@@ -2369,6 +2369,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     l.add_argument("--note", default="")
     l.add_argument("--by", default="jack")
     l.add_argument("--ref")
+    l.add_argument("--status", dest="status_opt", help="same as the positional status")
     l.add_argument("--all", action="store_true")
     pp = sub.add_parser("put", help="write findings.json or review.md from stdin into the day's folder")
     pp.add_argument("name", choices=PUT_NAMES)
@@ -2429,6 +2430,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not a.id or a.id not in items:
         print(f"no item {a.id}")
         return 1
+    a.status = a.status_opt or a.status
     if a.action == "decide":
         if a.status not in ("approved", "rejected", "deferred"):
             ap.error("decide takes approved|rejected|deferred")
