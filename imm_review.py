@@ -1163,6 +1163,21 @@ def sec_system(day: date, bootstrap_days: int = 14) -> dict:
     return out
 
 
+_SETLIKE = re.compile(r"^\s*(?:frozenset\(|set\(|tuple\()?\s*[\[{(](.*)[\]})]\s*\)?\s*$", re.S)
+_QUOTED = re.compile(r"'([^']*)'|\"([^\"]*)\"")
+
+
+def _set_items(v) -> Optional[List[str]]:
+    """The items of a logged set/list/tuple repr ("frozenset({'B', 'A'})"),
+    sorted, or None when the value is not one. Sets print in hash order, which
+    changes from run to run, so raw reprs differ when nothing changed."""
+    s = str(v) if v is not None else ""
+    m = _SETLIKE.match(s)
+    if not m or ("'" not in s and '"' not in s):
+        return None
+    return sorted(a or b for a, b in _QUOTED.findall(m.group(1)))
+
+
 def config_runs(day: date) -> dict:
     s, e = et_bounds(day)
     rows = []
@@ -1179,11 +1194,18 @@ def config_runs(day: date) -> dict:
         if prev:
             a, b = prev.get("config") or {}, r.get("config") or {}
             for k in sorted(set(a) | set(b)):
-                if k in ("IMM_HEARTBEAT_URL",):
+                if k in ("IMM_HEARTBEAT_URL",) or a.get(k) == b.get(k):
                     continue
-                if a.get(k) != b.get(k):
-                    changes.append({"at": et_str(_ts_of(r["ts"])), "key": k,
-                                    "old": str(a.get(k))[:80], "new": str(b.get(k))[:80]})
+                ia, ib = _set_items(a.get(k)), _set_items(b.get(k))
+                if ia is not None and ib is not None:
+                    if ia == ib:
+                        continue                  # same set, printed in another order
+                    add, rem = sorted(set(ib) - set(ia)), sorted(set(ia) - set(ib))
+                    old = ("-" + ",".join(rem))[:80] if rem else ""
+                    new = ("+" + ",".join(add))[:80] if add else ""
+                else:
+                    old, new = str(a.get(k))[:80], str(b.get(k))[:80]
+                changes.append({"at": et_str(_ts_of(r["ts"])), "key": k, "old": old, "new": new})
         prev = r
     return {"runs": runs, "env_changes": changes[:40]}
 

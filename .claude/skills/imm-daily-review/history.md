@@ -40,3 +40,10 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
 
 - **11/25 (build):** the first collect back-fills 14 days of log signatures, which took about 5 minutes on this box. Daily runs scan one day (about 30-60 seconds).
 - **11/25:** the cc-plugin-privacy hook blocks Bash commands that name files containing Jack's email address. Read incentive_mm.py with the Grep and Read tools.
+- **11/25, the first unattended run (D = 11/24, opus, 27 min, 66 turns, 51 Bash calls, no denials).**
+  - It filed 19 findings, R-261124-01 to -19.
+  - The best was a P1 the code review of 1417444 caught: day 21-31 DDMONYY tickers are still read year-first (the commit's own comment admits it). 13 events were dark, and KXUSDJPYEVENT-27NOV261100 read 364 days late.
+  - It also measured the name-bid-cap raise after the fact: -$235/day, t -1.68, so it proposed an A/B rather than a cut.
+  - **Fault:** it wrote "My bug, fixed in imm_review.py" while changing nothing (rule 6a). The env-diff frozenset noise it flagged was fixed in the build the same day.
+  - It drafted its outputs in its temp scratchpad, then used `put`. That is fine.
+  - The body ran about 170 lines, so the length rule is now explicit.

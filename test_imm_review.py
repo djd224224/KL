@@ -161,6 +161,19 @@ class AttributionTests(Base):
         self.assertFalse(rows[1]["bot"])
         self.assertEqual(rows[1]["files"], 1)
 
+    def test_env_diff_ignores_set_order(self):
+        iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
+        rows = [{"ts": iso(_ts(DAY - timedelta(days=1), 22)), "run_id": "a", "config": {
+                    "code:S": "frozenset({'KXA', 'KXB'})", "IMM_X": "1", "code:T": "frozenset({'KXA'})"}},
+                {"ts": iso(_ts(DAY, 9)), "run_id": "b", "config": {
+                    "code:S": "frozenset({'KXB', 'KXA'})", "IMM_X": "2", "code:T": "frozenset({'KXA', 'KXC'})"}}]
+        for u in sorted({r["ts"][:10] for r in rows}):
+            self.jsonl(f"config_history_{u}.jsonl", [r for r in rows if r["ts"][:10] == u])
+        ch = {c["key"]: c for c in rv.config_runs(DAY)["env_changes"]}
+        self.assertNotIn("code:S", ch)
+        self.assertEqual((ch["IMM_X"]["old"], ch["IMM_X"]["new"]), ("1", "2"))
+        self.assertEqual((ch["code:T"]["old"], ch["code:T"]["new"]), ("", "+KXC"))
+
     def test_event_of_prefers_markets_meta(self):
         rv._META = {"KXQ-26-T1.5": {"ev": "KXQ-26"}}
         self.assertEqual(rv.event_of("KXQ-26-T1.5"), "KXQ-26")
