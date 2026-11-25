@@ -297,6 +297,106 @@ class CounterfactualTests(Base):
         rv.sec_counterfactual(DAY)                              # idempotent per day
         self.assertEqual(len(list(rv._iter_jsonl(os.path.join(self.review, "counterfactual.jsonl")))), 2)
 
+    def test_unmeasured_pool_by_class(self):
+        # R-261124-21: the gap scan's unread pool, split by who (if anyone) measures it
+        rows = [{"event": "KXBLK-1", "series": "KXBLK", "pool": 100, "est": None, "n": 3, "n_est": 0,
+                 "reason": "blocklisted", "title": "blk"},
+                {"event": "KXNE-1", "series": "KXNE", "pool": 200, "est": None, "n": 4, "n_est": 0,
+                 "reason": "not in allowlist", "title": "ne1"},
+                {"event": "KXNE-2", "series": "KXNE", "pool": 50, "est": None, "n": 2, "n_est": 0,
+                 "reason": "not in allowlist", "title": "ne2"},
+                {"event": "KXNS-1", "series": "KXNS", "pool": 30, "est": None, "n": 1, "n_est": 0,
+                 "reason": "not in allowlist", "title": "ns"},
+                {"event": "KXP-2", "series": "KXP", "pool": 300, "est": None, "n": 2, "n_est": 0,
+                 "reason": "screened: extreme_mid", "title": "p2"},
+                {"event": "KXZ-1", "series": "KXZ", "pool": 40, "est": None, "n": 1, "n_est": 0,
+                 "reason": "capacity (cap/budget)", "title": "z"},
+                {"event": "KXA-1", "series": "KXA", "pool": 999, "est": 5.0, "n": 2, "n_est": 2,
+                 "reason": "capacity (cap/budget)", "title": "a"}]
+        with open(os.path.join(rv.CACHE_DIR, "api_gaps.pkl"), "wb") as fh:
+            pickle.dump({"at": 1.0, "val": {"rows": rows, "ctx": {"unest_pool": 720}}}, fh)
+        with open(os.path.join(rv.CACHE_DIR, "api_unquoted.pkl"), "wb") as fh:
+            pickle.dump({"at": 1.0, "val": {"rows": [{"series": "KXNE", "scored": 4, "x1": 2.0, "x3": 5.0}],
+                                            "ctx": {}}}, fh)
+        iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
+        snap = [{"ts": iso(_ts(DAY, 3)), "ticker": "KXP-2-T2", "event_ticker": "KXP-2",
+                 "decision": "extreme_mid", "est_dollars_per_day": 9.0},       # superseded by the later read
+                {"ts": iso(_ts(DAY, 9)), "ticker": "KXP-2-T1", "event_ticker": "KXP-2",
+                 "decision": "extreme_mid", "est_dollars_per_day": 0.6},
+                {"ts": iso(_ts(DAY, 9)), "ticker": "KXP-2-T2", "event_ticker": "KXP-2",
+                 "decision": "extreme_mid", "est_dollars_per_day": 3.0}]
+        for u in rv.utc_dates(DAY):
+            self.jsonl(f"selection_snapshot_{u}.jsonl", [r for r in snap if r["ts"][:10] == u])
+        cf = rv.sec_counterfactual(DAY)
+        um = cf["unmeasured"]
+        c = um["classes"]
+        self.assertEqual(um["gap_scan_unest_pool"], 720)
+        self.assertEqual(c["blocked on purpose"]["pool"], 100)
+        self.assertEqual((c["not enrolled: estimated"]["events"], c["not enrolled: estimated"]["pool"]), (2, 250))
+        self.assertEqual(c["not enrolled: estimated"]["est_x1"], 2.0)       # per series, counted once
+        self.assertEqual(c["not enrolled: estimated"]["est_x3"], 5.0)
+        self.assertEqual(c["not enrolled: unscored"]["pool"], 30)
+        self.assertAlmostEqual(c["allowed: estimated by the bot"]["est"], 3.6)
+        self.assertAlmostEqual(c["allowed: estimated by the bot"]["est_under_1_per_mkt"], 0.6)
+        self.assertEqual(c["allowed: not in the bot's snapshot"]["pool"], 40)
+        self.assertEqual(um["unmeasured_pool"], 170)
+        self.assertEqual(um["unmeasured_not_blocked"], 70)
+        by = {x["event"]: x["measured_by"] for x in cf["top_unestimated_pool"]}
+        self.assertEqual(by["KXP-2"], "allowed: estimated by the bot")
+        self.assertEqual(by["KXBLK-1"], "blocked on purpose")
+        md = rv.render_evidence({"day": DAY.isoformat(), "window_et": ["a", "b"], "generated": 0, "counterfactual": cf})
+        self.assertIn("Unmeasured pool by class (R-261124-21)", md)
+        self.assertIn("| blocked on purpose | 1 | $100 | none |", md)
+
+    def test_floor_misses_split_forced_and_cost(self):
+        # R-261124-23: misses split by whether the bot quoted them to the end, the
+        # wave that forced them, what they cost and the size they needed
+        pe = _ts(DAY, 20)
+        iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
+        base = {"program_end": iso(pe), "period_base": 1.0, "est_dollars_per_day": 1.0}
+        snap = [dict(base, ts=iso(_ts(DAY, 18)), ticker="KXW-1-T1", event_ticker="KXW-1",
+                     decision="selected", accrued_lifetime=1.4),
+                dict(base, ts=iso(_ts(DAY, 18)), ticker="KXW-1-T2", event_ticker="KXW-1",
+                     decision="selected", accrued_lifetime=1.1),
+                dict(base, ts=iso(_ts(DAY, 18)), ticker="KXD-1-T1", event_ticker="KXD-1",
+                     decision="hopeless", accrued_lifetime=1.3)]
+        for u in rv.utc_dates(DAY):
+            self.jsonl(f"selection_snapshot_{u}.jsonl", [r for r in snap if r["ts"][:10] == u])
+        self.write("post_vote_dead_books.json", json.dumps({"markets": {
+            "KXW-1-T1": {"event": "KXW-1", "stop": iso(pe + 7 * 86400),
+                         "band": "2026-11-24T05:00:00Z: 1-99c (wave w1111-test)"},
+            "KXOLD-1": {"event": "KXD-1", "stop": iso(pe - 10 * 86400)}}}))
+        self.archive(DAY, {"KXW-1-T1": _row(pnl=-5.0, fills=2, rest=100.0),
+                           "KXW-1-T2": _row(pnl=-1.0, fills=1, rest=50.0),
+                           "KXD-1-T1": _row(pnl=1.5, fills=1, rest=10.0)})
+        self.archive(DAY - timedelta(days=8), {"KXW-1-T1": _row(pnl=-100.0, fills=9, rest=1.0)})
+        fm = rv.selection_day(DAY)["floor_misses"]
+        self.assertEqual(fm["under_090"], 3)
+        self.assertEqual(fm["split"]["quoted_to_end"]["n"], 2)
+        self.assertEqual(fm["split"]["dropped"]["n"], 1)
+        self.assertEqual(fm["wave_forced"]["n"], 2)                  # the wave forces its whole event
+        self.assertEqual(fm["wave_forced"]["by_wave"], [("w1111-test", 2)])
+        self.assertEqual(fm["size_needed"], {"<=2x": 0, "2-3x": 1, "3-5x": 0, ">5x": 1})
+        q = fm["cost_7d"]["quoted_to_end"]
+        self.assertEqual((q["pnl"], q["fills"], q["rest_avg"]), (-6.0, 3, 75.0))   # day -8 is outside
+        self.assertEqual(fm["cost_7d"]["dropped"]["pnl"], 1.5)
+        md = rv.render_evidence({"day": DAY.isoformat(), "window_et": ["a", "b"], "generated": 0, "counterfactual": {"selection": {
+            "decisions": {"selected": {"tickers": 2, "avg_est_day": 1.0}}, "floor_misses": fm}}})
+        self.assertIn("2 QUOTED TO THE END", md)
+        self.assertIn("1 DROPPED by the floor logic", md)
+
+    def test_floor_miss_cost_without_wave_lists_or_archive(self):
+        pe = _ts(DAY, 20)
+        iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
+        self.jsonl(f"selection_snapshot_{rv.utc_dates(DAY)[0]}.jsonl",
+                   [{"ts": iso(_ts(DAY, 18)), "ticker": "KXQ-1-T1", "event_ticker": "KXQ-1",
+                     "decision": "selected", "program_end": iso(pe), "accrued_lifetime": 0.5,
+                     "period_base": 0.0}])
+        fm = rv.selection_day(DAY)["floor_misses"]
+        self.assertEqual(fm["wave_forced"]["n"], 0)
+        self.assertEqual(fm["cost_7d"]["quoted_to_end"], {"pnl": 0.0, "fills": 0, "rest_avg": 0.0})
+        self.assertEqual(fm["size_needed"]["<=2x"], 1)
+
     def test_reason_class(self):
         self.assertEqual(rv.reason_class("screened: extreme_mid, under payout floor"), "market screen")
         self.assertEqual(rv.reason_class("under payout floor, screened: x"), "economics")

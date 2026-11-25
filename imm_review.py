@@ -742,11 +742,96 @@ def realisation_factor() -> Tuple[float, str]:
     return DEFAULT_REALISATION, "default 0.72 (admission realised 0.71-0.74x of a single reading)"
 
 
+UNMEASURED_CLASSES = (
+    ("blocked on purpose", "nothing (Jack's blocks)"),
+    ("not enrolled: estimated", "imm_unquoted (the not-enrolled scan), per series"),
+    ("not enrolled: unscored", "nothing"),
+    ("allowed: estimated by the bot", "the bot's selection snapshot, every hourly refresh"),
+    ("allowed: not in the bot's snapshot", "nothing"),
+)
+_UNMEASURED_OPEN = ("blocked on purpose", "not enrolled: unscored", "allowed: not in the bot's snapshot")
+
+
+def unmeasured_class(r: dict, unq_series: Dict[str, dict], bot_events: Dict[str, dict]) -> str:
+    cls = reason_class(r.get("reason") or "")
+    if cls == "deliberate":
+        return "blocked on purpose"
+    if cls == "not enrolled":
+        u = unq_series.get(r.get("series") or series_of(r.get("event") or ""))
+        return "not enrolled: estimated" if u and _f(u.get("scored")) > 0 else "not enrolled: unscored"
+    return ("allowed: estimated by the bot" if r.get("event") in bot_events
+            else "allowed: not in the bot's snapshot")
+
+
+def unmeasured_pool(rows: List[dict], urows: List[dict], latest: Dict[str, tuple],
+                    gap_scan_unest) -> dict:
+    """THE BLIND SPOT, MEASURED (review R-261124-21, Jack 2026-11-25: "Yes, all
+    four"). The gap scan reads ~210 books an hour, so its "unestimated pool"
+    (api_gaps ctx unest_pool) counts every event it did not read, though most of
+    them are estimated elsewhere: the not-enrolled scan (api_unquoted) scores each
+    series outside the allowlist, and the bot estimates every allowed candidate
+    on each hourly refresh (selection snapshot). Only what none of the three
+    reads is unmeasured -- and most of that is blocked on purpose."""
+    unq_series = {u.get("series"): u for u in urows if u.get("series")}
+    bot_events: Dict[str, dict] = {}
+    for _t, (_ts, dec, est, ev) in latest.items():
+        if not ev or dec == "selected":
+            continue
+        b = bot_events.setdefault(ev, {"est": 0.0, "under_1": 0.0, "n": 0})
+        b["est"] += est
+        b["n"] += 1
+        if est < 1.0:
+            b["under_1"] += est
+    acc = {name: {"events": 0, "pool": 0.0, "est": 0.0, "est_x3": 0.0, "under_1": 0.0, "by": by}
+           for name, by in UNMEASURED_CLASSES}
+    seen_series = set()
+    for r in rows:
+        if _f(r.get("n_est")):
+            continue
+        name = unmeasured_class(r, unq_series, bot_events)
+        a = acc[name]
+        a["events"] += 1
+        a["pool"] += _f(r.get("pool"))
+        if name == "not enrolled: estimated":
+            ser = r.get("series") or series_of(r.get("event") or "")
+            if ser not in seen_series:               # x1/x3 are per series: count each once
+                seen_series.add(ser)
+                a["est"] += _f(unq_series[ser].get("x1"))
+                a["est_x3"] += _f(unq_series[ser].get("x3"))
+        elif name == "allowed: estimated by the bot":
+            b = bot_events[r["event"]]
+            a["est"] += b["est"]
+            a["under_1"] += b["under_1"]
+    classes = {}
+    for name, a in acc.items():
+        if not a["events"]:
+            continue
+        c = {"events": a["events"], "pool": round(a["pool"], 2), "by": a["by"]}
+        if name == "not enrolled: estimated":
+            c.update({"est_x1": round(a["est"], 2), "est_x3": round(a["est_x3"], 2)})
+        elif name == "allowed: estimated by the bot":
+            c.update({"est": round(a["est"], 2), "est_under_1_per_mkt": round(a["under_1"], 2)})
+        classes[name] = c
+    open_pool = sum(acc[k]["pool"] for k in _UNMEASURED_OPEN)
+    return {"gap_scan_unest_pool": round(_f(gap_scan_unest), 2),
+            "classes": classes,
+            "unmeasured_pool": round(open_pool, 2),
+            "unmeasured_not_blocked": round(open_pool - acc["blocked on purpose"]["pool"], 2),
+            "basis": ("pool: Kalshi program $/day of events the gap scan left unread (MEASURED); estimates "
+                      "MODELLED: not-enrolled x1/x3 $/day per series, the bot's est $/day per allowed market "
+                      "at its last read of the day (est_under_1_per_mkt: the part from markets under $1/day "
+                      "each, which a one-day period never pays)")}
+
+
 def sec_counterfactual(day: date) -> dict:
     iso = day.isoformat()
     out: dict = {"basis": "MODELLED: one-reading estimates, full-day coverage, no competitor response"}
     fac, fac_note = realisation_factor()
     out["realisation"] = {"factor": fac, "note": fac_note}
+    latest: Dict[str, tuple] = {}
+    sel = selection_day(day, latest)
+    rows: List[dict] = []
+    urows: List[dict] = []
     gaps = _load_pickle(os.path.join(CACHE_DIR, "api_gaps.pkl")) or {}
     val = gaps.get("val") if isinstance(gaps, dict) else None
     if isinstance(val, dict):
@@ -808,12 +893,19 @@ def sec_counterfactual(day: date) -> dict:
                                     "x3": r.get("x3"), "call": r.get("call"),
                                     "why": (r.get("why") or "")[:90], "tape_c": r.get("tape_c")}
                                    for r in top]
+    if rows:
+        um = unmeasured_pool(rows, urows, latest, (out.get("universe") or {}).get("unest_pool"))
+        out["unmeasured"] = um
+        unq_series = {u.get("series"): u for u in urows if u.get("series")}
+        bot_events = {ev for _t, (_ts, dec, _est, ev) in latest.items() if ev and dec != "selected"}
+        for x in out.get("top_unestimated_pool") or []:
+            x["measured_by"] = unmeasured_class(x, unq_series, dict.fromkeys(bot_events))
     cg = _load_json(os.path.join(STATUS_DIR, "config_gaps.json"), {}) or {}
     gaps_now = cg.get("gaps") or {}
     out["config_gaps"] = [{"event": k, "series": v.get("series"), "since": v.get("since"),
                            "msg": (v.get("msg") or "")[:160]}
                           for k, v in list(gaps_now.items())[:25] if isinstance(v, dict)]
-    out["selection"] = selection_day(day)
+    out["selection"] = sel
     out["calibration"] = calibrate_predictions(day)
     return out
 
@@ -873,10 +965,51 @@ def calibrate_predictions(day: date) -> dict:
     return out
 
 
-def selection_day(day: date) -> dict:
+_WAVE_RE = re.compile(r"\(wave (w[0-9A-Za-z_-]+)\)")
+
+
+def pvd_wave_events() -> Dict[str, dict]:
+    """{event: {"stop": latest stop ts, "waves": {names}}} from the wave lists the bot
+    reads (STATUS_DIR/post_vote_dead_books.json, as of this run). A wave entry
+    forces its whole EVENT past the payout floor and the hopeless exit
+    (incentive_mm.py, "a wave entry forces its EVENT"); "stop" also counts the
+    period that just ended (prev_period), so a miss that closed it still shows."""
+    d = _load_json(os.path.join(STATUS_DIR, "post_vote_dead_books.json"), {}) or {}
+    out: Dict[str, dict] = {}
+    for _t, v in ((d.get("markets") or {}) if isinstance(d, dict) else {}).items():
+        if not isinstance(v, dict) or not v.get("event"):
+            continue
+        stops = [_ts_of(v.get("stop"))]
+        pp = v.get("prev_period")
+        if isinstance(pp, dict):
+            stops.append(_ts_of(pp.get("stop")))
+        stops = [x for x in stops if x is not None]
+        e = out.setdefault(v["event"], {"stop": None, "waves": set()})
+        if stops:
+            e["stop"] = max(stops + ([e["stop"]] if e["stop"] is not None else []))
+        for x in v.values():
+            if isinstance(x, str):
+                e["waves"].update(_WAVE_RE.findall(x))
+    return out
+
+
+SIZE_NEEDED_BUCKETS = ((2.0, "<=2x"), (3.0, "2-3x"), (5.0, "3-5x"), (float("inf"), ">5x"))
+
+
+def selection_day(day: date, latest: Optional[dict] = None) -> dict:
     """Allowed candidates the bot cut, from the hourly selection snapshots: the
     average modelled $/day by decision, and floor misses (periods that ended in
-    the day with accrual under the $1 floor)."""
+    the day with accrual under the $1 floor). With `latest`, also fills it with
+    each ticker's last row of the day: {ticker: (ts, decision, est $/day, event)}.
+
+    FLOOR MISSES, COST AND CAUSE (review R-261124-23, Jack 2026-11-25: "Yes, all
+    four"): a miss is "quoted to the end" when its last read before the period
+    end still had it selected, else "dropped" (the floor logic stood it down and
+    the accrual was left over); "wave-forced" when a wave list held its event
+    through the period end. Each class carries the trading P&L, fills and $
+    resting of its markets over the 7 ET days to the day (day archive: MEASURED
+    at last-trade marks) and, for the quoted ones, the size multiple each needed
+    to reach $1 (1 / banked: MODELLED, linear in size)."""
     s, e = et_bounds(day)
     snaps = set()
     by_dec = defaultdict(lambda: {"est": 0.0, "tickers": set()})
@@ -893,8 +1026,13 @@ def selection_day(day: date) -> dict:
             b = by_dec[dec]
             b["est"] += est
             b["tickers"].add(r.get("ticker"))
+            ev = r.get("event_ticker") or event_of(r.get("ticker") or "")
             if dec != "selected" and est > 0:
-                top[(r.get("event_ticker") or event_of(r.get("ticker") or ""), dec)] += est
+                top[(ev, dec)] += est
+            if latest is not None and r.get("ticker"):
+                prev = latest.get(r["ticker"])
+                if prev is None or ts >= prev[0]:
+                    latest[r["ticker"]] = (ts, dec, est, ev)
             pe = _ts_of(r.get("program_end"))
             if pe is not None and s <= pe < e + 3600:
                 last_row[r.get("ticker")] = r
@@ -910,15 +1048,78 @@ def selection_day(day: date) -> dict:
             near.append((t, round(banked, 3)))
     under.sort(key=lambda x: -x[1])
     by_series = Counter(series_of(t) for t, _ in under)
+    fm = {"periods_ending": len(last_row),
+          "under_090": len(under),
+          "under_090_modelled": round(sum(b for _, b in under), 2),
+          "near_090_100": len(near),
+          "near_modelled": round(sum(b for _, b in near), 2),
+          "by_series": by_series.most_common(8), "top": under[:8]}
+    try:
+        fm.update(_floor_miss_cost(day, under, last_row))
+    except Exception as ex:                      # a report line, never a crash
+        fm["cost_error"] = f"{type(ex).__name__}: {ex}"
     return {"snapshots": len(snaps), "decisions": decisions,
             "top_cut": [{"event": ev, "decision": dec, "avg_est_day": round(v / n, 2)}
                         for (ev, dec), v in sorted(top.items(), key=lambda kv: -kv[1])[:15]],
-            "floor_misses": {"periods_ending": len(last_row),
-                             "under_090": len(under),
-                             "under_090_modelled": round(sum(b for _, b in under), 2),
-                             "near_090_100": len(near),
-                             "near_modelled": round(sum(b for _, b in near), 2),
-                             "by_series": by_series.most_common(8), "top": under[:8]}}
+            "floor_misses": fm}
+
+
+def _floor_miss_cost(day: date, under: List[Tuple[str, float]], last_row: Dict[str, dict]) -> dict:
+    """The cause and cost of the under-$0.90 misses (see selection_day)."""
+    waves = pvd_wave_events()
+    cls_of: Dict[str, str] = {}
+    split = {k: {"n": 0, "modelled": 0.0, "series": Counter()} for k in ("quoted_to_end", "dropped")}
+    forced = {"n": 0, "modelled": 0.0, "waves": Counter()}
+    size_needed = {lab: 0 for _x, lab in SIZE_NEEDED_BUCKETS}
+    for t, banked in under:
+        r = last_row.get(t) or {}
+        k = "quoted_to_end" if r.get("decision") == "selected" else "dropped"
+        cls_of[t] = k
+        c = split[k]
+        c["n"] += 1
+        c["modelled"] += banked
+        c["series"][series_of(t)] += 1
+        ev = r.get("event_ticker") or event_of(t)
+        pe = _ts_of(r.get("program_end"))
+        w = waves.get(ev)
+        if w and w["stop"] is not None and pe is not None and w["stop"] >= pe - 300:
+            forced["n"] += 1
+            forced["modelled"] += banked
+            forced["waves"].update(sorted(w["waves"]) or ["(unnamed wave)"])
+        if k == "quoted_to_end" and banked > 0:
+            need = 1.0 / banked
+            for lim, lab in SIZE_NEEDED_BUCKETS:
+                if need <= lim:
+                    size_needed[lab] += 1
+                    break
+    cost = {k: {"pnl": 0.0, "fills": 0, "rest_sum": 0.0, "days": 0} for k in split}
+    end = day.isoformat()
+    start = (day - timedelta(days=6)).isoformat()
+    for d in [x for x in archive_days() if start <= x <= end]:
+        b = load_archive(d)
+        if not b:
+            continue
+        for t, v in market_rows(b):
+            k = cls_of.get(t)
+            if k is None:
+                continue
+            cc = cost[k]
+            cc["pnl"] += _f(v.get("pnl"))
+            cc["fills"] += int(_f(v.get("fills")))
+            cc["rest_sum"] += _f(v.get("rest"))
+            cc["days"] += 1
+    return {
+        "split": {k: {"n": v["n"], "modelled": round(v["modelled"], 2),
+                      "by_series": v["series"].most_common(6)} for k, v in split.items()},
+        "wave_forced": {"n": forced["n"], "modelled": round(forced["modelled"], 2),
+                        "by_wave": forced["waves"].most_common(6),
+                        "basis": "wave lists as of this run (post_vote_dead_books.json)"},
+        "size_needed": size_needed,
+        "cost_7d": {k: {"pnl": round(v["pnl"], 2), "fills": v["fills"],
+                        "rest_avg": round(v["rest_sum"] / v["days"], 2) if v["days"] else 0.0}
+                    for k, v in cost.items()},
+        "cost_basis": (f"trading P&L at last-trade marks, fills and average $ resting per market-day, "
+                       f"{start} to {end} ET (day archive, MEASURED); size needed = 1 / banked (MODELLED)")}
 
 
 # ---------------------------------------------------------------------------
@@ -2493,7 +2694,23 @@ def render_evidence(ev: dict) -> str:
         a(f"Universe (dashboard cache {et_str(cf.get('gaps_as_of'))}): {u.get('programs')} programs, pool "
           f"{usd0(u.get('pool_total'), False)}/day; quoted {u.get('quoted')} mkts in {u.get('quoted_events')} events "
           f"(cap {u.get('event_cap')}); {u.get('unquoted_rows')} unquoted rows; {u.get('books_read')} books read; "
-          f"UNESTIMATED pool {usd0(u.get('unest_pool'), False)}/day; estimated missed total {usd(u.get('est_missed_total'), False)}/day.")
+          f"the gap scan left {usd0(u.get('unest_pool'), False)}/day unread (its own count, most of it estimated "
+          f"elsewhere: see the classes below); estimated missed total {usd(u.get('est_missed_total'), False)}/day.")
+    um = cf.get("unmeasured") or {}
+    if um.get("classes"):
+        a(f"\nUnmeasured pool by class (R-261124-21): of {usd0(um.get('gap_scan_unest_pool'), False)}/day the gap scan "
+          f"left unread, {usd0(um.get('unmeasured_pool'), False)}/day is read by nothing, "
+          f"{usd0(um.get('unmeasured_not_blocked'), False)}/day of it NOT blocked on purpose. {um.get('basis')}.")
+        a("| Class | Events | Pool $/day | Estimate $/day | Estimated by |")
+        a("|---|---:|---:|---:|---|")
+        for k, v in um["classes"].items():
+            if "est_x1" in v:
+                est = f"x1 {usd(v['est_x1'], False)}, x3 {usd(v['est_x3'], False)}"
+            elif "est" in v:
+                est = f"{usd(v['est'], False)} ({usd(v['est_under_1_per_mkt'], False)} from mkts under $1/day)"
+            else:
+                est = "none"
+            a(f"| {k} | {v['events']} | {usd0(v['pool'], False)} | {est} | {v['by']} |")
     r = cf.get("realisation") or {}
     a(f"Estimates shown raw and x{r.get('factor')} ({r.get('note')}).")
     if cf.get("by_class"):
@@ -2508,9 +2725,10 @@ def render_evidence(ev: dict) -> str:
               f"{usd(x['est'], False)} -> adj {usd(x['est_adj'], False)} -> net {usd(x.get('est_net'), False)} "
               f"({x.get('family')}, tax {x.get('tax')}), {x['n_est']}/{x['n']} mkts read - {x['title']}")
     if cf.get("top_unestimated_pool"):
-        a("\nBiggest UNESTIMATED pools (no book read):")
+        a("\nBiggest pools the gap scan left unread (with who measures them instead):")
         for x in cf["top_unestimated_pool"]:
-            a(f"- {x['event']} [{x['class']}: {x['reason']}] pool {usd0(x['pool'], False)}/day, {x['n']} mkts - {x['title']}")
+            a(f"- {x['event']} [{x['class']}: {x['reason']}; {x.get('measured_by') or '?'}] pool "
+              f"{usd0(x['pool'], False)}/day, {x['n']} mkts - {x['title']}")
     if cf.get("not_enrolled_top"):
         a(f"\nNot-enrolled series (imm_unquoted calls {cf.get('not_enrolled_calls')}):")
         for x in cf["not_enrolled_top"]:
@@ -2532,6 +2750,22 @@ def render_evidence(ev: dict) -> str:
           f"under $0.90 of modelled accrual ({usd(fm.get('under_090_modelled'), False)} earned nothing) and "
           f"{fm.get('near_090_100')} at $0.90-1.00 ({usd(fm.get('near_modelled'), False)}; paid/est ~1.1 may still clear). "
           f"By series {fm.get('by_series')}; top {fm.get('top')}")
+        sp = fm.get("split") or {}
+        if sp:
+            q, dr = sp.get("quoted_to_end") or {}, sp.get("dropped") or {}
+            wf = fm.get("wave_forced") or {}
+            c7 = fm.get("cost_7d") or {}
+            cq, cd = c7.get("quoted_to_end") or {}, c7.get("dropped") or {}
+            a(f"Floor misses by cause (R-261124-23): {q.get('n')} QUOTED TO THE END ({usd(q.get('modelled'), False)}; "
+              f"{q.get('by_series')}) vs {dr.get('n')} DROPPED by the floor logic, accrual left over "
+              f"({usd(dr.get('modelled'), False)}; {dr.get('by_series')}). Wave-forced (a wave list held the event "
+              f"through the period end): {wf.get('n')} ({usd(wf.get('modelled'), False)}), by wave {wf.get('by_wave')}.")
+            a(f"Floor-miss COST, 7 ET days to the day: quoted-to-the-end markets trading {usd(cq.get('pnl'))} on "
+              f"{cq.get('fills')} fills, ~{usd0(cq.get('rest_avg'), False)} resting per market-day; dropped markets "
+              f"trading {usd(cd.get('pnl'))} on {cd.get('fills')} fills. Size each quoted miss needed to reach $1: "
+              f"{fm.get('size_needed')}. ({fm.get('cost_basis')})")
+        elif fm.get("cost_error"):
+            a(f"Floor-miss cost: ERROR {fm['cost_error']}")
     cal = cf.get("calibration") or {}
     a(f"Prediction calibration: {cal}")
     # 5 coverage

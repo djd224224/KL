@@ -150,7 +150,10 @@ Known biases (all point the same way, so treat raw estimates as upper bounds):
 3. Books before a program starts are thin, so upcoming estimates lean high.
 4. Totals add up independent markets. That is not a feasible portfolio: caps, slots and per-event room are ignored.
 5. The average tape maker's P&L understates our pick-offs. On the 10/26 gas test, makers lost 3.2c a contract and we lost 31c.
-6. The book-read budget truncates the universe. The unestimated pool is a blind spot, not a zero.
+6. The gap scan's book-read budget (~210 books) limits the gap scan's own view, not the bot's.
+   - The bot estimates every allowed candidate on each refresh (`selection_snapshot`), and the not-enrolled scan scores every series outside the allowlist.
+   - Only `counterfactual.unmeasured.unmeasured_pool` goes unread by all three. On 11/24 that was $24.7k/day, $20.2k of it blocked on purpose; the allowed markets nobody quotes were worth $35/day (all under $1/day each).
+   - Unmeasured is not zero, but it is also not the $65k the gap scan counts (R-261124-21).
 
 Calibrate: each day's top predictions are logged, and when those events get quoted later the realised modelled $/day over the predicted $/day sets the factor (median, clamped 0.05-2.0).
 

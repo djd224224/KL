@@ -38,7 +38,7 @@ Then, cheapest first:
 4. Move capital to strengthening families.
 5. Retire a family whose net per $1k stays under the book for 3 straight weeks. That is a decision for Jack.
 
-Always look for edges others can't copy: families where our own fair, data feed or speed cuts the trading tax, and new programs we can enroll first. The unestimated pool is where those hide.
+Always look for edges others can't copy: families where our own fair, data feed or speed cuts the trading tax, and new programs we can enroll first. The pool nothing reads (`counterfactual.unmeasured`, outside the blocks) is where those hide.
 
 **Every run adds to the moat.** It has a finding that improves data (a gap to log), analysis (a prior or check to add), or process (a rule to promote), or it says why none was warranted.
 
@@ -106,9 +106,13 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 - **Not enrolled with a real pool:** read the imm_unquoted call. An ADD or ADD WITH CARE whose tape makers are at or above zero and whose x1 clears $5/day is an enrollment suggestion. Name the file (extra_allow_series.json) and the cutoff rule it needs.
 - **Config gaps** (fail-closed, missing verified dates): list them. If two sources settle the date in minutes, put both in the plan; the row is written in apply mode with `imm_rows.py`.
 - **Capacity / economics / deliberate with a sizeable estimate:** ask whether the rule still earns its keep. Deliberate blocks get re-litigated only weekly, or when a new pool is large.
-- **Unestimated pool:** if the estimator read N books and left $X/day unestimated, that is a data finding (the blind spot), not a miss.
+- **Unmeasured pool:** use `counterfactual.unmeasured` (R-261124-21), never the gap scan's raw `unest_pool`. Most of what the gap scan leaves unread is estimated elsewhere: the not-enrolled scan scores each series outside the allowlist, and the bot estimates every allowed candidate each hour. Report only what nothing reads, with the part blocked on purpose split out. Putting a price on a block is Jack's decision to make, not a blind spot.
 - **Before calling anything "dark", "misread" or "not quoted", confirm it in the bot's own sinks.** Check that the market or event is absent from `selection_snapshot_<utc>.jsonl` (or decided `cutoff` there), and that it earned nothing in `dashboard/cache/day_archive` while it was live. A local import of incentive_mm does NOT reproduce the running bot: family rules register at runtime through `globals().get(...)` hooks and reload files (crypto-open / FX-event / Vercel / rain-day series). The first run (11/25) called 13 events "dark" from an offline sweep. The live bot had quoted all of them, and 12 were already finalized (R-261124-01, closed as a false positive).
-- **Floor misses** (periods that closed under $1 of accrual): recurring series point to a sizing or near-cliff fix. Book the $0.90-1.00 band as uncertain (paid/est is about 1.1).
+- **Floor misses** (periods that closed under $1 of accrual): use `floor_misses.split`, `wave_forced`, `cost_7d` and `size_needed` (R-261124-23).
+  - "Quoted to the end" misses are usually forced by a wave; they cost trading as well as accrual. "Dropped" ones are accrual left over after the floor logic stood them down.
+  - Lead with the trading cost, not "$X earned nothing".
+  - Sizing up is rarely the fix; check `size_needed` and the pick-offs first.
+  - Book the $0.90-1.00 band as uncertain (paid/est is about 1.1).
 - Don't propose chasing tail share with size (11/17 competitor study: tails are a size race). Mid-price books are where reward per dollar at risk is.
 
 **Step 6. System scan** (bugs and errors anywhere):
@@ -273,7 +277,7 @@ Two or three sentences: the risk-adjusted result against the 7d/30d norm, and th
 - **<headline> [[fp:...]]:** what it is, root cause, fix, status.
 
 ## Missed markets
-A small table: market, why not quoted, net $/day (modelled). Then one bullet on the blind spot.
+A small table: market, why not quoted, net $/day (modelled). Then one bullet on the pool nothing reads (`counterfactual.unmeasured`: the part not blocked on purpose).
 
 ## Did past changes work?
 One bullet per due item: verdict, before -> after, $/day.
