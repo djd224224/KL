@@ -481,6 +481,93 @@ class EventStartCacheTests(unittest.TestCase):
         self.assertEqual(calls, [("https://x/a", 10), ("https://x/b", 10)])
 
 
+class UpcomingWhatTests(unittest.TestCase):
+    """Jack 2026-11-23, the Events tab's Starting soon: "make it more clear
+    what each event is". Each row reads its one event's Kalshi title, or the
+    series title for a series with several events; titles are kept across
+    refreshes and a failed read is asked again."""
+
+    class _Gaps:
+        def __init__(self, client):
+            self.client = client
+
+        def event_title(self, client, ev, fallback=""):
+            e = (client.get("/events/" + ev) or {}).get("event") or {}
+            return e.get("title") or fallback
+
+        def describe_event(self, ev, title=""):
+            # the family wording, as imm_quote_gaps words KXRAIN*
+            return "Whether it rains in a city that day" if ev.startswith("KXRAIN")                 else (title or ev.split("-")[0])
+
+    class _Client:
+        def __init__(self, answers):
+            self.answers, self.calls = answers, []
+
+        def get(self, path, params=None):
+            self.calls.append(path)
+            a = self.answers.get(path)
+            if isinstance(a, Exception):
+                raise a
+            return a
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._old = dash.CACHE_DIR
+        dash.CACHE_DIR = self.dir
+
+    def tearDown(self):
+        dash.CACHE_DIR = self._old
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    @staticmethod
+    def _row(series, events, kind="yes", start=0.0):
+        return {"series": series, "events": events, "n_ev": len(events), "kind": kind,
+                "start": start}
+
+    def test_event_title_one_event_series_title_several(self):
+        rows = [self._row("KXORSEMICONEMP", ["KXORSEMICONEMP-27MAR31"]),
+                self._row("KXRT", ["KXRT-WICKED", "KXRT-ZOO", "KXRT-MOANA"]),
+                self._row("KXNOPE", ["KXNOPE-1"], kind="no"),
+                self._row("KXSOLO", ["KXSOLO"]),
+                self._row("KXRAINSNYC", ["KXRAINSNYC-25NOV26-29NOV26"]),
+                self._row("KXRAINX", ["KXRAINX-1"])]
+        c = self._Client({
+            "/events/KXORSEMICONEMP-27MAR31": {"event": {"title": "Oregon semiconductor jobs in March?"}},
+            "/series/KXRT": {"series": {"title": "Rotten Tomatoes score"}},
+            "/events/KXNOPE-1": RuntimeError("503"),
+            "/series/KXSOLO": {"series": {"title": "Slovenia referendum"}},
+            "/events/KXRAINSNYC-25NOV26-29NOV26": {"event": {"title": "How much will it rain in NYC Nov 25-29?"}}})
+        out = dash.upcoming_what(c, self._Gaps(c), rows)
+        self.assertEqual(out, {"KXORSEMICONEMP": "Oregon semiconductor jobs in March?",
+                               "KXRT": "Rotten Tomatoes score",
+                               "KXNOPE": "",           # no title: the ticker line says it
+                               # a no-dash ticker's event read is empty: the series title
+                               "KXSOLO": "Slovenia referendum",
+                               # Kalshi's title over the family wording
+                               "KXRAINSNYC": "How much will it rain in NYC Nov 25-29?",
+                               # no title at all: the family wording
+                               "KXRAINX": "Whether it rains in a city that day"})
+        # the next refresh reads only the one that failed
+        c2 = self._Client({"/events/KXNOPE-1": {"event": {"title": "Will it?"}}})
+        out = dash.upcoming_what(c2, self._Gaps(c2), rows)
+        self.assertEqual(c2.calls, ["/events/KXRAINX-1", "/series/KXRAINX", "/events/KXNOPE-1"])   # quotable first
+        self.assertEqual(out["KXNOPE"], "Will it?")
+        self.assertEqual(out["KXRT"], "Rotten Tomatoes score")
+        # a row gone from the feed leaves the cache
+        dash.upcoming_what(c2, self._Gaps(c2), rows[:1])
+        with open(os.path.join(self.dir, "upcoming_titles.json"), encoding="utf-8") as f:
+            self.assertEqual(list(json.load(f)), ["KXORSEMICONEMP-27MAR31"])
+
+    def test_quotable_rows_read_first_within_the_budget(self):
+        rows = [self._row("KXNO%d" % i, ["KXNO%d-1" % i], kind="no", start=i) for i in range(3)] \
+            + [self._row("KXYES", ["KXYES-1"], start=99)]
+        c = self._Client({})
+        with mock.patch.object(dash, "TITLE_BUDGET", 2):
+            dash.upcoming_what(c, self._Gaps(c), rows)
+        self.assertEqual([x for x in c.calls if x.startswith("/events/")],
+                         ["/events/KXYES-1", "/events/KXNO0-1"])
+
+
 class WindowTests(unittest.TestCase):
     def test_et_days_and_roll(self):
         now = _ts("2026-09-28T20:00:00Z")          # 4 PM EDT

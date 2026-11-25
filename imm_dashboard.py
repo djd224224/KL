@@ -52,8 +52,7 @@ latest hourly block), reward_credits.csv, reward_calibration.json,
 config_history_* (with `git log` for the deploys' subjects). With the API on
 (default), also Kalshi's incentive-program feed (new events), the 7:20
 quote-gaps estimator (imm_quote_gaps.classify_and_estimate: what unquoted
-events would earn), imm_pickoff.scan (pick-off windows), each cached for
-API_TTL minutes, imm_unquoted.score_all (the unquoted series scored for
+events would earn), cached for API_TTL minutes, imm_unquoted.score_all (the unquoted series scored for
 adding, with the weekly email's calls; UNQUOTED_TTL_MIN), and market /
 event records (strike structure, value now;
 cached, a bounded number of reads per build). Every
@@ -2075,7 +2074,7 @@ def launcher_env() -> dict:
 
 
 # ----------------------------------------------------------------------------
-# API sections (cached): programs feed, quote-gaps estimator, pick-off windows
+# API sections (cached): programs feed, quote-gaps estimator, upcoming programs
 # ----------------------------------------------------------------------------
 
 def _kalshi_markets(tickers):
@@ -2397,24 +2396,84 @@ def fetch_upcoming(gaps, imm, now_utc, active):
             "est": round(e["est_total"], 2),
             "est_day": None if e["est_day"] is None else round(e["est_day"], 2),
             "est_src": e["est_src"]})
+    try:
+        what = upcoming_what(client, gaps, rows)
+    except Exception as e:
+        log(f"! upcoming titles failed ({e!r:.80})")
+        what = {}
+    for r in rows:
+        r["what"] = what.get(r["series"], "")
     return {"rows": rows, "renewals": list(up["renewals"]), "n_new": up["n_new_markets"],
             "n_events": up["n_events"], "books": up["books"],
             "horizon_days": up["horizon_days"]}
 
 
-def fetch_pickoff(gaps, imm, now_utc):
-    import imm_pickoff
-    client = imm.build_client()
-    res = imm_pickoff.scan(client, now_utc)
-    rows = []
-    for r in res.get("rows") or []:
-        rows.append({"event": r["event"], "title": r.get("title") or "",
-                     "kalshi_start": r["kalshi_start"].timestamp(),
-                     "real": r["real"].timestamp(), "kind": r.get("kind"),
-                     "label": r.get("label"), "source": r.get("source"),
-                     "gap_h": r.get("gap_h"), "open_now": bool(r.get("open_now")),
-                     "live_mkts": r.get("live_mkts")})
-    return {"rows": rows, "checked": res.get("checked", 0), "error": res.get("error")}
+def _what_key(r: dict) -> str:
+    """The title a Starting soon row reads: its one event's, or for a series
+    with several events the series' own (an event title names one of them)."""
+    return r["events"][0] if r.get("n_ev", len(r["events"])) == 1 else "series:" + r["series"]
+
+
+def upcoming_what(client, gaps, rows: list) -> dict:
+    """{series: one clause saying what it is} for the Starting soon rows (Jack
+    2026-11-23: "make it more clear what each event is"): Kalshi's event
+    title (GET /events/{ticker}) for a one-event series, the series title (GET
+    /series/{ticker}) for one with several, through describe_event as the
+    quoting-now table words its events. Kalshi's title comes first: the
+    family wording names the kind, not the city or the dates
+    (KXRAINSNYC-25NOV26-29NOV26 read "Whether it rains in a city that day");
+    a one-event series whose event read is empty (a ticker with no dash,
+    KXSLOVENIAZIURS) reads its series title. Kept in
+    cache/upcoming_titles.json across refreshes; the quotable rows first,
+    TITLE_BUDGET reads a refresh; a failed read is retried on the next
+    refresh."""
+    path = os.path.join(CACHE_DIR, "upcoming_titles.json")
+    cache = load_json(path, {})
+    keys = {r["series"]: _what_key(r) for r in rows}
+    series_of_key = {k: s for s, k in keys.items()}
+
+    def series_title(s):
+        return str(((client.get(f"/series/{s}") or {}).get("series") or {})
+                   .get("title") or "").strip()
+    order = sorted(rows, key=lambda r: (r["kind"] == "no", r["start"]))
+    todo = [k for k in dict.fromkeys(keys[r["series"]] for r in order) if not cache.get(k)]
+    todo = todo[:TITLE_BUDGET]
+    for k in todo:
+        title = ""
+        try:
+            title = series_title(k[7:]) if k.startswith("series:") else                 gaps.event_title(client, k, "")
+        except Exception:
+            title = ""
+        if not title and not k.startswith("series:"):
+            try:
+                title = series_title(series_of_key[k])
+            except Exception:
+                title = ""
+        cache[k] = title
+    kept = {k: v for k, v in cache.items() if k in set(keys.values())}
+    if todo or len(kept) < len(cache):
+        cache = kept
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+    out = {}
+    for s, k in keys.items():
+        title = cache.get(k, "")
+        if title:
+            out[s] = title if len(title) <= 90 else title[:87] + "..."
+            continue
+        base = k[7:] if k.startswith("series:") else k
+        try:
+            d = gaps.describe_event(base, "")
+        except Exception:
+            d = ""
+        # no title and no family wording: the ticker line says it
+        out[s] = "" if d == base.split("-")[0] else d
+    return out
 
 
 def account_now(D: dict, now: float) -> dict:
@@ -4665,14 +4724,14 @@ class Builder:
             return out_
         gap, g_at, g_err = _api_cached("gaps", API_TTL_MIN, self.api_force,
                                        lambda: fetch_gaps(gaps, imm, now_utc, _extra()))
-        pick, k_at, k_err = _api_cached("pickoff", API_TTL_MIN, self.api_force,
-                                        lambda: fetch_pickoff(gaps, imm, now_utc))
+        # the pick-off windows table was taken off the page (Jack 2026-11-23:
+        # "remove 'Pick-off windows' from daily email digest and dashboard")
         unq, u_at, u_err = _api_cached(
             "unquoted", UNQUOTED_TTL_MIN, self.api_force,
             lambda: fetch_unquoted(gaps, imm, now_utc, (gap or {}).get("rows") or []))
-        out = {"programs_at": p_at, "gaps_at": g_at, "pick_at": k_at, "unquoted_at": u_at,
+        out = {"programs_at": p_at, "gaps_at": g_at, "unquoted_at": u_at,
                "errors": {k: v for k, v in (("programs", p_err), ("gaps", g_err),
-                                            ("pickoff", k_err), ("unquoted", u_err)) if v}}
+                                            ("unquoted", u_err)) if v}}
         # the shared calls, so a new launch the weekly email would pass is not
         # flagged promising beside it
         calls = {r["series"]: {"call": r["call"], "why": r["why"], "ok": bool(r.get("promising"))}
@@ -4746,8 +4805,6 @@ class Builder:
                 -(d["yld"] if d.get("yld") is not None else -1),
                 -(d["est"] if d["est"] is not None else -1), -d["pool"]))[:60]
             out["gaps_ctx"] = gap.get("ctx") or {}
-        if pick:
-            out["pickoff"] = pick
         return out
 
 
