@@ -1378,8 +1378,15 @@ def git_state() -> dict:
                 if not path.startswith(("run-logs/", "__pycache__")) and not path.endswith(".pyc"):
                     untracked.append(path)
             else:
-                dirty.append(l[:2].strip() + " " + path)
-    out["dirty_tracked"] = dirty[:40]
+                try:
+                    age_h = (time.time() - os.path.getmtime(os.path.join(LIVE_REPO, path))) / 3600.0
+                except OSError:
+                    age_h = None
+                dirty.append((l[:2].strip() + " " + path, age_h))
+    # an edit hours old is most likely a session at work (leave it to them); one
+    # untouched for a day is a forgotten commit the sync can clobber
+    out["dirty_tracked"] = [f"{p} ({'?' if a is None else f'{a:.0f}h'} old)" for p, a in dirty[:40]]
+    out["dirty_stale_24h"] = [p for p, a in dirty if a is not None and a >= 24]
     out["dirty_count"] = len(dirty)
     out["untracked_count"] = len(untracked)
     code, wt = _git("worktree", "list", "--porcelain")
@@ -1446,6 +1453,7 @@ def machine_state(day: date) -> dict:
 # 7. Data health
 # ---------------------------------------------------------------------------
 
+SINK_NOISE_FLOOR_BYTES = 500_000      # usual day under 0.5 MB: event-driven, size is not health
 _SINK_FILE = re.compile(r"([a-z][a-z0-9_]*?)_(\d{4}-\d{2}-\d{2})(?:_[A-Za-z0-9.]+)?\.(?:jsonl|csv)$")
 
 
@@ -1487,7 +1495,11 @@ def sec_data(day: date) -> dict:
         status = "ok"
         if cur == 0 and len(present) >= 10:
             status = "MISSING"
-        elif ratio is not None and len(present) >= 5 and (ratio < 0.3 or ratio > 3.0):
+        elif (ratio is not None and len(present) >= 5 and med >= SINK_NOISE_FLOOR_BYTES
+              and (ratio < 0.3 or ratio > 3.0)):
+            # (a sink whose usual day is under the noise floor is event-driven --
+            # twin_check, ws_group, alone_front: its size swings with the day's
+            # events, so LOW/HIGH there is noise; the first run flagged three)
             status = "LOW" if ratio < 0.3 else "HIGH"
         elif cur == 0 and not present:
             continue
@@ -2271,7 +2283,9 @@ def render_evidence(ev: dict) -> str:
         if g.get("unpushed"):
             a("Unpushed commits: " + "; ".join(g["unpushed"][:10]))
         if g.get("dirty_tracked"):
-            a("Uncommitted: " + ", ".join(g["dirty_tracked"][:25]))
+            a("Uncommitted (age = since the file last changed): " + ", ".join(g["dirty_tracked"][:25]))
+        if g.get("dirty_stale_24h"):
+            a(f"Untouched for 24h+ (forgotten commits, not a session at work): {', '.join(g['dirty_stale_24h'])}")
     m = sy.get("machine") or {}
     if m:
         a(f"Machine: disk free {m.get('disk_free_gb')} of {m.get('disk_total_gb')} GB; run-logs/incentive-mm "

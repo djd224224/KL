@@ -338,11 +338,16 @@ class CoverageDataConfigTests(Base):
             self.write(f"marks_{d}.jsonl", "x" * 1000)
         self.write(f"orders_{DAY.isoformat()}.jsonl", "x" * 100)
         self.write(f"imm_toxic_halts_sent_{DAY.isoformat()}.marker", "x")
-        dh = rv.sec_data(DAY)
+        with mock.patch.object(rv, "SINK_NOISE_FLOOR_BYTES", 0):
+            dh = rv.sec_data(DAY)
         st = {r["sink"]: r["status"] for r in dh["sinks"]}
         self.assertEqual(st["orders"], "LOW")
         self.assertEqual(st["marks"], "MISSING")
         self.assertNotIn("imm_toxic_halts_sent", st)
+        # a sink whose usual day is under the noise floor is event-driven: not LOW
+        st2 = {r["sink"]: r["status"] for r in rv.sec_data(DAY)["sinks"]}
+        self.assertEqual(st2["orders"], "ok")
+        self.assertEqual(st2["marks"], "MISSING")          # missing is still missing
 
     def test_config_versioning(self):
         self.write("extra_allow_series.json", json.dumps({"a": 1}))

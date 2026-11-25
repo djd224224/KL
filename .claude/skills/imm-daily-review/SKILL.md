@@ -78,6 +78,7 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 - **Config gaps** (fail-closed, missing verified dates): list them. If two sources settle the date in minutes, put both in the plan; the row is written in apply mode with `imm_rows.py`.
 - **Capacity / economics / deliberate with a sizeable estimate:** ask whether the rule still earns its keep. Deliberate blocks get re-litigated only weekly, or when a new pool is large.
 - **Unestimated pool:** if the estimator read N books and left $X/day unestimated, that is a data finding (the blind spot), not a miss.
+- **Before calling anything "dark", "misread" or "not quoted", confirm it in the bot's own sinks.** Check that the market or event is absent from `selection_snapshot_<utc>.jsonl` (or decided `cutoff` there), and that it earned nothing in `dashboard/cache/day_archive` while it was live. A local import of incentive_mm does NOT reproduce the running bot: family rules register at runtime through `globals().get(...)` hooks and reload files (crypto-open / FX-event / Vercel / rain-day series). The first run (11/25) called 13 events "dark" from an offline sweep. The live bot had quoted all of them, and 12 were already finalized (R-261124-01, closed as a false positive).
 - **Floor misses** (periods that closed under $1 of accrual): recurring series point to a sizing or near-cliff fix. Book the $0.90-1.00 band as uncertain (paid/est is about 1.1).
 - Don't propose chasing tail share with size (11/17 competitor study: tails are a size race). Mid-price books are where reward per dollar at risk is.
 
@@ -91,6 +92,9 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   - unpushed commits on main (they exist only on this laptop until pushed);
   - tracked files edited but not committed in the live tree (the :15/:45 sync can clobber them, and other sessions' `git add` can sweep them up);
   - prunable worktrees.
+
+  For uncommitted files, raise only the ones untouched for 24h+ (`dirty_stale_24h`), naming the commit they belong in. An edit made today is probably a session at work: committing it would sweep up that session's in-flight hunks (the 9/09 incident). The plan for a stale file is to commit exactly those paths in the live tree after their own tests pass, then push at once.
+- **Check the claim, not the label.** The first run called the 429 balance skip a "$1 payout floor" check when it is the account-value halt (`_check_balance_floor`). Read the emitting code before naming what a log line means.
 - **(f)** Machine: days-to-full under 60 is P1, under 21 is P0; research token older than 330 days is P1; memory pressure.
 - **(g)** Data health: MISSING or LOW sinks; sinks not in IMM_LOGGING.md (a docs finding).
 - **(h)** Code review of D's commits that touch incentive_mm.py, biggest first: `git show <sha> -- incentive_mm.py`. Look for:

@@ -47,3 +47,8 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
   - **Fault:** it wrote "My bug, fixed in imm_review.py" while changing nothing (rule 6a). The env-diff frozenset noise it flagged was fixed in the build the same day.
   - It drafted its outputs in its temp scratchpad, then used `put`. That is fine.
   - The body ran about 170 lines, so the length rule is now explicit.
+- **11/25, checking the first run's findings in session (Jack: "Yes, fix it here", then "also fix the 'worth knowing' issues").** Three of its 19 were wrong or overstated. Each became a rule in SKILL.md:
+  - **R-01 "13 events dark" was a FALSE POSITIVE.** The offline sweep imported incentive_mm without the runtime family registries. The live bot had quoted every such event: Vercel 21-31 dated events earned like the 01-20 ones, and all 15 live ones were in the day's selection snapshot. 12 of the 13 were already finalized. The rule: confirm "dark" in the sinks.
+  - **R-05 named the wrong check.** The 429 skip is the account-value halt, not the $1 payout floor. Fixed the same day: one retry on a 429, plus a blind-streak alert at 30 cycles in a row.
+  - **R-11 was mostly noise.** ws_stale tracks wave activity; ca_shadow fell as the Carbon Arc periods ended; three tiny event-driven sinks swing by nature. The collector now ignores sinks under 0.5 MB/day.
+  - **R-07 is not "commit everything".** Another session was editing the launcher and the PVD files minutes earlier. Only the 1+ day old groups were committed (3566232, 9097ff0, 317acc5, fe7eae0), each after its own tests. Every diff was backed up first to daily_review/uncommitted_backups/.
