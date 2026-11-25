@@ -10577,6 +10577,34 @@ CONTROLS_SIZE_MULT = _env_float("IMM_CONTROLS_SIZE_MULT", 6.0)
 SERIES_OVERRIDES[CONTROLS_SERIES] = replace(SERIES_OVERRIDES[ELECTION_ARCHETYPE],
                                             size_mult=CONTROLS_SIZE_MULT)
 
+# THE 2029 SEAT-COUNT LADDERS (Jack 2026-11-25: "2x", on "Size all four seat
+# series up x3, the same way as CONTROLS?"). "How many Senate / House seats
+# will Democrats / Republicans hold?" (KXSENATESEATSD-29, -R-29,
+# KXHOUSESEATSD-29, -R-29): election-family members by the Elections-category
+# file, dated to the Nov 7 2028 vote, $100 a week a market ($90 House R). At
+# the family x2 they rested 40 a side by day (120 in the 0-9 ET hours) into
+# books the bot reads at 2.5-6M contracts on most strikes: a 0.1-2% share,
+# $0.01-0.30/day a market. 11/25 12:45Z: House D's 18 were dropped as hopeless
+# within ~1 h of the 05:00Z period start ($0.47-0.95 projected); House R
+# quoted 4 of 22, Senate R 1 of 4, Senate D 4 of 20 over $1 (the other 16
+# only because the cheap-side tails forced the event: CHEAP-SIDE BOOKS).
+#   * x2 OF THE FAMILY SIZE = size_mult 4 IN PLACE OF the family x2, the
+#     KXGENERALMOV / CONTROLS wire: the election guard set (1-99c band, no
+#     safe-join), so rungs 40 -> 80 by day (240 overnight), the per-market
+#     cap 300 -> 600 and the per-event cap 2,000 -> 4,000; the floor
+#     projection walks the doubled ladder (a model: share ~ size on books
+#     this deep is an upper bound).
+#   * The four series only: KXDSENATESEATS (the Senate split) and CONTROLH
+#     stay on the family x2.
+# IMM_SEATS_SIZE_MULT=2 puts them back on the family size (env => task-level
+# restart). An election night session (ENS, below) still replaces the
+# override of its own series.
+SEATS_SERIES = ("KXSENATESEATSD", "KXSENATESEATSR", "KXHOUSESEATSD", "KXHOUSESEATSR")
+SEATS_SIZE_MULT = _env_float("IMM_SEATS_SIZE_MULT", 4.0)
+for _s in SEATS_SERIES:
+    SERIES_OVERRIDES[_s] = replace(SERIES_OVERRIDES[ELECTION_ARCHETYPE],
+                                   size_mult=SEATS_SIZE_MULT)
+
 # KXGOPSIXSENATE (Jack 2026-11-02: "2x it and quote it", on "Leave
 # KXGOPSIXSENATE dark?"). "Will Republicans win 5+ of AK, IA, KS, MI, OH, TX
 # Senate?", one market (AL5), listed with a $52.62/day program at 19:00Z
@@ -10887,7 +10915,8 @@ def pvd_entry(ticker: str, now_utc: Optional[datetime] = None) -> Optional[dict]
 # size x px. Its own file, CHEAP_FILE, beside the wave list: the wave tools
 # (pvd_scan, pvd_wave_tune, the dashboards) rebuild and retune every entry of
 # post_vote_dead_books.json, and must never touch these. The loader merges the
-# two into PVD_MARKETS (forced events, the stop as cutoff, the list admits the
+# two into PVD_MARKETS (forced -- the market itself, not its event, since
+# 2026-11-25: forced_market -- the stop as cutoff, the list admits the
 # market, the placement backstop's side cap = its size), each marked "cheap";
 # a ticker on both lists keeps its wave entry. In the quote loop the market
 # runs the plain path and then cheap_side_quote REPLACES its quotes: the rung
@@ -10979,6 +11008,27 @@ def wave_entry(ticker: str, now_utc: Optional[datetime] = None) -> Optional[dict
     post-vote dead books: what the waves' own switches act on)."""
     e = pvd_entry(ticker, now_utc)
     return e if e is not None and not e.get("cheap") else None
+
+
+# A CHEAP-SIDE BOOK FORCES ONLY ITSELF (Jack 2026-11-25: "also fix the issue",
+# on "a cheap-side tail forces its whole event"). The loader used to put a
+# cheap entry's EVENT in FORCE_EVENTS like a wave entry's, so every other
+# strike of that event skipped the payout floor, the rate floor, the hopeless
+# exit and the admission wait: 11/25, 48 such markets in 4 events quoted at
+# their family size, 40 of them projecting under the $1 period payout (pure
+# fill risk, cash locked to 2028-29) -- KXSENATESEATSD-29 13, POPVOTEMOV-
+# 28NOV07 14, KXDSENATESEATS-29 10, KXFRENCHPRES-27 3. Now the cheap entry's
+# own market is forced while its stop is ahead; its event's other markets
+# are judged like any family market. A wave entry still forces its event
+# (no unlisted wave-event market was forced on 11/25). The event's cap
+# (PVD_EVENT_STOPS -> PVD_EVENT_CAP) is unchanged: the 5,000-20,000-contract
+# rungs need it.
+def forced_market(ticker: str, event_ticker: str,
+                  now_utc: Optional[datetime] = None) -> bool:
+    """Past the payout and rate floors, the hopeless exit and the admission
+    wait: an event in FORCE_EVENTS (the env, KXGOPSIXSENATE, an election night
+    session, a wave entry's event), or a live cheap-side book's own market."""
+    return event_ticker in FORCE_EVENTS or cheap_entry(ticker, now_utc) is not None
 
 
 def load_cheap_entries(mtime: float) -> Dict[str, dict]:
@@ -11379,7 +11429,8 @@ def cheap_side_quote(ticker: str, entry: dict,
 
 def load_pvd_markets() -> int:
     """(Re)load PVD_FILE when its mtime moves; rebinds FORCE_EVENTS to carry
-    the listed markets' events. Returns the number of markets changed."""
+    the wave-listed markets' events (a cheap-side book forces only its own
+    market: forced_market). Returns the number of markets changed."""
     global FORCE_EVENTS
     if not PVD_ENABLE:
         return 0
@@ -11533,7 +11584,10 @@ def load_pvd_markets() -> int:
     for e in fresh.values():
         if PVD_EVENT_STOPS.get(e["event"]) is None or e["stop"] > PVD_EVENT_STOPS[e["event"]]:
             PVD_EVENT_STOPS[e["event"]] = e["stop"]
-    events = frozenset(e["event"] for e in fresh.values())
+    # a wave entry forces its EVENT; a cheap-side book forces only ITSELF
+    # (forced_market, 2026-11-25), so its event's other strikes keep the payout
+    # floor and the hopeless exit
+    events = frozenset(e["event"] for e in fresh.values() if not e.get("cheap"))
     base = FORCE_EVENTS - _pvd_state["forced"]
     added = events - base
     FORCE_EVENTS = base | added
@@ -15430,6 +15484,7 @@ _CONFIG_CODE_KNOBS = (
     "TRUMPVH_SIZE_MULT",          # the weekly VoteHub approval x3 (2026-10-31)
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     "CONTROLS_SIZE_MULT",         # CONTROLS (2028 Senate) x6 (2026-11-24)
+    "SEATS_SIZE_MULT",            # the 2029 seat-count ladders x4 (2026-11-25)
     "GRAMMY_WIN_SIZE_MULT",       # the Grammy winner families x2 (2026-11-24)
     "GRAMMY_COUNT_SIZE_MULT",     # KXGRAMMYCOUNT x2 (2026-11-24)
     "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
@@ -38292,7 +38347,8 @@ class IncentiveMarketMaker:
                         "new_event": meta.event_ticker not in prev_events,
                         "exempt": ("quote_all" if quote_all else
                                    "fair_close" if fc_hold else
-                                   "force" if meta.event_ticker in FORCE_EVENTS else
+                                   "force" if forced_market(meta.ticker, meta.event_ticker,
+                                                            now_utc) else
                                    "curated" if curated_event(meta.event_ticker,
                                                               meta.series, now_utc) else
                                    "finecon" if meta.series in FINECON_SERIES else
@@ -38317,7 +38373,7 @@ class IncentiveMarketMaker:
                     and meta.ticker in prev_selected \
                     and meta.series not in FINECON_SERIES \
                     and (SCAN_HOPELESS_EXIT or not meta.scan) \
-                    and meta.event_ticker not in FORCE_EVENTS \
+                    and not forced_market(meta.ticker, meta.event_ticker, now_utc) \
                     and not curated_event(meta.event_ticker, meta.series, now_utc):
                 # STICKY EXIT (Jack 2026-07-25): "<5% chance to reach $1 by
                 # program end -> stop quoting, even if already started". The
@@ -38360,7 +38416,7 @@ class IncentiveMarketMaker:
                     self.state.scan_hopeless_barred[meta.ticker] = now_ts
             elif meta.ticker not in prev_selected \
                     and meta.event_ticker not in prev_events \
-                    and meta.event_ticker not in FORCE_EVENTS \
+                    and not forced_market(meta.ticker, meta.event_ticker, now_utc) \
                     and rate_floor_rate(meta) < series_min_est_rate(meta.series) \
                     and rate_floor_projected(accrued, est_total, proj_peak,
                                              qdays) \
@@ -38378,7 +38434,7 @@ class IncentiveMarketMaker:
                 skipped["rate_floor"] = skipped.get("rate_floor", 0) + 1
                 decisions[meta.ticker] = "rate_floor"
             elif meta.ticker in prev_selected \
-                    or meta.event_ticker in FORCE_EVENTS \
+                    or forced_market(meta.ticker, meta.event_ticker, now_utc) \
                     or curated_event(meta.event_ticker, meta.series, now_utc):
                 # Sticky members and event-start-override events bypass the
                 # entry floor / zero-yield / budget-race filters (original

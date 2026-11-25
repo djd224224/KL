@@ -2813,6 +2813,22 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         self.assertNotIn("CONTROLH", imm.SERIES_OVERRIDES)
         self.assertIn("CONTROLS_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
 
+    def test_the_2029_seat_ladders_rest_at_twice_the_election_family_size(self):
+        # Jack 2026-11-25: "2x" for the four seat-count series under the $1
+        # bar -- size_mult 4 in place of the family x2, on the election guard
+        # set; the Senate split (KXDSENATESEATS) keeps the family's clone
+        fam = imm.SERIES_OVERRIDES[imm.ELECTION_ARCHETYPE]
+        self.assertEqual(imm.SEATS_SERIES, ("KXSENATESEATSD", "KXSENATESEATSR",
+                                            "KXHOUSESEATSD", "KXHOUSESEATSR"))
+        for s in imm.SEATS_SERIES:
+            ov = imm.SERIES_OVERRIDES[s]
+            self.assertEqual(ov, imm.replace(fam, size_mult=4.0), s)
+            self.assertEqual(ov.size_mult, 2 * imm.ELECTION_SIZE_MULT)
+            with mock.patch.object(imm, "size_test_mult", return_value=1.0):
+                self.assertEqual(imm.applied_mention_mult(s), 4.0)
+        self.assertIn(imm.SERIES_OVERRIDES.get("KXDSENATESEATS"), (None, fam))
+        self.assertIn("SEATS_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
+
     def test_mlbplayoffs_26_event_blocked(self):
         # Jack 2026-09-26: "blocklist KXMLBPLAYOFFS-26". Every market of
         # the 2026 event and the event ticker are frozen; the series (the
@@ -46510,6 +46526,54 @@ class TestCheapSideBooks(unittest.TestCase):
         imm.load_pvd_markets()
         self.assertEqual(imm.PVD_MARKETS, {})
         self.assertEqual(imm.FORCE_EVENTS, base)
+
+    def test_a_tail_forces_only_itself(self):
+        # Jack 2026-11-25: "also fix the issue" -- a cheap-side tail put its
+        # whole EVENT in FORCE_EVENTS, so KXSENATESEATSD-29's other strikes
+        # quoted past the payout floor and the hopeless exit, 13 of them
+        # projecting under $1 (48 such markets in 4 events). The tail itself
+        # is still forced; its event's other markets are judged like any.
+        ev, sib = "KXGOOD-99DEC31", "KXGOOD-99DEC31-C"
+        base = imm.FORCE_EVENTS
+        self._write({self.T: {"side": "yes", "px": 1, "size": 1000}})
+        self.assertEqual(imm.FORCE_EVENTS, base)
+        self.assertNotIn(ev, imm.FORCE_EVENTS)
+        self.assertTrue(imm.forced_market(self.T, ev))
+        self.assertFalse(imm.forced_market(sib, ev))
+        # past its stop the tail is no longer forced either
+        later = datetime.now(timezone.utc) + timedelta(hours=7)
+        self.assertFalse(imm.forced_market(self.T, ev, later))
+        # a WAVE entry in the event still forces the whole event...
+        with open(imm.pvd_path(), "w", encoding="utf-8") as f:
+            json.dump({"stop": (datetime.now(timezone.utc) + timedelta(hours=6)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"), "markets": {self.T2: {"bid_max": 30, "ask_min": 70}}}, f)
+        imm._pvd_state["mtime"] = 0.0
+        imm.load_pvd_markets()
+        self.assertIn(ev, imm.FORCE_EVENTS)
+        self.assertTrue(imm.forced_market(sib, ev))
+        # ...and once it is off the list, only the tail again
+        os.remove(imm.pvd_path())
+        imm.load_pvd_markets()
+        self.assertEqual(imm.FORCE_EVENTS, base)
+        self.assertFalse(imm.forced_market(sib, ev))
+        self.assertTrue(imm.forced_market(self.T, ev))
+
+    def test_the_tails_event_siblings_keep_the_payout_floor(self):
+        # the selection itself: with every bar out of reach, the listed tail
+        # is selected (forced) and its sibling in the same event is not
+        sib = "KXGOOD-99DEC31-C"
+        c = FakeClient()
+        c.programs.append(dict(c.programs[0], market_ticker=sib))
+        c.markets[sib] = dict(c.markets[self.T], ticker=sib)
+        c.books[sib] = json.loads(json.dumps(c.books[self.T]))
+        self._write({self.T: {"side": "yes", "px": 1, "size": 1000}},
+                    stop=datetime.now(timezone.utc) + timedelta(days=5))
+        with mock.patch.object(imm, "MIN_EST_TOTAL_DOLLARS", 1e9), \
+                mock.patch.object(imm, "PAYOUT_FLOOR_DOLLARS", 1e9):
+            bot = IncentiveMarketMaker(client=c, live=False)
+            bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertNotIn(sib, bot.state.selected)
 
     def test_the_rung(self):
         Y = lambda q: None if q is None else (q.book_side, q.price_cents, q.count)
