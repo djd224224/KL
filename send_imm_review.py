@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 r"""send_imm_review.py -- email the IMM daily review (Jack 2026-11-25: "... and
-suggests fixes to me in a morning email"; then "make the email way clearer and
-easier to read").
+suggests fixes to me in a morning email"; "make the email way clearer and easier
+to read"; then "make the email comprehensive, but just make it easy to read and
+legible").
 
     python send_imm_review.py --day D                  # build + send; once a day (marker)
     python send_imm_review.py --day D --dry            # write email.html only, send nothing
@@ -9,25 +10,23 @@ easier to read").
     python send_imm_review.py --day D --fallback --reason "why"
                                                        # numbers-only email: the analysis did not run
 
-THE EMAIL is built here, not written by the model, so it looks the same every
-day and fits a phone:
-  1. the day's net in one big number, rewards / trading / the 7-day average,
-     and the model's one-sentence verdict;
-  2. NEEDS YOUR OK: at most three cards (headline, why, fix, what it's worth,
-     the exact text that approves it);
-  3. WORTH KNOWING: one line per finding that is new today (or P0/P1);
-  4. did past fixes work, and what is still waiting on Jack;
-  5. the numbers (day / 7d / 30d, best and worst families) and a row of
-     health checks, coloured green / amber / red.
-The words in the cards come from each finding's short "email" block in
-findings.json (headline / why / fix / value); a finding without one falls back
-to a shortened title, summary and plan. The model's long review.md rides along
-as an attachment ("full write-up"). Numbers come from evidence.json only.
+THE EMAIL carries the whole review, laid out to be read on a phone:
+  1. the day's net in one big number, rewards / trading / the 7-day average, and
+     the verdict -- then the write-up's opening paragraph;
+  2. NEEDS YOUR OK: up to three cards (headline, why, fix, worth, the exact text
+     that approves it), from findings.json;
+  3. THE FULL REVIEW: every section of the model's review.md, each in its own card,
+     rendered for reading -- short paragraphs, real tables, bullets, gains in green
+     and losses in red, ledger ids as small tags (nothing is cut);
+  4. EVERYTHING FOUND TODAY: one row per finding, so nothing is missed;
+  5. THE NUMBERS from evidence.json (day / 7d / 30d, best and worst families, the
+     edge watch) and the green / amber / red health checks.
+The numbers in 1 and 5 come from evidence.json, never from the model. The
+evidence pack rides along as an attachment for deep dives.
 
-Reads run-logs/incentive-mm/daily_review/<D>/: evidence.json (imm_review.py
-collect), findings.json + review.md (the skill), ids.json + ingested.json
-(ledger ingest), and the ledger itself. Writes <D>/email.html and, once sent,
-<D>/sent.marker.
+Reads run-logs/incentive-mm/daily_review/<D>/: evidence.json, evidence.md,
+findings.json, review.md, ids.json, ingested.json, and the ledger. Writes
+<D>/email.html and, once sent, <D>/sent.marker.
 
 Mail goes through the ALERT_EMAIL_* account send_alert_email.py uses, to
 IMM_REVIEW_TO, else ALERT_EMAIL_TO, else the sender; each is read from the
@@ -63,15 +62,23 @@ except Exception:
 SEND_TRIES = 4
 SEND_WAIT = 90
 MAX_DECISIONS = 3
-MAX_FYI = 7
 
-# palette (inline styles: Gmail keeps those)
+# palette and type (inline styles: Gmail keeps those)
 FONT = "-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
-INK, MUTED, LINE, PAGE, CARD = "#1f2328", "#5f6368", "#e3e6ea", "#f4f5f7", "#ffffff"
+MONO = "Consolas,Menlo,monospace"
+INK, MUTED, LINE, PAGE, CARD, ZEBRA = "#1f2328", "#5f6368", "#e3e6ea", "#f4f5f7", "#ffffff", "#f8f9fa"
 GREEN, RED, AMBER, BLUE = "#137333", "#c5221f", "#b06000", "#1a56db"
 SEV_STYLE = {"P0": ("#fce8e6", RED), "P1": ("#fce8e6", RED),
              "P2": ("#fef3e0", AMBER), "P3": ("#eef0f2", MUTED)}
 DOT = {"green": GREEN, "amber": AMBER, "red": RED, "gray": "#9aa0a6"}
+S_P = "margin:0 0 10px;line-height:1.55"
+S_LIST = "margin:0 0 10px;padding-left:20px;line-height:1.5"
+S_LI = "margin:0 0 6px"
+S_H3 = "margin:14px 0 6px;font-size:15px;font-weight:700"
+S_CODE = (f"font-family:{MONO};font-size:13px;background:#f1f3f4;border-radius:4px;"
+          f"padding:0 4px;white-space:nowrap")
+S_TH = f"padding:6px 8px;border-bottom:2px solid {LINE};font-size:12px;color:{MUTED};font-weight:600"
+S_TD = f"padding:6px 8px;border-top:1px solid {LINE};font-size:14px;vertical-align:top"
 
 
 def setting(name: str) -> str:
@@ -137,7 +144,7 @@ def _first_sentence(text, n: int) -> str:
 
 
 def email_fields(f: dict) -> dict:
-    """The four short phrases a card shows. The skill writes them in the
+    """The four short phrases a decision card shows. The skill writes them in the
     finding's "email" block; older findings fall back to shortened fields."""
     e = f.get("email") if isinstance(f.get("email"), dict) else {}
     imp = f.get("impact") if isinstance(f.get("impact"), dict) else {}
@@ -150,6 +157,204 @@ def email_fields(f: dict) -> dict:
             "fix": _short(e.get("fix") or _first_sentence(plan.get("change"), 170), 180),
             "value": _short(value, 60)}
 
+
+# ---------------------------------------------------------------------------
+# Markdown -> legible, inline-styled HTML
+# ---------------------------------------------------------------------------
+
+_RID = re.compile(r"\bR-\d{6}-\d{2}\b")
+_MONEY = re.compile(r"(?<![\w$~])([+-])\$([\d,]+(?:\.\d+)?)")
+_BOLD = re.compile(r"\*\*(.+?)\*\*")
+_ITAL = re.compile(r"(?<![*\w])\*(?![\s*])(.+?)(?<![\s*])\*(?![*\w])")
+_LIST = re.compile(r"^(\s*)([-*+]|\d{1,3}[.)])\s+(.*)$")
+_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+_RULE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
+
+
+def id_chip(rid: str) -> str:
+    return (f'<span style="font-size:12px;color:{MUTED};background:#eef0f2;border-radius:8px;'
+            f'padding:0 6px;white-space:nowrap">{rid}</span>')
+
+
+def inline(text: str) -> str:
+    """One line's inline Markdown: `code`, **bold** (which may wrap code),
+    *italics*, signed dollars coloured, ledger ids as tags. Everything else
+    escaped. Code spans are set aside first so nothing inside them is styled."""
+    codes: List[str] = []
+
+    def stash(m):
+        codes.append(m.group(1))
+        return f"\x00{len(codes) - 1}\x00"
+    s = esc(re.sub(r"`([^`]+)`", stash, text))
+    s = _BOLD.sub(r"<b>\1</b>", s)
+    s = _ITAL.sub(r"<i>\1</i>", s)
+    s = _MONEY.sub(lambda m: f'<span style="color:{GREEN if m.group(1) == "+" else RED};'
+                             f'white-space:nowrap">{m.group(1)}${m.group(2)}</span>', s)
+    s = _RID.sub(lambda m: id_chip(m.group(0)), s)
+    return re.sub(r"\x00(\d+)\x00",
+                  lambda m: f'<code style="{S_CODE}">{esc(codes[int(m.group(1))])}</code>', s)
+
+
+def _cells(line: str) -> List[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in re.split(r"(?<!\\)\|", s)]
+
+
+def _table_html(head: List[str], aligns: List[str], rows: List[List[str]]) -> str:
+    def al(i):
+        return aligns[i] if i < len(aligns) else "left"
+    h = "".join(f'<th style="{S_TH};text-align:{al(i)}">{inline(c)}</th>' for i, c in enumerate(head))
+    body = []
+    for n, r in enumerate(rows):
+        bg = f"background:{ZEBRA};" if n % 2 else ""
+        body.append("<tr>" + "".join(f'<td style="{S_TD};{bg}text-align:{al(i)}">{inline(c)}</td>'
+                                     for i, c in enumerate(r)) + "</tr>")
+    return (f'<div style="overflow-x:auto;margin:0 0 12px"><table style="width:100%;border-collapse:collapse">'
+            f'<tr>{h}</tr>{"".join(body)}</table></div>')
+
+
+def _indent(line: str) -> int:
+    return len(line.replace("\t", "    ")) - len(line.replace("\t", "    ").lstrip(" "))
+
+
+def _dedent(lines: List[str]) -> List[str]:
+    ind = min((_indent(l) for l in lines if l.strip()), default=0)
+    return [l.replace("\t", "    ")[ind:] if l.strip() else "" for l in lines]
+
+
+def _parse_list(lines: List[str], i: int) -> Tuple[str, int]:
+    """A list starting at lines[i] -> (html, index after it). Each item owns the
+    lines indented under it -- nested lists, tables, paragraphs -- rendered by
+    md_html, so a table inside an item stays inside it. A numbered list keeps
+    its numbers (start=)."""
+    m = _LIST.match(lines[i])
+    base = _indent(lines[i])
+    ordered = m.group(2)[0].isdigit()
+    start = int(re.match(r"\d+", m.group(2)).group(0)) if ordered else 1
+    items: List[list] = []
+    j = i
+    while j < len(lines):
+        l = lines[j]
+        lm = _LIST.match(l)
+        if lm and _indent(l) == base:
+            if lm.group(2)[0].isdigit() != ordered:
+                break                                   # bullets after numbers (or back): a new list
+            items.append([lm.group(3), []])
+            j += 1
+            continue
+        if not l.strip():
+            k = j + 1
+            while k < len(lines) and not lines[k].strip():
+                k += 1
+            if k < len(lines):
+                nm = _LIST.match(lines[k])
+                if _indent(lines[k]) > base or (nm and _indent(lines[k]) == base
+                                                and nm.group(2)[0].isdigit() == ordered):
+                    items[-1][1].append("")
+                    j += 1
+                    continue
+            break
+        if _indent(l) > base and items:
+            items[-1][1].append(l)
+            j += 1
+            continue
+        break
+    tag = "ol" if ordered else "ul"
+    attr = f' start="{start}"' if ordered and start != 1 else ""
+    out = [f'<{tag}{attr} style="{S_LIST}">']
+    for first, sub in items:
+        body = md_html("\n".join(_dedent(sub))) if any(x.strip() for x in sub) else ""
+        out.append(f'<li style="{S_LI}">{inline(first)}{body}</li>')
+    out.append(f"</{tag}>")
+    return "".join(out), j
+
+
+def md_html(md: str) -> str:
+    """Markdown (headings, paragraphs, bullet and numbered lists with nesting,
+    pipe tables, fenced code, rules) -> HTML with inline styles."""
+    lines = md.replace("\r\n", "\n").split("\n")
+    html, para, i = [], [], 0
+
+    def flush():
+        if para:
+            html.append(f'<p style="{S_P}">{inline(" ".join(l.strip() for l in para))}</p>')
+            para.clear()
+
+    while i < len(lines):
+        line = lines[i]
+        s = line.strip()
+        if not s:
+            flush()
+            i += 1
+            continue
+        if s.startswith("```"):
+            flush()
+            j, code = i + 1, []
+            while j < len(lines) and not lines[j].strip().startswith("```"):
+                code.append(lines[j])
+                j += 1
+            html.append(f'<pre style="font-family:{MONO};font-size:12px;background:#f6f8fa;padding:8px;'
+                        f'border-radius:6px;white-space:pre-wrap;margin:0 0 10px">{esc(chr(10).join(code))}</pre>')
+            i = j + 1
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*?)\s*#*$", s)
+        if m:
+            flush()
+            html.append(f'<div style="{S_H3}">{inline(m.group(2))}</div>')
+            i += 1
+            continue
+        if s.startswith("|") and i + 1 < len(lines) and _TABLE_SEP.match(lines[i + 1]):
+            flush()
+            head = _cells(s)
+            aligns = []
+            for c in _cells(lines[i + 1]):
+                aligns.append("right" if c.endswith(":") and not c.startswith(":")
+                              else "center" if c.startswith(":") and c.endswith(":") else "left")
+            rows, j = [], i + 2
+            while j < len(lines) and lines[j].strip().startswith("|"):
+                rows.append(_cells(lines[j]))
+                j += 1
+            html.append(_table_html(head, aligns, rows))
+            i = j
+            continue
+        if _RULE.match(s):
+            flush()
+            html.append(f'<div style="border-top:1px solid {LINE};margin:12px 0"></div>')
+            i += 1
+            continue
+        if _LIST.match(line):
+            flush()
+            block, i = _parse_list(lines, i)
+            html.append(block)
+            continue
+        para.append(line)
+        i += 1
+    flush()
+    return "".join(html)
+
+
+def split_review(md: str) -> Tuple[str, str, List[Tuple[str, str]]]:
+    """(title, intro, [(section heading, body)]) of a review.md."""
+    title, intro, sections, cur = "", [], [], None
+    for line in md.replace("\r\n", "\n").split("\n"):
+        if line.startswith("# ") and not title and cur is None and not any(x.strip() for x in intro):
+            title = line[2:].strip()
+            continue
+        if line.startswith("## "):
+            cur = [line[3:].strip(), []]
+            sections.append(cur)
+            continue
+        (cur[1] if cur is not None else intro).append(line)
+    return title, "\n".join(intro).strip(), [(h, "\n".join(b).strip()) for h, b in sections]
+
+
+# ---------------------------------------------------------------------------
+# context
+# ---------------------------------------------------------------------------
 
 def load_ctx(day: date) -> dict:
     dd = day_dir(day)
@@ -169,17 +374,16 @@ def load_ctx(day: date) -> dict:
         fp = rv._slug(f.get("fingerprint") or "")
         iid = ids.get(fp) or (f.get("ledger_id") if f.get("ledger_id") in ledger else None) or ""
         sev = str(f.get("severity") or "P3").upper()
+        it = ledger.get(iid) or {}
         rows.append({"id": iid, "sev": sev if sev in SEV_STYLE else "P3",
                      "decision": bool(f.get("decision_needed")), "new": iid in created or not iid,
+                     "seen": len(it.get("seen_days") or []), "status": it.get("status") or "",
                      "usd": abs(rv._f((f.get("impact") or {}).get("usd_day")))
                      if isinstance(f.get("impact"), dict) else 0.0,
                      **email_fields(f)})
     order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
     rows.sort(key=lambda r: (order[r["sev"]], -r["usd"]))
-    decisions = [r for r in rows if r["decision"]][:MAX_DECISIONS]
-    extra_dec = [r for r in rows if r["decision"]][MAX_DECISIONS:]
-    fyi_all = [r for r in rows if not r["decision"]] + extra_dec
-    fyi = [r for r in fyi_all if r["new"] or r["sev"] in ("P0", "P1")]
+    decisions = [r for r in rows if r["decision"] and r["status"] not in rv.TERMINAL][:MAX_DECISIONS]
     today_ids = {r["id"] for r in rows}
     waiting = []
     for iid, it in sorted(ledger.items()):
@@ -187,25 +391,17 @@ def load_ctx(day: date) -> dict:
             age = (day - date.fromisoformat(it["first_seen"])).days if it.get("first_seen") else 0
             head = (it.get("email") or {}).get("headline") if isinstance(it.get("email"), dict) else None
             waiting.append({"id": iid, "headline": _short(head or it.get("title"), 80), "age": age})
-    evals = []
-    for e in findings.get("evaluations") or []:
-        if isinstance(e, dict) and e.get("id"):
-            it = ledger.get(e["id"]) or {}
-            evals.append({"id": e["id"], "verdict": e.get("verdict") or "inconclusive",
-                          "headline": _short(it.get("title") or e.get("note"), 80),
-                          "delta": e.get("delta_usd_day"), "note": _short(e.get("note"), 140)})
-    closures = [{"id": c.get("id"), "status": c.get("status"), "note": _short(c.get("note"), 120)}
-                for c in findings.get("closures") or [] if isinstance(c, dict) and c.get("id")]
-    return {"day": day, "ev": ev, "findings": findings, "decisions": decisions,
-            "fyi": fyi[:MAX_FYI], "fyi_more": max(0, len(fyi) - MAX_FYI),
-            "repeat_quiet": len(fyi_all) - len(fyi), "waiting": waiting[:6],
-            "evals": evals, "closures": closures,
+    review_md = substitute_ids(_read(os.path.join(dd, "review.md")), ids).strip()
+    title, intro, sections = split_review(review_md)
+    return {"day": day, "ev": ev, "findings": findings, "rows": rows, "decisions": decisions,
+            "waiting": waiting[:8], "review": review_md, "title": title, "intro": intro,
+            "sections": sections,
             "open": sum(1 for it in ledger.values() if it.get("status") not in rv.TERMINAL),
-            "verdict": _short(findings.get("verdict") or findings.get("headline") or "", 260)}
+            "verdict": _short(findings.get("verdict") or findings.get("headline") or title or "", 300)}
 
 
 # ---------------------------------------------------------------------------
-# health checks: (label, colour) chips from the evidence pack
+# health checks and the edge line
 # ---------------------------------------------------------------------------
 
 def health_checks(ev: dict) -> List[Tuple[str, str]]:
@@ -241,7 +437,8 @@ def health_checks(ev: dict) -> List[Tuple[str, str]]:
         if streak == 0 and unp == 0:
             out.append(("Repo in sync", "green"))
         else:
-            out.append((f"Repo sync failing x{streak}" if streak else f"{unp} unpushed commit(s)", "red" if streak > 2 else "amber"))
+            out.append((f"Repo sync failing x{streak}" if streak else f"{unp} unpushed commit(s)",
+                        "red" if streak > 2 else "amber"))
     m = sy.get("machine") or {}
     if m.get("days_to_full") is not None:
         d = rv._f(m["days_to_full"])
@@ -301,6 +498,26 @@ def _card(inner: str, accent: str = LINE) -> str:
             f'border-radius:10px;padding:14px 16px;margin:0 0 10px">{inner}</div>')
 
 
+SECTION_RENAME = {"decisions for you": "Decisions in detail"}
+_STAND_ORDER = {"needs your OK": 0, "open": 1, "shipped": 2, "fixed": 2, "closed": 3}
+
+
+def _standing(r: dict) -> Tuple[str, str]:
+    """(label, colour) for where a finding stands in the ledger now."""
+    st = r.get("status") or ""
+    if st in ("closed", "fixed-elsewhere", "wontfix", "reverted", "rejected"):
+        return "closed", MUTED
+    if st == "verified":
+        return "fixed", GREEN
+    if st == "shipped":
+        return "shipped", GREEN
+    if st in ("proposed", "approved") or (r.get("decision") and st not in rv.TERMINAL and st != "open"):
+        return "needs your OK", BLUE
+    if r.get("decision") and not st:
+        return "needs your OK", BLUE
+    return "open", AMBER
+
+
 def render_html(ctx: dict, fallback_reason: str = "") -> str:
     day: date = ctx["day"]
     ev = ctx["ev"]
@@ -311,22 +528,25 @@ def render_html(ctx: dict, fallback_reason: str = "") -> str:
     a = P.append
     pre = ctx["verdict"] or (f"Net {money(d.get('net'))} on {_dow(day)}" if d else "")
     a(f'<div style="display:none;max-height:0;overflow:hidden;opacity:0">{esc(pre)}</div>')
-    a(f'<div style="background:{PAGE};padding:16px 0;font-family:{FONT};color:{INK};font-size:15px;line-height:1.45">')
-    a('<div style="max-width:640px;margin:0 auto;padding:0 12px">')
-    # header
-    a(f'<div style="font-size:13px;color:{MUTED}">IMM daily review &middot; {esc(day.strftime("%A, %B %d").replace(" 0", " "))}</div>')
+    a(f'<div style="background:{PAGE};padding:16px 0;font-family:{FONT};color:{INK};font-size:15px;line-height:1.5">')
+    a('<div style="max-width:680px;margin:0 auto;padding:0 12px">')
+    # 1. header
+    a(f'<div style="font-size:13px;color:{MUTED}">IMM daily review &middot; '
+      f'{esc(day.strftime("%A, %B %d").replace(" 0", " "))}</div>')
     if d:
         a(f'<div style="margin:6px 0 2px">{_num(d.get("net"), size=34, bold=True)}'
           f'<span style="font-size:16px;color:{MUTED}"> net</span></div>')
         a(f'<div style="font-size:14px;color:{MUTED}">Rewards {_num(d.get("rew"))} &middot; Trading {_num(d.get("pnl"))}'
           f' &middot; 7-day avg {_num(w7.get("mean"))}/day</div>')
     if fallback_reason:
-        a(_card(f'<b style="color:{RED}">The analysis did not run</b> ({esc(fallback_reason)}). Numbers and checks '
-                'below come straight from the data; nothing was judged. The full evidence pack is attached.', RED))
-    elif ctx["verdict"]:
-        a(f'<div style="margin:12px 0 0;font-size:16px">{esc(ctx["verdict"])}</div>')
-    # decisions
-    if not fallback_reason:
+        a(_card(f'<b style="color:{RED}">The analysis did not run</b> ({esc(fallback_reason)}). Below are the '
+                'numbers and the evidence pack exactly as the collector built them; nothing was judged.', RED))
+    else:
+        if ctx["verdict"]:
+            a(f'<div style="margin:12px 0 0;font-size:17px;font-weight:600;line-height:1.4">{inline(ctx["verdict"])}</div>')
+        if ctx["intro"]:
+            a(f'<div style="margin:10px 0 0">{md_html(ctx["intro"])}</div>')
+        # 2. decisions
         dec = ctx["decisions"]
         a(_h2("Needs your OK", len(dec)))
         if not dec:
@@ -335,97 +555,106 @@ def render_html(ctx: dict, fallback_reason: str = "") -> str:
             idt = r["id"] or "(not filed)"
             inner = [f'<div style="font-size:16px;font-weight:700;margin-bottom:6px">{i}. {esc(r["headline"])} {_sev(r["sev"])}</div>']
             if r["why"]:
-                inner.append(f'<div style="margin-bottom:6px">{esc(r["why"])}</div>')
+                inner.append(f'<div style="margin-bottom:6px">{inline(r["why"])}</div>')
             if r["fix"]:
-                inner.append(f'<div style="margin-bottom:6px"><b>Fix:</b> {esc(r["fix"])}</div>')
+                inner.append(f'<div style="margin-bottom:6px"><b>Fix:</b> {inline(r["fix"])}</div>')
             if r["value"]:
                 inner.append(f'<div style="margin-bottom:8px"><b>Worth:</b> {esc(r["value"])}</div>')
             inner.append(f'<div style="font-size:14px;color:{BLUE}">Approve: text '
                          f'<b style="white-space:nowrap">do {esc(idt)}</b></div>'
                          f'<div style="font-size:12px;color:{MUTED}">or text '
-                         f'<span style="white-space:nowrap">no {esc(idt)}</span> to drop it</div>')
+                         f'<span style="white-space:nowrap">no {esc(idt)}</span> to drop it '
+                         f'&middot; details below</div>')
             a(_card("".join(inner), SEV_STYLE[r["sev"]][1]))
-        # fyi
-        if ctx["fyi"]:
-            a(_h2("Worth knowing"))
-            items = []
-            for r in ctx["fyi"]:
-                why = f'<div style="color:{MUTED};font-size:14px">{esc(r["why"])}</div>' if r["why"] else ""
-                items.append(f'<div style="padding:8px 0;border-top:1px solid {LINE}">{_sev(r["sev"])} '
-                             f'<b>{esc(r["headline"])}</b> <span style="color:{MUTED};font-size:12px;'
-                             f'white-space:nowrap">{esc(r["id"])}</span>{why}</div>')
-            more = []
-            if ctx["fyi_more"]:
-                more.append(f'{ctx["fyi_more"]} more new')
-            if ctx["repeat_quiet"]:
-                more.append(f'{ctx["repeat_quiet"]} already known')
-            if more:
-                items.append(f'<div style="padding:8px 0;border-top:1px solid {LINE};color:{MUTED};font-size:13px">'
-                             f'{esc(" and ".join(more))} - in the full write-up and the ledger.</div>')
-            a(_card("".join(items)))
-        # past changes
-        if ctx["evals"] or ctx["closures"] or ctx["waiting"]:
-            a(_h2("Follow-ups"))
-            items = []
-            mark = {"verified": ("Worked", GREEN), "failed": ("Didn't work", RED), "inconclusive": ("Too early to tell", AMBER)}
-            for e in ctx["evals"]:
-                lab, col = mark.get(e["verdict"], ("Checked", MUTED))
-                dl = f' ({esc(money(e["delta"]))}/day)' if e.get("delta") not in (None, "") else ""
-                items.append(f'<div style="padding:6px 0"><b style="color:{col}">{lab}:</b> {esc(e["headline"])}{dl} '
-                             f'<span style="color:{MUTED};font-size:12px;white-space:nowrap">{esc(e["id"])}</span></div>')
-            for c in ctx["closures"]:
-                items.append(f'<div style="padding:6px 0"><b>Closed</b> ({esc(c["status"])}): {esc(c["note"])} '
-                             f'<span style="color:{MUTED};font-size:12px;white-space:nowrap">{esc(c["id"])}</span></div>')
-            for w in ctx["waiting"]:
-                items.append(f'<div style="padding:6px 0"><b style="color:{AMBER}">Still waiting on you</b> '
-                             f'({w["age"]}d): {esc(w["headline"])} <span style="color:{MUTED};font-size:12px;'
-                             f'white-space:nowrap">text do {esc(w["id"])}</span></div>')
-            a(_card("".join(items)))
-    # numbers
+        # 3. the full review, section by section
+        for head, body in ctx["sections"]:
+            if not body.strip():
+                continue
+            a(_h2(SECTION_RENAME.get(head.strip().lower(), head)))
+            a(_card(md_html(body)))
+        if ctx["waiting"] and not any("waiting" in h.lower() for h, _ in ctx["sections"]):
+            a(_h2("Still waiting on you", len(ctx["waiting"])))
+            a(_card("".join(f'<div style="padding:4px 0">{id_chip(w["id"])} {esc(w["headline"])} '
+                            f'<span style="color:{MUTED};font-size:13px">({w["age"]}d; text do {esc(w["id"])})</span></div>'
+                            for w in ctx["waiting"])))
+        # 4. every finding, with where it stands now
+        if ctx["rows"]:
+            a(_h2("Everything found today", len(ctx["rows"])))
+            t = [f'<table style="width:100%;border-collapse:collapse">'
+                 f'<tr><th style="{S_TH};text-align:left">Finding</th><th style="{S_TH};text-align:right">Status</th></tr>']
+            for n, r in enumerate(sorted(ctx["rows"], key=lambda r: (_STAND_ORDER[_standing(r)[0]],
+                                                                    {"P0": 0, "P1": 1, "P2": 2}.get(r["sev"], 3)))):
+                bg = f"background:{ZEBRA};" if n % 2 else ""
+                label, col = _standing(r)
+                age = "new today" if r["new"] else f'seen {r["seen"]} days'
+                t.append(f'<tr><td style="{S_TD};{bg}">{_sev(r["sev"])} {esc(r["headline"])}'
+                         f'<div style="font-size:12px;color:{MUTED}">{age}</div></td>'
+                         f'<td style="{S_TD};{bg}text-align:right;white-space:nowrap">'
+                         f'<div style="font-size:12px;font-weight:600;color:{col}">{label}</div>'
+                         f'{id_chip(r["id"]) if r["id"] else ""}</td></tr>')
+            t.append("</table>")
+            a(_card("".join(t)))
+    # 5. numbers
     if d:
         a(_h2("The numbers"))
-        rows = [("Net", d.get("net"), w7.get("mean"), w30.get("mean"), True),
-                ("Rewards (modelled)", d.get("rew"), w7.get("rew_mean"), w30.get("rew_mean"), True),
-                ("Trading (marked to last trade)", d.get("pnl"), w7.get("pnl_mean"), w30.get("pnl_mean"), True)]
-        td = f'style="padding:6px 8px;text-align:right;border-top:1px solid {LINE}"'
-        tl = f'style="padding:6px 8px;text-align:left;border-top:1px solid {LINE}"'
-        t = [f'<table style="width:100%;border-collapse:collapse;font-size:14px">'
-             f'<tr><th style="text-align:left;padding:4px 8px;color:{MUTED};font-weight:600"></th>'
-             f'<th style="text-align:right;padding:4px 8px;color:{MUTED};font-weight:600">{esc(_dow(day))}</th>'
-             f'<th style="text-align:right;padding:4px 8px;color:{MUTED};font-weight:600">7-day avg</th>'
-             f'<th style="text-align:right;padding:4px 8px;color:{MUTED};font-weight:600">30-day avg</th></tr>']
-        for lab, x, y, z, sg in rows:
-            t.append(f'<tr><td {tl}>{esc(lab)}</td><td {td}>{_num(x, sg)}</td><td {td}>{_num(y, sg)}</td>'
-                     f'<td {td}>{_num(z, sg)}</td></tr>')
-        t.append(f'<tr><td {tl}>Fills / contracts</td><td {td}>{int(rv._f(d.get("fills")))} / '
-                 f'{rv._f(d.get("cts")):,.0f}</td><td {td}></td><td {td}></td></tr></table>')
-        risk = []
+        rows = [("Net", d.get("net"), w7.get("mean"), w30.get("mean")),
+                ("Rewards (modelled)", d.get("rew"), w7.get("rew_mean"), w30.get("rew_mean")),
+                ("Trading (marked to last trade)", d.get("pnl"), w7.get("pnl_mean"), w30.get("pnl_mean"))]
+        t = [f'<table style="width:100%;border-collapse:collapse"><tr><th style="{S_TH};text-align:left"></th>'
+             f'<th style="{S_TH};text-align:right">{esc(_dow(day))}</th>'
+             f'<th style="{S_TH};text-align:right">7-day avg</th><th style="{S_TH};text-align:right">30-day avg</th></tr>']
+        for lab, x, y, z in rows:
+            t.append(f'<tr><td style="{S_TD}">{esc(lab)}</td><td style="{S_TD};text-align:right">{_num(x)}</td>'
+                     f'<td style="{S_TD};text-align:right">{_num(y)}</td><td style="{S_TD};text-align:right">{_num(z)}</td></tr>')
+        t.append(f'<tr><td style="{S_TD}">Fills / contracts</td><td style="{S_TD};text-align:right">'
+                 f'{int(rv._f(d.get("fills")))} / {rv._f(d.get("cts")):,.0f}</td><td style="{S_TD}"></td>'
+                 f'<td style="{S_TD}"></td></tr></table>')
+        extra = []
         if w30.get("n"):
-            risk.append(f'30 days: worst day {money(w30.get("worst"))}, max drawdown {money(w30.get("max_dd"))}, '
-                        f'{w30.get("green")} of {w30.get("n")} days green')
-            if w30.get("tax") is not None:
-                risk.append(f'trading gave back {rv._f(w30.get("tax")) * 100:.0f}% of rewards')
+            tax = f', trading gave back {rv._f(w30.get("tax")) * 100:.0f}% of rewards' if w30.get("tax") is not None else ""
+            extra.append(f'<div style="margin-top:10px;color:{MUTED};font-size:13px">30 days: worst day '
+                         f'{esc(money(w30.get("worst")))}, max drawdown {esc(money(w30.get("max_dd")))}, '
+                         f'{w30.get("green")} of {w30.get("n")} days green{tax}.</div>')
         fams = (ev.get("attribution") or {}).get("families") or []
-        famline = ""
         if fams:
             ranked = sorted((f for f in fams if abs(rv._f(f["day"]["net"])) >= 1), key=lambda f: -rv._f(f["day"]["net"]))
             best = [f'{f["family"]} {money(f["day"]["net"])}' for f in ranked[:3] if rv._f(f["day"]["net"]) > 0]
             worst = [f'{f["family"]} {money(f["day"]["net"])}' for f in ranked[::-1][:3] if rv._f(f["day"]["net"]) < 0]
             if best:
-                famline += f'<div style="margin-top:8px"><b style="color:{GREEN}">Best:</b> {esc(", ".join(best))}</div>'
+                extra.append(f'<div style="margin-top:8px"><b style="color:{GREEN}">Best:</b> {inline(", ".join(best))}</div>')
             if worst:
-                famline += f'<div><b style="color:{RED}">Worst:</b> {esc(", ".join(worst))}</div>'
-        edge = edge_line(ev)
+                extra.append(f'<div><b style="color:{RED}">Worst:</b> {inline(", ".join(worst))}</div>')
+        a(_card("".join(t) + "".join(extra)))
+        edge = (ev.get("moat") or {}).get("edge") or []
         if edge:
-            famline += f'<div style="margin-top:8px"><b>Edge watch:</b> {esc(edge)}</div>'
-        a(_card("".join(t) + (f'<div style="margin-top:10px;color:{MUTED};font-size:13px">{esc("; ".join(risk))}.</div>' if risk else "") + famline))
+            a(_h2("Edge watch (last 7 days vs the 21 before)"))
+            et = [f'<table style="width:100%;border-collapse:collapse"><tr>'
+                  f'<th style="{S_TH};text-align:left">Family</th><th style="{S_TH};text-align:right">Rewards per $1k resting</th>'
+                  f'<th style="{S_TH};text-align:right">Change</th></tr>']
+            for n, e in enumerate(edge[:6]):
+                bg = f"background:{ZEBRA};" if n % 2 else ""
+                lead = rv._f(e.get("lead"))
+                col = GREEN if e["verdict"] == "strengthening" else RED
+                r_, b_ = e.get("recent") or {}, e.get("base") or {}
+                et.append(f'<tr><td style="{S_TD};{bg}">{esc(e["family"])}<div style="font-size:12px;color:{col}">'
+                          f'{esc(e["verdict"])}</div></td>'
+                          f'<td style="{S_TD};{bg}text-align:right">${rv._f(r_.get("rew_per_1k")):,.2f} vs '
+                          f'${rv._f(b_.get("rew_per_1k")):,.2f}</td>'
+                          f'<td style="{S_TD};{bg}text-align:right;color:{col};font-weight:600">{(lead - 1) * 100:+.0f}%</td></tr>')
+            et.append("</table>")
+            a(_card("".join(et)))
     checks = health_checks(ev)
     if checks:
         a(_h2("Health checks"))
         a('<div>' + "".join(_chip(t, c) for t, c in checks) + '</div>')
-    # footer
+    if fallback_reason:
+        evmd = _read(os.path.join(day_dir(day), "evidence.md"))
+        _t, _i, secs = split_review(evmd)
+        for head, body in secs:
+            a(_h2(head))
+            a(_card(md_html(body)))
     foot = [f'{ctx["open"]} open item(s) in the ledger.'] if ctx.get("open") else []
-    foot.append("The full write-up is attached." if not fallback_reason else "The evidence pack is attached.")
+    foot.append("The evidence pack is attached.")
     foot.append("Approve by text (do R-...) or in any Claude session (/imm-daily-review apply R-...).")
     foot.append("Rewards are the bot's model until Kalshi pays them (1-2 days later); trading is marked to the last trade.")
     a(f'<div style="margin:22px 0 8px;font-size:12px;color:{MUTED}">{esc(" ".join(foot))}</div>')
@@ -448,9 +677,9 @@ def render_text(ctx: dict, fallback_reason: str = "") -> str:
                  f"7-day avg {money(w7.get('mean'))}/day.")
     if fallback_reason:
         L.append(f"The analysis did not run ({fallback_reason}). Numbers only; evidence attached.")
-    elif ctx["verdict"]:
-        L.append(ctx["verdict"])
-    if not fallback_reason:
+    else:
+        if ctx["verdict"]:
+            L.append(ctx["verdict"])
         L += ["", f"NEEDS YOUR OK ({len(ctx['decisions'])})"]
         for i, r in enumerate(ctx["decisions"], 1):
             L.append(f"{i}. {r['headline']} [{r['sev']}]")
@@ -460,21 +689,14 @@ def render_text(ctx: dict, fallback_reason: str = "") -> str:
             L.append(f"   Approve: text \"do {r['id']}\"")
         if not ctx["decisions"]:
             L.append("Nothing today.")
-        if ctx["fyi"]:
-            L += ["", "WORTH KNOWING"]
-            for r in ctx["fyi"]:
-                L.append(f"- [{r['sev']}] {r['headline']} ({r['id']})")
-        for e in ctx["evals"]:
-            L.append(f"- Follow-up {e['id']}: {e['verdict']} - {e['headline']}")
-        for w in ctx["waiting"]:
-            L.append(f"- Still waiting on you ({w['age']}d): {w['headline']} - text do {w['id']}")
+        if ctx["review"]:
+            L += ["", ctx["review"]]
     edge = edge_line(ctx["ev"])
     if edge:
         L += ["", "EDGE WATCH: " + edge]
     checks = health_checks(ctx["ev"])
     if checks:
         L += ["", "HEALTH: " + "; ".join(t for t, _ in checks)]
-    L += ["", "Full write-up attached."]
     return "\n".join(L)
 
 
@@ -497,34 +719,25 @@ def subject_for(ctx: dict, fallback_reason: str = "") -> str:
     return s
 
 
-def full_writeup(day: date, ctx: dict, fallback_reason: str = "") -> Tuple[str, str]:
-    """(file name, HTML page) of the long version: the model's review.md, or
-    the evidence pack when the analysis did not run."""
-    dd = day_dir(day)
-    if fallback_reason:
-        md = _read(os.path.join(dd, "evidence.md"))
-        return f"IMM-evidence-{day.isoformat()}.html", mdr.page(f"IMM evidence {day.isoformat()}", [mdr.render(md)])
-    ids = rv._load_json(os.path.join(dd, "ids.json"), {}) or {}
-    md = substitute_ids(_read(os.path.join(dd, "review.md")), ids).strip()
-    return f"IMM-review-{day.isoformat()}-full.html", mdr.page(f"IMM review {day.isoformat()} (full write-up)",
-                                                               [mdr.render(md)])
+def evidence_attachment(day: date) -> Tuple[str, str]:
+    md = _read(os.path.join(day_dir(day), "evidence.md"))
+    return f"IMM-evidence-{day.isoformat()}.html", mdr.page(f"IMM evidence pack {day.isoformat()}", [mdr.render(md)])
 
 
 def build(day: date, fallback: bool = False, reason: str = "") -> Tuple[str, str, str, List[Tuple[str, str]]]:
     dd = day_dir(day)
     os.makedirs(dd, exist_ok=True)
     ctx = load_ctx(day)
-    has_review = bool(_read(os.path.join(dd, "review.md")).strip()) and bool(ctx["findings"])
+    has_review = bool(ctx["review"]) and bool(ctx["findings"])
     why = ""
     if fallback or not has_review:
         why = reason or ("no review was written" if not has_review else "fallback requested")
     page = render_html(ctx, why)
     text = render_text(ctx, why)
     subject = subject_for(ctx, why)
-    attach = [full_writeup(day, ctx, why)]
     with open(os.path.join(dd, "email.html"), "w", encoding="utf-8") as fh:
         fh.write(page)
-    return subject, page, text, attach
+    return subject, page, text, [evidence_attachment(day)]
 
 
 def send(subject: str, html: str, text: str, attachments: Optional[List[Tuple[str, str]]] = None) -> bool:
@@ -583,6 +796,8 @@ def main(argv: Optional[list] = None) -> int:
     print("subject: " + subject)
     print(f"html: {os.path.join(dd, 'email.html')} ({len(page):,} bytes); attachments: "
           + ", ".join(f"{n} ({len(c):,} bytes)" for n, c in attach))
+    if len(page) > 100_000:
+        print("warning: over ~100 KB of HTML -- Gmail clips the message there")
     if a.dry:
         return 0
     if not send(subject, page, text, attach):

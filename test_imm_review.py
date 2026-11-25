@@ -450,6 +450,47 @@ class LedgerTests(Base):
         self.assertEqual(rv.ledger_state()[iid]["status"], "fixed-elsewhere")
 
 
+class RenderTests(unittest.TestCase):
+    def test_tables_lists_money_and_ids(self):
+        md = "\n".join([
+            "Lead line with **bold** and `code`.", "",
+            "| Market | Trading |", "|---|---:|", "| KXA | -$88 |", "| KXB | +$46 |", "",
+            "- **One:** first", "  - nested", "- **Two:** see R-261124-02", "",
+            "1. step one", "2. step two", ""])
+        h = sr.md_html(md)
+        self.assertIn("<b>bold</b>", h)
+        self.assertIn("<code", h)
+        self.assertIn("<table", h)
+        self.assertIn("text-align:right", h)                          # ---: aligns right
+        self.assertIn(f"color:{sr.RED}", h)                           # -$88 in red
+        self.assertIn(f"color:{sr.GREEN}", h)                         # +$46 in green
+        self.assertEqual(h.count("<ul"), 2)                           # nested list
+        self.assertIn("<ol", h)
+        self.assertIn("R-261124-02</span>", h)                        # id tag
+        self.assertNotIn("**", h)
+
+    def test_table_inside_a_numbered_item_keeps_the_list_together(self):
+        md = "\n".join(["1. **First**", "   - a", "", "     | x | y |", "     |---|---:|", "     | 1 | 2 |", "",
+                        "   - b", "", "2. **Second** with **`code` inside bold**", ""])
+        h = sr.md_html(md)
+        self.assertEqual(h.count("<ol"), 1)                               # one list: numbers continue
+        self.assertLess(h.index("<table"), h.index("Second"))            # the table stays in item 1
+        self.assertLess(h.index('">b</li>'), h.index("Second"))          # so does the bullet after it
+        self.assertIn("<b><code", h)                                     # bold wraps code
+        self.assertNotIn("**", h)
+        self.assertIn('start="3"', sr.md_html("3. third\n4. fourth\n"))  # a list starting at 3
+
+    def test_escapes_html(self):
+        self.assertIn("&lt;script&gt;", sr.md_html("a <script>x</script> b"))
+
+    def test_split_review(self):
+        title, intro, secs = sr.split_review("\n".join([
+            "# Tue: verdict", "Intro line.", "", "## What happened", "- a", "## Data", "b", ""]))
+        self.assertEqual(title, "Tue: verdict")
+        self.assertEqual(intro, "Intro line.")
+        self.assertEqual([h for h, _ in secs], ["What happened", "Data"])
+
+
 class MoatTests(Base):
     def _cycle_log(self, day, rows):
         """rows: (hh, mm, ticker, est_frac, pool) -> cycle_log files by UTC date."""
@@ -618,15 +659,18 @@ class CollectAndSendTests(Base):
         self.assertIn("Needs your OK", page)
         self.assertIn("The repo sync is stuck", page)
         self.assertIn("do R-261124-01", page)
-        self.assertIn("A very long technical title", page)          # FYI line, shortened
+        self.assertIn("A very long technical title", page)          # in Everything found today
+        self.assertIn("Everything found today", page)
         self.assertIn("A clean day; one thing needs you.", page)
+        self.assertIn("Fix the sync", page)                          # the review.md body is in the email
         self.assertIn("Health checks", page)
         self.assertNotIn("[[fp:", page)
+        self.assertLess(len(page), 100_000)                          # under Gmail's clip size
         self.assertIn('Approve: text "do R-261124-01"', text)
-        name, full = attach[0]
-        self.assertEqual(name, "IMM-review-2026-11-24-full.html")
-        self.assertIn("R-261124-01", full)
-        self.assertNotIn("[[fp:", full)
+        self.assertIn("Fix the sync R-261124-01", text)               # review.md, ids substituted
+        name, ev_page = attach[0]
+        self.assertEqual(name, "IMM-evidence-2026-11-24.html")
+        self.assertIn("Scorecard", ev_page)
         sent = []
 
         class FakeSMTP:
@@ -663,6 +707,7 @@ class CollectAndSendTests(Base):
         self.assertIn("The analysis did not run (claude exit 1)", text)
         self.assertEqual(attach[0][0], "IMM-evidence-2026-11-24.html")
         self.assertIn("Scorecard", attach[0][1])
+        self.assertIn("1. Scorecard", page)                          # the evidence pack in the body
         _, p2, _, _ = sr.build(DAY)                                         # no review.md at all
         self.assertIn("no review was written", p2)
 

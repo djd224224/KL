@@ -214,13 +214,7 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 }
 ```
 
-**The email is built from this file, not from review.md** (Jack 11/25: "make the email way clearer and easier to read"). `send_imm_review.py` lays it out the same way every day:
-- the day's net in one big number;
-- your `verdict`;
-- up to 3 "Needs your OK" cards (the decision_needed findings, most severe first);
-- one line per finding that is new today or P0/P1;
-- follow-ups;
-- a numbers table and green/amber/red health checks.
+**The top of the email comes from this file:** your `verdict` under the big number, up to 3 "Needs your OK" cards from the decision_needed findings (most severe first), and the "Everything found today" table of all findings. The rest of the body is review.md (section 5); the numbers, edge watch and health checks come from evidence.json.
 
 So write the short fields for a phone:
 - **`verdict`:** one or two plain sentences, at most 240 characters. How the day went in risk-adjusted terms, and the one thing that matters.
@@ -243,44 +237,58 @@ The `plan` must be executable by a fresh Claude with no other context:
 
 The `metric.recipe` must be a command or a precise evidence-pack reading.
 
-## 5. review.md (the full write-up, attached to the email)
+## 5. review.md (the body of the email)
 
-The email body is generated from findings.json (section 4). review.md is the attachment for when Jack wants the reasoning, so it can carry the analysis. Still write it to be read:
-- short paragraphs, at most 4 lines;
-- a table where there are more than 3 numbers;
-- no walls of tickers.
+Jack 11/25: "make the email comprehensive, but just make it easy to read and legible". The email shows review.md in full, section by section, each section in its own card. Above it sit the big number, your `verdict`, and the decision cards (from findings.json). Below it come a table of every finding, the numbers, the edge watch and the health checks.
 
-Plain Markdown that `md_report_email.py` renders: headings, pipe tables, bullets, **bold**, `code`. No emoji. Under about 150 lines. It names about 10 findings at most. P3 items go in the ledger only, closing with one line: "N more P3 items in the ledger: <ids>". Order:
+So review.md carries the whole analysis, written to be read on a phone.
+
+**Legibility rules:**
+- **Lead with the point.** A section's first line says what matters. Detail follows.
+- **One idea per bullet.** Start each bullet with a **bold claim**, then at most two short sentences.
+- **Short paragraphs.** At most 3 sentences or about 60 words. No line over about 300 characters.
+- **Tables for numbers.** Use a table once there are more than 3 numbers to compare: markets, losses, before/after. Right-align number columns (`---:`).
+- **Signed dollars.** Write signed dollars (+$46, -$88) so the email can colour them. Write the basis once per claim ("modelled", "measured").
+- **Ledger ids, never fingerprints.** Use `[[fp:<fingerprint>]]` where an id belongs; it becomes a small tag. Tickers go in `code` only when the ticker is the point; otherwise name the thing ("the Hormuz weekly").
+- **No walls of tickers.** List at most 5, then "and N more". No emoji.
+
+**Comprehensive:** every finding filed today appears in one section. Decisions get the full reasoning in "Decisions for you", shown as "Decisions in detail" under the cards. P3 items get one bullet each in "Data and logging" or "Bugs and system health".
+
+Plain Markdown: headings, pipe tables, bullets (nesting allowed), **bold**, *italics*, `code`. About 120-200 lines. Order:
 
 ```
 # <Day>: <one-line verdict>
-Two or three sentences: risk-adjusted result vs the 7d/30d norm and the one thing that matters most today.
+Two or three sentences: the risk-adjusted result against the 7d/30d norm, and the one thing that matters most today.
 
 ## Decisions for you
-1. **[[fp:<fingerprint>]] <title>** - <what is wrong, $/day and basis>. Fix: <the change, one line>. Kill switch: <...>.
-   Text "do [[fp:<fingerprint>]]" to approve, "no [[fp:<fingerprint>]]" to drop.
-(at most 3; write "None today." when there are none)
+1. **[[fp:<fingerprint>]] <headline>**
+   - **What is wrong:** <one or two sentences, $/day and basis>
+   - **The evidence:** <the numbers, or a small table>
+   - **The fix:** <the change>. Kill switch: <...>. Text "do [[fp:...]]" to approve.
 
 ## What happened
-Drivers by family; the worst losses and what caused them; risk numbers.
+- **The day:** ... (then a small table of the drivers by family or the biggest losses: market, trading, why)
 
 ## Bugs and system health
-New or spiking errors with their root cause; failing jobs; repo / disk / token; each with its id.
+- **<headline> [[fp:...]]:** what it is, root cause, fix, status.
 
 ## Missed markets
-The few that matter, with modelled $/day x the realisation factor and the reason class. Plus the blind spot (unestimated pool).
+A small table: market, why not quoted, net $/day (modelled). Then one bullet on the blind spot.
 
 ## Did past changes work?
-Each due item: verdict, before -> after, $/day.
+One bullet per due item: verdict, before -> after, $/day.
+
+## The moat
+What was added today (data, analysis, process); the edge watch in a sentence or two.
 
 ## Data and logging
-Gaps found and what to log.
+One bullet per gap and what to log.
 
 ## Still waiting on you
-One line per item proposed 3+ days ago.
+One bullet per item proposed 3+ days ago.
 ```
 
-The email carries the exact-number tables from evidence.json, so don't paste the scorecard. Cite the numbers you argue from.
+The email's numbers card comes from evidence.json, so don't paste the scorecard. Cite the numbers you argue from.
 
 ## 6. Severity
 
