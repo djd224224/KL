@@ -2847,14 +2847,20 @@ def series_price_min(series: str) -> int:
     if ov and ov.price_min_cents is not None:
         return ov.price_min_cents
     # the shipping family's band, by name (2026-10-31, SHIPPING_PRICE_MIN)
-    return SHIPPING_PRICE_MIN if series in SHIPPING_STEP_SERIES else PRICE_MIN_CENTS
+    if series in SHIPPING_STEP_SERIES:
+        return SHIPPING_PRICE_MIN
+    # ...and KXGOODREADS' 1-99c, by name: its override is the awards
+    # parent's clone (2026-11-26, GOODREADS_PRICE_MIN)
+    return GOODREADS_PRICE_MIN if series == GOODREADS_BAND_SERIES else PRICE_MIN_CENTS
 
 
 def series_price_max(series: str) -> int:
     ov = SERIES_OVERRIDES.get(series)
     if ov and ov.price_max_cents is not None:
         return ov.price_max_cents
-    return SHIPPING_PRICE_MAX if series in SHIPPING_STEP_SERIES else PRICE_MAX_CENTS
+    if series in SHIPPING_STEP_SERIES:
+        return SHIPPING_PRICE_MAX
+    return GOODREADS_PRICE_MAX if series == GOODREADS_BAND_SERIES else PRICE_MAX_CENTS
 
 
 def series_min_hours_to_close(series: str) -> float:
@@ -15631,6 +15637,7 @@ _CONFIG_CODE_KNOBS = (
     "GTEMP_SIZE_MULT",            # KXGTEMP x3 (2026-11-24)
     "ART_PRICE_MIN", "ART_PRICE_MAX",                    # KXART 2-98c (2026-11-11)
     "OSCAR_PRICE_MIN", "OSCAR_PRICE_MAX",                # KXOSCAR* 1-99c (2026-11-13)
+    "GOODREADS_PRICE_MIN", "GOODREADS_PRICE_MAX",        # KXGOODREADS 1-99c (2026-11-26)
     "ART_BOOST_SIDE_CAP", "ART_BOOST_CHEAP_C", "ART_BOOST_CHEAP_SIDE_CAP",
     "ART_EVENT_CAP",                                     # ART FLOOR BOOST (2026-11-11)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
@@ -25571,6 +25578,27 @@ OSCAR_PRICE_MAX = _env_int("IMM_OSCAR_PRICE_MAX", 99)
 SERIES_OVERRIDES["KXOSCAR"] = replace(SERIES_OVERRIDES["KXOSCAR"],
                                       price_min_cents=OSCAR_PRICE_MIN,
                                       price_max_cents=OSCAR_PRICE_MAX)
+# GOODREADS 1-99c (Jack 2026-11-26: "why are most not quoting on goodreads,
+# fix it. KXGOODREADS-26ROM KXGOODREADS-26DEBUT"). At 19:30Z 11/26, 9 of the
+# 15 categories quoted and 6 were dark, all by the 5-90c / 5-93c band:
+#   * DEBUT, FANT, HISTBIO, HOR, NONFIC (50 finalists) are placeholder books,
+#     a 1-2c bid x a 93-94c ask on every finalist: both touches outside the
+#     band, so zero_yield;
+#   * ROM's 10 books are 3-8c x 96-97c, and each carries a 0.01-contract order
+#     one tick inside the other side's wall (a YES bid at 95-96c, or a NO bid
+#     at 91-95c), so Kalshi's listed touch read 95-96c x 96-97c and 6 of the
+#     10 screened out extreme_mid. external_best already skips a 0.01 level,
+#     so the quote loop joins the real touch; leads now price clear of it too
+#     (book_top).
+# The Oscars precedent: a long shot's bid joins the 1c wall and a 94c ask its
+# NO wall, the least-risk quotes in a 10-finalist category (a finalist's fair
+# averages ~10c). KXGOODREADS clones the awards parent's override at x3, so
+# the band is by name (series_price_min / _max), not on the override, and
+# awards_auto_rules still counts it a member. Size, safe-join and the Dec 2
+# stand-down are unchanged. IMM_GOODREADS_PRICE_MIN=5 / _MAX=90 = the old band.
+GOODREADS_BAND_SERIES = "KXGOODREADS"
+GOODREADS_PRICE_MIN = _env_int("IMM_GOODREADS_PRICE_MIN", 1)
+GOODREADS_PRICE_MAX = _env_int("IMM_GOODREADS_PRICE_MAX", 99)
 
 # FAMILY x2, 2026-10-11 (Jack: "do 1,2,6,8" -- #2 and #6 of the consolidated
 # recommendations): Rotten Tomatoes, Trump endorsements, the strait / port
@@ -27191,6 +27219,21 @@ def external_best(yes_levels: List[List[float]], no_levels: List[List[float]],
     return best_yes_bid, best_yes_ask
 
 
+def book_top(yes_levels: List[List[float]], no_levels: List[List[float]]
+             ) -> Tuple[Optional[int], Optional[int]]:
+    """(best YES bid, best YES ask) in cents over EVERY level with any size,
+    however small: the prices a post-only order must stay clear of.
+    external_best skips a level of 0.01 contracts or less (the residue our own
+    size leaves when it nets out), so a 0.01-lot order resting one tick inside
+    the other side's wall is no touch to join -- but a lead priced past it is
+    refused "post only cross" every cycle (KXGOODREADS-26ROM, 2026-11-26: a
+    0.01 YES bid at 96c over a 97c ask on six of its ten books). Pass the
+    levels the caller crosses against (EXTERNAL, our own netted out)."""
+    yb = max((int(px) for px, q in yes_levels if float(q) > 1e-9), default=None)
+    nb = max((int(px) for px, q in no_levels if float(q) > 1e-9), default=None)
+    return yb, (100 - nb) if nb is not None else None
+
+
 def external_depths(yes_levels: List[List[float]], no_levels: List[List[float]],
                     own_orders: List[Tuple[str, int, float]] = ()
                     ) -> Tuple[float, float]:
@@ -28556,7 +28599,8 @@ def comp_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
     siblings' YES-bid references; the bid side leads only with `bid_ok` and
     exactly one sibling, off that twin's NO bids. `hold_bid` / `hold_ask`
     (YES cents): where a side already leads. A lead never crosses the
-    market's own other side, and two leads that would cross both stand down."""
+    market's own other side -- any order on it, a 0.01-lot one too
+    (book_top) -- and two leads that would cross both stand down."""
     lb = ln = None
     if bid_ok and len(sibs) == 1:
         lb = comp_side_lead(yes_levels, sibs[0][1], target, df, hold=hold_bid)
@@ -28565,7 +28609,7 @@ def comp_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
         ln = comp_side_lead_ref(no_levels, sum(refs), target, df,
                                 hold=None if hold_ask is None else 100 - hold_ask)
     la = None if ln is None else (100 - ln[0], 100 - ln[1], 100 - ln[2])
-    eb, ea = external_best(yes_levels, no_levels)
+    eb, ea = book_top(yes_levels, no_levels)
     if lb is not None and ea is not None and lb[0] >= ea:
         lb = None
     if la is not None and eb is not None and la[0] <= eb:
@@ -29095,7 +29139,7 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
             ln = comp_side_lead_ref(no_levels, max(refs), target, df,
                                     hold=None if hold_ask is None else 100 - hold_ask)
     la = None if ln is None else (100 - ln[0], 100 - ln[1], 100 - ln[2])
-    eb, ea = external_best(yes_levels, no_levels)
+    eb, ea = book_top(yes_levels, no_levels)     # clear of any order, 0.01 lots too
     if lb is not None and ea is not None and lb[0] >= ea:
         lb = None
     if la is not None and eb is not None and la[0] <= eb:
@@ -29703,9 +29747,10 @@ def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
                                 hold=None if hold_ask is None else 100 - hold_ask,
                                 margin=margin)
     la = None if ln is None else (100 - ln[0], 100 - ln[1], 100 - ln[2])
-    if lb is not None and ea is not None and lb[0] >= ea:
+    xb, xa = book_top(yes_levels, no_levels)     # clear of any order, 0.01 lots too
+    if lb is not None and xa is not None and lb[0] >= xa:
         lb = None
-    if la is not None and eb is not None and la[0] <= eb:
+    if la is not None and xb is not None and la[0] <= xb:
         la = None
     if lb is not None and la is not None and lb[0] >= la[0]:
         lb = la = None
@@ -29743,15 +29788,16 @@ def ca_array_lead_group(yes_levels: List[List[float]], no_levels: List[List[floa
                            {px: float(n)}, target, df)[1]
 
     lb = la = None
+    xb, xa = book_top(yes_levels, no_levels)     # clear of any order, 0.01 lots too
     px = CA_ARRAY_LEAD_EDGE_C
     if (p_lo >= CA_ARRAY_LEAD_BID_MIN_P
             and (eb is None or px > eb or (hold_bid == px and px >= eb))
-            and (ea is None or px < ea) and qualifies(yes_levels, px)):
+            and (xa is None or px < xa) and qualifies(yes_levels, px)):
         lb = (px, px, eb if eb is not None else 0)
     px = 100 - CA_ARRAY_LEAD_EDGE_C
     if (p_hi <= CA_ARRAY_LEAD_ASK_MAX_P
             and (ea is None or px < ea or (hold_ask == px and px <= ea))
-            and (eb is None or px > eb) and qualifies(no_levels, 100 - px)):
+            and (xb is None or px > xb) and qualifies(no_levels, 100 - px)):
         la = (px, px, ea if ea is not None else 100)
     return lb, la
 

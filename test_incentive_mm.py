@@ -48770,6 +48770,190 @@ class TestOscarsWinnersBand(unittest.TestCase):
                         [s for s in lines if "universe:" in s][-3:])
 
 
+class TestGoodreadsBand(unittest.TestCase):
+    """GOODREADS 1-99c (Jack 2026-11-26: "why are most not quoting on
+    goodreads, fix it. KXGOODREADS-26ROM KXGOODREADS-26DEBUT"). KXGOODREADS
+    quotes 1-99c by name: a DEBUT finalist's 1c x 94c placeholder book is no
+    longer zero_yield, and a ROM book whose listed touch a 0.01-lot order
+    makes 96c x 97c is no longer extreme_mid -- that order is neither joined
+    nor led past (book_top)."""
+
+    DEBUT = ("KXGOODREADS-26DEBUT-LT", "KXGOODREADS-26DEBUT")
+    ROM = ("KXGOODREADS-26ROM-FD", "KXGOODREADS-26ROM")
+
+    def setUp(self):
+        _clean_persist()
+        overrides = dict(imm.SERIES_OVERRIDES)
+
+        def reset():
+            imm.SERIES_OVERRIDES.clear()
+            imm.SERIES_OVERRIDES.update(overrides)
+            imm.AWARDS_EXTRA_SERIES.clear()
+            imm._awards_extra_state["mtime"] = 0.0
+            try:
+                os.remove(imm.awards_extra_path())
+            except OSError:
+                pass
+            for _t, ev in (self.DEBUT, self.ROM):
+                imm._config_gaps.pop(ev, None)
+        reset()
+        self.addCleanup(reset)
+        with open(imm.awards_extra_path(), "w", encoding="utf-8") as f:
+            json.dump({"series": ["KXGOODREADS", "KXGAMEAWARDS"]}, f)
+        imm.load_awards_extra_series()
+        # the live box's: "NOT Carbon Arc" (11/25), and the awards parent's
+        # override (its x3 aside)
+        imm.FAMILY_VERDICTS["KXGOODREADS"] = {
+            "carbon_arc": False, "ts": time.time(), "title": "Goodreads Choice Awards"}
+        self.addCleanup(imm.FAMILY_VERDICTS.pop, "KXGOODREADS", None)
+        parent = imm.SERIES_OVERRIDES[imm.AWARDS_AUTO_PARENT]
+        for s in ("KXGOODREADS", "KXGAMEAWARDS"):
+            imm.SERIES_OVERRIDES[s] = parent
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        self.addCleanup(setattr, imm, "SERIES_HOUR_MULTS", self._saved_hour_mults)
+
+    def test_goodreads_takes_1_to_99_by_name(self):
+        self.assertEqual((imm.GOODREADS_PRICE_MIN, imm.GOODREADS_PRICE_MAX), (1, 99))
+        for k in ("GOODREADS_PRICE_MIN", "GOODREADS_PRICE_MAX"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        self.assertEqual((imm.series_price_min("KXGOODREADS"),
+                          imm.series_price_max("KXGOODREADS")), (1, 99))
+        for member in (False, True):
+            self.assertEqual(imm.member_price_band("KXGOODREADS", member), (1, 99))
+        # the override is untouched (the awards rules still count it a
+        # member), and another awards show keeps the usual band
+        self.assertIsNone(imm.SERIES_OVERRIDES["KXGOODREADS"].price_min_cents)
+        self.assertTrue(imm.awards_auto_rules("KXGOODREADS"))
+        self.assertEqual((imm.series_price_min("KXGAMEAWARDS"),
+                          imm.series_price_max("KXGAMEAWARDS")),
+                         (imm.PRICE_MIN_CENTS, imm.PRICE_MAX_CENTS))
+        # a band ON the override still wins over the name's
+        imm.SERIES_OVERRIDES["KXGOODREADS"] = imm.replace(
+            imm.SERIES_OVERRIDES["KXGOODREADS"], price_min_cents=4, price_max_cents=95)
+        self.assertEqual((imm.series_price_min("KXGOODREADS"),
+                          imm.series_price_max("KXGOODREADS")), (4, 95))
+        # the knobs revert it
+        imm.SERIES_OVERRIDES["KXGOODREADS"] = imm.SERIES_OVERRIDES[imm.AWARDS_AUTO_PARENT]
+        with mock.patch.object(imm, "GOODREADS_PRICE_MIN", 5), \
+                mock.patch.object(imm, "GOODREADS_PRICE_MAX", 90):
+            self.assertEqual((imm.series_price_min("KXGOODREADS"),
+                              imm.series_price_max("KXGOODREADS")), (5, 90))
+
+    def test_book_top_counts_a_dust_order_external_best_skips(self):
+        # KXGOODREADS-26ROM-FD at 19:30Z 11/26: 0.01 YES at 96c over a 97c ask
+        yes = [[1, 51150.0], [2, 7306.0], [3, 100.0], [96, 0.01]]
+        no = [[1, 1157.0], [2, 300.0], [3, 19601.0]]
+        self.assertEqual(imm.external_best(yes, no), (3, 97))   # the joins' touch
+        self.assertEqual(imm.book_top(yes, no), (96, 97))       # what post-only crosses
+        self.assertEqual(imm.book_top([], []), (None, None))
+        self.assertEqual(imm.book_top([[5, 0.0]], [[94, 0.01]]), (None, 6))
+
+    def test_a_complement_lead_never_prices_past_a_dust_order(self):
+        # three siblings bid 8c deep: the ask side may lead down to 100 - 24
+        # + 5c; a 0.01 YES bid at 96c makes every such offer a post-only cross
+        sibs = [([[8, 1000.0]], [[1, 1000.0]])] * 3
+        yes = [[1, 1500.0], [3, 100.0]]
+        no = [[3, 1500.0]]
+        _lb, la = imm.comp_lead_group(yes, no, sibs, 1000.0, 0.5)
+        self.assertIsNotNone(la)
+        self.assertLess(la[0], 96)
+        _lb, la = imm.comp_lead_group(yes + [[96, 0.01]], no, sibs, 1000.0, 0.5)
+        self.assertIsNone(la)
+
+    def test_a_fair_lead_never_prices_past_a_dust_order(self):
+        # the same for a model fair's leads: on a 40 x 60 book with a 50c
+        # fair the ask leads at 52c, which a 0.01 YES bid at 55c would cross
+        yes = [[40, 1500.0]]
+        no = [[40, 1500.0]]
+        lb, la = imm.fair_lead_group(yes, no, 50.0, 1000.0, 0.5, margin=0)
+        self.assertEqual((lb[0], la[0]), (48, 52))
+        _lb, la = imm.fair_lead_group(yes + [[55, 0.01]], no, 50.0, 1000.0, 0.5, margin=0)
+        self.assertIsNone(la)
+
+    def _cycle(self, which, bid, ask, yes, no, band=None):
+        t, ev = which
+        now = datetime.now(timezone.utc)
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": t, "incentive_type": "liquidity",
+             "period_reward": 9000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[t] = {
+            "ticker": t, "event_ticker": ev, "status": "active",
+            "close_time": "2099-12-31T15:00:00Z",
+            "expected_expiration_time": "2099-12-31T15:00:00Z",
+            "yes_bid_dollars": bid, "yes_ask_dollars": ask, "volume_fp": "0.00"}
+        client.books[t] = {"orderbook_fp": {"yes_dollars": yes, "no_dollars": no}}
+        far = (("KXGOODREADS-26*", now + timedelta(days=60)),)   # a date the test can't outlive
+        # (the launcher runs IMM_LADDER_MODE=atref: a side rests one rung at
+        # its reference, never past its touch, so a 1c bid joins the 1c wall;
+        # the module's default offsets ladder drops any rung under the 2c
+        # deep floor)
+        patches = [mock.patch.object(imm, "AWARDS_EVENT_DATES", far),
+                   mock.patch.object(imm, "AWARDS_DATES_EXTRA", []),
+                   mock.patch.object(imm, "series_in_blackout", return_value=False),
+                   mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99),
+                   mock.patch.object(imm, "LADDER_MODE", "atref"),
+                   mock.patch.object(imm, "JOIN_AHEAD_MODE", "off")]
+        if band is not None:
+            patches += [mock.patch.object(imm, "GOODREADS_PRICE_MIN", band[0]),
+                        mock.patch.object(imm, "GOODREADS_PRICE_MAX", band[1])]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+        rest = sorted((o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
+                      if o["ticker"] == t)
+        return bot, rest, lines
+
+    # a DEBUT finalist at 19:30Z 11/26: 1c x 94c, walls on both sides
+    _DEBUT_BOOK = ("0.0100", "0.9400", [["0.01", "1500"]], [["0.06", "1500"]])
+    # ROM-FD's shape: 3c x 97c with a 0.01-lot YES bid at 96c
+    _ROM_BOOK = ("0.9600", "0.9700",
+                 [["0.01", "1500"], ["0.03", "100"], ["0.96", "0.01"]],
+                 [["0.03", "1500"]])
+
+    def test_a_placeholder_finalist_quotes_both_walls(self):
+        bot, rest, lines = self._cycle(self.DEBUT, *self._DEBUT_BOOK)
+        t = self.DEBUT[0]
+        self.assertIn(t, bot.state.selected, [s for s in lines if "universe:" in s][-3:])
+        self.assertIn(("bid", 1), rest, [s for s in lines if t in s][-10:])
+        self.assertIn(("ask", 94), rest, [s for s in lines if t in s][-10:])
+
+    def test_the_old_band_left_it_dark(self):
+        bot, rest, _lines = self._cycle(self.DEBUT, *self._DEBUT_BOOK, band=(5, 90))
+        self.assertNotIn(self.DEBUT[0], bot.state.selected)
+        self.assertEqual(rest, [])
+
+    def test_a_dust_touch_is_neither_screened_out_nor_joined(self):
+        bot, rest, lines = self._cycle(self.ROM, *self._ROM_BOOK)
+        t = self.ROM[0]
+        self.assertIn(t, bot.state.selected, [s for s in lines if "universe:" in s][-3:])
+        self.assertTrue(rest, [s for s in lines if t in s][-10:])
+        for side, px in rest:
+            if side == "bid":
+                self.assertLessEqual(px, 3, rest)       # never at the 0.01 lot's 96c
+            else:
+                self.assertGreaterEqual(px, 97, rest)   # never under it: post-only
+        self.assertIn(("ask", 97), rest)
+
+    def test_the_old_band_screened_the_dust_touch_out(self):
+        bot, rest, lines = self._cycle(self.ROM, *self._ROM_BOOK, band=(5, 90))
+        self.assertNotIn(self.ROM[0], bot.state.selected)
+        self.assertEqual(rest, [])
+        self.assertTrue(any("extreme_mid" in s for s in lines if "universe:" in s),
+                        [s for s in lines if "universe:" in s][-3:])
+
+
 class TestCarbonArcTikTokShop(unittest.TestCase):
     """Jack 2026-11-13: "they should quote as part of carbon arc auto-quoting
     family along other tiktok shop" (KXHAUSTTS-26DEC06, KXRHODETTS-26DEC06).
