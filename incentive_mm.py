@@ -2763,6 +2763,89 @@ def size_test_mult(series: str, now_ts: Optional[float] = None) -> float:
     return SIZE_TEST_MULT
 
 
+# NEAR-TERM ELECTIONS x3 FOR A WEEK (Jack 2026-11-26: "Yes, x3 for a week",
+# on "Raise ad-hoc near-term elections from x2 to x3?"). The ad-hoc election
+# series at the plain family size -- KXINDONESIAVP, KXKEELUNGMAYOR, the
+# leadership votes -- netted +$85 / +$114 / +$71 over 11/09-11/25 (41-90% of
+# rewards kept) at a median 0.7% of the scored book, so size should buy reward
+# about in proportion. Such a series -- an election-family member at exactly
+# the family's ELECTION_SIZE_MULT (so not KXPRESRUN, CONTROLS, the seat
+# ladders or any series with its own size), not an election night session,
+# and EVERY one of whose markets in the universe is a dated vote within
+# NEAR_ELECTION_DAYS -- its event ticker's own date (KXKEELUNGMAYOR-26NOV28,
+# KXINDONESIAVP-27FEB01), not the cutoff, which on the 2028 primaries is
+# their program's end; an undated or year-only event (KXFRENCHPRES-27) is not
+# near-term, nor one whose vote is past -- rests at NEAR_ELECTION_SIZE_MULT
+# (x3) in place of the family's
+# x2 on the size_mult wire (rungs, per-market and per-event caps, skew knees,
+# the floor projection) until NEAR_ELECTION_UNTIL (00:00 ET 12/04), then
+# back to x2 by itself. Wave and post-vote books keep their own sizes
+# (pvd_side_sizes). The set is rebuilt at each universe refresh
+# (near_election_refresh), logged when it changes. IMM_NEAR_ELECTION_SIZE_MULT=0
+# turns it off (an env change = task-level restart).
+NEAR_ELECTION_SIZE_MULT = _env_float("IMM_NEAR_ELECTION_SIZE_MULT", 3.0)
+NEAR_ELECTION_DAYS = _env_float("IMM_NEAR_ELECTION_DAYS", 180.0)
+
+
+def _near_election_until() -> datetime:
+    """IMM_NEAR_ELECTION_UNTIL (ISO, UTC if naive), else 00:00 ET 12/04."""
+    raw = os.environ.get("IMM_NEAR_ELECTION_UNTIL", "").strip()
+    if raw:
+        try:
+            d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return datetime(2026, 12, 4, 5, 0, tzinfo=timezone.utc)
+
+
+NEAR_ELECTION_UNTIL = _near_election_until()
+_near_election: Dict[str, Any] = {"series": frozenset()}
+
+
+def near_election_on(now_ts: Optional[float] = None) -> bool:
+    return NEAR_ELECTION_SIZE_MULT > 0 and (
+        time.time() if now_ts is None else now_ts) < NEAR_ELECTION_UNTIL.timestamp()
+
+
+def near_election_candidate(series: str) -> bool:
+    """An election-family series at exactly the family size, not an
+    election night session's."""
+    ov = SERIES_OVERRIDES.get(series)
+    return (ov is not None and ov.size_mult is not None
+            and abs(ov.size_mult - ELECTION_SIZE_MULT) < 1e-9
+            and election_series(series) and not ens_series(series))
+
+
+def near_election_refresh(metas, now_utc: datetime) -> frozenset:
+    """Rebuild the NEAR-TERM ELECTIONS set from the universe's market metas
+    (every market of a series a dated vote within NEAR_ELECTION_DAYS); logs a
+    change. Returns the set."""
+    new: frozenset = frozenset()
+    if near_election_on(now_utc.timestamp()):
+        horizon = now_utc + timedelta(days=NEAR_ELECTION_DAYS)
+        ok: Dict[str, bool] = {}
+        for mm in metas:
+            s = mm.series
+            if s in ok and not ok[s]:
+                continue
+            if not near_election_candidate(s):
+                continue
+            td = parse_event_date(mm.event_ticker)        # the vote's own date
+            ok[s] = td is not None and now_utc - timedelta(days=2) <= td <= horizon
+        new = frozenset(s for s, v in ok.items() if v)
+    old = _near_election["series"]
+    if new != old:
+        add, gone = sorted(new - old), sorted(old - new)
+        log(f"[IMM] near-term elections x{NEAR_ELECTION_SIZE_MULT:g}: {len(new)} series"
+            + (f"; + {', '.join(add[:12])}" + (f" (+{len(add) - 12} more)" if len(add) > 12 else "")
+               if add else "")
+            + (f"; - {', '.join(gone[:12])}" + (f" (+{len(gone) - 12} more)" if len(gone) > 12 else "")
+               if gone else ""))
+    _near_election["series"] = new
+    return new
+
+
 def applied_mention_mult(series: str) -> float:
     """The mention multiplier ACTUALLY applied to this series' geometry:
     1.0 for series with a hand-tuned SeriesOverride ladder/cap (Love Island
@@ -2782,6 +2865,9 @@ def applied_mention_mult(series: str) -> float:
     if ov and ov.size_mult is not None:
         # (the strait weeklies' nights without the 10/31 shipping step)
         m *= ov.size_mult / shipping_night_step(series)
+        # ...x3 in place of the family x2 on a near-term election (to 12/04)
+        if series in _near_election["series"] and near_election_on():
+            m *= NEAR_ELECTION_SIZE_MULT / ov.size_mult
     # ...an international rain daily's base (RAIN_DAILY_INTL_BASE, 2026-10-31)
     m *= rain_daily_intl_base_mult(series)
     # ...and the base size split test's half (SIZE_TEST_MULT, 2026-10-26)
@@ -15753,6 +15839,8 @@ _CONFIG_CODE_KNOBS = (
     "MORT_FAIR_REFRESH_SECS", "MORT_CUTOFF_BUFFER_DAYS", "MORT_SIZE_MULT",
     # hand-named events (2026-11-26)
     "NAMED_EVENTS_ENABLE", "NAMED_EVENTS",
+    # near-term elections x3 for a week (2026-11-26)
+    "NEAR_ELECTION_SIZE_MULT", "NEAR_ELECTION_DAYS", "NEAR_ELECTION_UNTIL",
     # Zillow home value gate (2026-11-12); zillow_home_fair's model knobs
     # ride in its status file's "model" block
     "HOME_ENABLE", "HOME_SERIES", "HOME_FAIR_TOL_CENTS", "HOME_FAIR_TTL_MIN",
@@ -38680,6 +38768,9 @@ class IncentiveMarketMaker:
                 continue
             metas.append(meta)
 
+        # NEAR-TERM ELECTIONS x3 (2026-11-26): which election series stop soon
+        near_election_refresh(metas + [mm for mm, _m in scan_metas], now_utc)
+
         # OPEN SCAN admission (2026-09-05): event volumes first (they need
         # every bulk-read sibling, pinned strikes included — informed flow
         # on one strike shows up on its neighbours), then the per-market
@@ -51008,6 +51099,12 @@ class IncentiveMarketMaker:
                 f"{ev} x{m:g} {lo}-{hi}c to {stop:%m/%d %H:%M}Z"
                 for ev, (m, stop, lo, hi) in sorted(NAMED_EVENTS.items()))
                 + " -- past the pattern block and the allowlist, no leads")
+        if near_election_on():
+            log(f"near-term elections (2026-11-26): x{NEAR_ELECTION_SIZE_MULT:g} in place "
+                f"of the family x{ELECTION_SIZE_MULT:g} on an election series whose every "
+                f"market is a dated vote within {NEAR_ELECTION_DAYS:g}d, to "
+                f"{NEAR_ELECTION_UNTIL:%m/%d %H:%M}Z; wave and post-vote books keep "
+                f"their own sizes")
         if SNOW_DAYS_ENABLE:
             log(f"snow-day counts (2026-11-14): {','.join(sorted(SNOW_DAYS_SERIES))}"
                 + (" + any SNOW series on its contract" if SNOW_DAYS_AUTO else "")

@@ -51681,3 +51681,84 @@ class TestNamedEvents(unittest.TestCase):
                                  (None, None))
                 with mock.patch.object(imm, "NAMED_EVENTS_ENABLE", False):
                     self.assertEqual(bot._lead_source(meta), "comp", t)   # (unnamed: its ladder)
+
+
+class TestNearTermElections(unittest.TestCase):
+    """NEAR-TERM ELECTIONS x3 FOR A WEEK (Jack 2026-11-26: "Yes, x3 for a
+    week")."""
+    NOW = datetime(2026, 11, 27, 0, 0, tzinfo=timezone.utc)
+
+    def _meta(self, t, series, cutoff):
+        return imm.MarketMeta(ticker=t, event_ticker=t.rsplit("-", 1)[0], series=series,
+                              dollars_per_day=50.0, program_end=None, target_size=1000.0,
+                              discount_factor=0.5, cutoff=cutoff, close_time=cutoff,
+                              mid_cents=40.0, spread_cents=6, volume=0.0)
+
+    def _ctx(self):
+        fam = {"KXKEELUNGMAYOR", "KXINDONESIAVP", "KXDPRESPRIMARY", "KXPRESRUN", "KXSTATELEG",
+               "KXRPRESPRIMARY", "KXFRENCHPRES", "KXLAMAYORMOV"}
+        st = contextlib.ExitStack()
+        st.enter_context(mock.patch.object(imm, "election_series", lambda s: s in fam))
+        st.enter_context(mock.patch.object(imm, "ens_series", lambda s: False))
+        st.enter_context(mock.patch.dict(imm.SERIES_OVERRIDES, {
+            s: imm.SeriesOverride(size_mult=imm.ELECTION_SIZE_MULT)
+            for s in fam - {"KXPRESRUN"}}))
+        st.enter_context(mock.patch.dict(imm.SERIES_OVERRIDES, {
+            "KXPRESRUN": imm.SeriesOverride(size_mult=6.0)}))
+        st.enter_context(mock.patch.dict(imm._near_election, {"series": frozenset()}))
+        st.enter_context(mock.patch.object(imm, "log", lambda *_a, **_k: None))
+        return st
+
+    def _metas(self):
+        d = lambda days: self.NOW + timedelta(days=days)   # noqa: E731
+        return [self._meta("KXKEELUNGMAYOR-26NOV28-WWEI", "KXKEELUNGMAYOR", d(1)),
+                self._meta("KXINDONESIAVP-27FEB01-SUGI", "KXINDONESIAVP", d(66)),
+                self._meta("KXDPRESPRIMARY-28-X", "KXDPRESPRIMARY", d(600)),
+                self._meta("KXPRESRUN-28-X", "KXPRESRUN", d(30)),
+                # a series with one far vote is not near-term
+                self._meta("KXSTATELEG-26DEC01A-1", "KXSTATELEG", d(5)),
+                self._meta("KXSTATELEG-28NOV07B-1", "KXSTATELEG", d(5)),
+                # the 2028 primaries: no vote date in the ticker, a near cutoff
+                self._meta("KXRPRESPRIMARY-28IA-X", "KXRPRESPRIMARY", d(5)),
+                # a year-only event, and a vote already past
+                self._meta("KXFRENCHPRES-27-X", "KXFRENCHPRES", d(5)),
+                self._meta("KXLAMAYORMOV-26NOV03-X", "KXLAMAYORMOV", d(5)),
+                self._meta("KXFOO-26DEC01-X", "KXFOO", d(3))]       # not an election
+
+    def test_the_near_term_family_members_and_no_other(self):
+        with self._ctx():
+            got = imm.near_election_refresh(self._metas(), self.NOW)
+            self.assertEqual(got, {"KXKEELUNGMAYOR", "KXINDONESIAVP"})
+            self.assertEqual(imm._near_election["series"], got)
+
+    def test_x3_in_place_of_the_family_x2_to_the_end_of_the_week(self):
+        self.assertEqual(imm.NEAR_ELECTION_SIZE_MULT, 3.0)
+        self.assertEqual(imm.ELECTION_SIZE_MULT, 2.0)
+        self.assertEqual(imm.NEAR_ELECTION_UNTIL,
+                         datetime(2026, 12, 4, 5, 0, tzinfo=timezone.utc))
+        with self._ctx():
+            base = imm.applied_mention_mult("KXKEELUNGMAYOR")
+            far = imm.applied_mention_mult("KXDPRESPRIMARY")
+            imm.near_election_refresh(self._metas(), self.NOW)
+            self.assertAlmostEqual(imm.applied_mention_mult("KXKEELUNGMAYOR"), base * 1.5)
+            self.assertAlmostEqual(imm.applied_mention_mult("KXDPRESPRIMARY"), far)
+            self.assertAlmostEqual(imm.applied_mention_mult("KXPRESRUN"),
+                                   imm.applied_mention_mult("KXPRESRUN"))
+            # the event caps scale with it (the same wire)
+            with mock.patch.object(imm, "time") as tm:
+                tm.time.return_value = imm.NEAR_ELECTION_UNTIL.timestamp() + 1
+                self.assertAlmostEqual(imm.applied_mention_mult("KXKEELUNGMAYOR"), base)
+            # past the week the refresh empties the set
+            self.assertEqual(imm.near_election_refresh(
+                self._metas(), imm.NEAR_ELECTION_UNTIL + timedelta(minutes=1)), frozenset())
+            self.assertAlmostEqual(imm.applied_mention_mult("KXKEELUNGMAYOR"), base)
+        # the kill switch
+        with self._ctx(), mock.patch.object(imm, "NEAR_ELECTION_SIZE_MULT", 0.0):
+            self.assertEqual(imm.near_election_refresh(self._metas(), self.NOW), frozenset())
+        for k in ("NEAR_ELECTION_SIZE_MULT", "NEAR_ELECTION_DAYS", "NEAR_ELECTION_UNTIL"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def test_the_refresh_builds_it(self):
+        import inspect
+        src = inspect.getsource(IncentiveMarketMaker.refresh_universe)
+        self.assertIn("near_election_refresh(metas + [mm for mm, _m in scan_metas], now_utc)", src)
