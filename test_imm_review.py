@@ -397,6 +397,49 @@ class CounterfactualTests(Base):
         self.assertEqual(fm["cost_7d"]["quoted_to_end"], {"pnl": 0.0, "fills": 0, "rest_avg": 0.0})
         self.assertEqual(fm["size_needed"]["<=2x"], 1)
 
+    def test_whole_day_from_every_hourly_scan(self):
+        # R-261124-24: the review adds up the day's archived gap scans, each scan
+        # standing for the time to the next (<= 2h; the first also since midnight)
+        s, _e = rv.et_bounds(DAY)
+        iso = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        A = {"event": "KXA-1", "series": "KXA", "n": 2, "n_est": 2, "pool": 100.0, "est": 24.0,
+             "reason": "screened: extreme_mid"}
+        B = {"event": "KXB-1", "series": "KXB", "n": 1, "n_est": 1, "pool": 200.0, "est": 48.0,
+             "reason": "not in allowlist"}
+        C = {"event": "KXC-1", "series": "KXC", "n": 3, "n_est": 0, "pool": 50.0, "est": None,
+             "reason": "blocklisted"}
+        by_u = defaultdict(list)
+        for ts, scan in ((s + 3600, [A, B, C]), (s + 3900, [A, C]), (s + 13 * 3600, [A, C])):
+            by_u[datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")].append(
+                {"ts": iso(ts), "source": "scan", "ctx": {}, "rows": scan})
+        for u, recs in by_u.items():
+            self.jsonl(f"gap_scans_{u}.jsonl", recs)
+        with open(os.path.join(rv.CACHE_DIR, "api_gaps.pkl"), "wb") as fh:      # the morning scan: A, C
+            pickle.dump({"at": 1.0, "val": {"rows": [dict(A), dict(C)], "ctx": {"unest_pool": 50}}}, fh)
+        cf = rv.sec_counterfactual(DAY)
+        wd = cf["whole_day"]
+        cover = 3900 + 7200 + 7200
+        self.assertEqual(wd["scans"], 3)
+        self.assertEqual(wd["covered_hours"], round(cover / 3600, 1))
+        top = {x["event"]: x for x in wd["top"]}
+        self.assertAlmostEqual(top["KXA-1"]["est_days"], round(24.0 * cover / 86400, 2))
+        self.assertAlmostEqual(top["KXB-1"]["est_days"], round(48.0 * 3900 / 86400, 2))
+        self.assertFalse(top["KXB-1"]["in_morning_scan"])
+        self.assertTrue(top["KXA-1"]["in_morning_scan"])
+        self.assertEqual(wd["ended_before_review"]["events"], 1)
+        self.assertEqual(wd["ended_before_review"]["top"][0]["event"], "KXB-1")
+        self.assertAlmostEqual(wd["unread_pool_days"], round(50.0 * cover / 86400, 2))
+        md = rv.render_evidence({"day": DAY.isoformat(), "window_et": ["a", "b"], "generated": 0,
+                                 "counterfactual": cf})
+        self.assertIn("THE WHOLE ET DAY", md)
+        self.assertIn("KXB-1 [not enrolled: not in allowlist]", md)
+        self.assertIn("ENDED BEFORE THE REVIEW", md)
+
+    def test_whole_day_without_an_archive_says_so(self):
+        wd = rv.sec_counterfactual(DAY)["whole_day"]
+        self.assertEqual(wd["scans"], 0)
+        self.assertIn("no gap_scans file", wd["note"])
+
     def test_reason_class(self):
         self.assertEqual(rv.reason_class("screened: extreme_mid, under payout floor"), "market screen")
         self.assertEqual(rv.reason_class("under payout floor, screened: x"), "economics")
@@ -611,6 +654,22 @@ class MoatTests(Base):
         self.assertAlmostEqual(sh["Fam KXAA"]["pool_cov"], 400.0)       # per cycle, 2 cycles
         self.assertNotIn("Fam KXBB", sh)
 
+    def test_a_rerun_for_an_old_day_reads_compressed_logs(self):
+        # R-261124-03: day files older than 35 days are .gz; a re-run for one reads the same
+        import imm_log_retention as ret
+        self._cycle_log(DAY, [(9, 0, "KXAAA-1-T1", 0.10, 100), (9, 1, "KXAAA-1-T1", 0.10, 100),
+                              (21, 0, "KXAAA-1-T1", 0.20, 100)])           # 21:00 ET is the next UTC day
+        snap = self.jsonl(f"selection_snapshot_{DAY.isoformat()}.jsonl", [{"ts": "x", "ticker": "KXAAA-1-T1"}])
+        share, times = rv.cycle_share(DAY), rv.cycle_times(DAY)
+        rows = list(rv._iter_jsonl(snap))
+        for name in os.listdir(self.status):
+            if name.startswith(("cycle_log_", "selection_snapshot_")):
+                self.assertEqual(ret.compress_file(os.path.join(self.status, name))["action"], "compressed")
+        self.assertFalse(os.path.exists(snap))
+        self.assertEqual((rv.cycle_share(DAY), rv.cycle_times(DAY)), (share, times))
+        self.assertEqual(list(rv._iter_jsonl(snap)), rows)
+        self.assertEqual(len(times), 3)
+
     def test_history_priors_and_edge_watch(self):
         # 28 days: KXGOOD steady; KXFADE's reward per $ resting halves in the last 7
         for i in range(28):
@@ -675,6 +734,41 @@ class MoatTests(Base):
                                  "share_ratio": None}]}}
         self.assertEqual(sr.edge_line(ev), "Elections pool share -35% (eroding); "
                                            "Rotten Tomatoes rewards per $1k resting +40% (strengthening)")
+
+
+class RetentionStatusTests(Base):
+    """R-261124-03: the evidence pack reports imm_log_retention's last run."""
+
+    def test_reads_last_run_and_the_manifest(self):
+        import time
+        self.assertEqual(rv.retention_status(), {"present": False})
+        rdir = os.path.join(self.status, "retention")
+        os.makedirs(rdir)
+        now = time.time()
+        with open(os.path.join(rdir, "last_run.json"), "w") as fh:
+            json.dump({"ts": datetime.fromtimestamp(now - 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "mode": "apply", "compressed": 2, "in_gb": 1.5, "freed_gb": 1.2, "remaining": 3,
+                       "remaining_gb": 4.0, "held": 1, "held_reasons": {"ET day not in the day archive": 1},
+                       "failed": [{"file": "orders_2026-10-01.jsonl", "reason": "verify failed"}],
+                       "conflicts": []}, fh)
+        with open(os.path.join(rdir, "manifest.jsonl"), "w") as fh:
+            for r in ({"action": "compressed", "size": 1000, "gz_size": 100},
+                      {"action": "removed_plain", "size": 500},
+                      {"action": "failed", "size": 7},
+                      {"action": "restored", "size": 1000}):
+                fh.write(json.dumps(r) + "\n")
+        rt = rv.retention_status(now=now)
+        self.assertEqual((rt["mode"], rt["compressed"], rt["age_h"]), ("apply", 2, 1.0))
+        self.assertEqual((rt["lifetime_files"], rt["lifetime_restored"]), (2, 1))
+        md = rv.render_evidence({"day": DAY.isoformat(), "window_et": ["a", "b"], "generated": now,
+                                 "system": {"retention": rt}})
+        self.assertIn("Log retention (imm_log_retention, R-261124-03)", md)
+        self.assertIn("2 files compressed (1.5 GB in), 1.2 GB freed", md)
+        self.assertIn("Log retention FAILURES", md)
+        self.assertNotIn("STALE", md)
+        md0 = rv.render_evidence({"day": DAY.isoformat(), "window_et": ["a", "b"], "generated": now,
+                                  "system": {"retention": {"present": False}}})
+        self.assertIn("Log retention: no run yet", md0)
 
 
 class MeasureTests(Base):

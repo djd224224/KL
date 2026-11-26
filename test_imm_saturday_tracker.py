@@ -648,6 +648,30 @@ class CycleCacheTests(unittest.TestCase):
         self.assertEqual(self._cycles(monday), 49)
         self.assertEqual(self.parse.call_count, 2)
 
+    def test_a_compressed_log_reads_the_same_and_keeps_its_cache(self):
+        # R-261124-03: imm_log_retention gzips a log in place once it is 35 days old
+        import shutil
+        import imm_log_retention as ret
+        self._append(range(24), _utc(2026, 9, 29, 23, 59))
+        monday = _utc(2026, 11, 5, 11, 40)
+        first = sat.load_cycle_data(self.DAY, now=monday.timestamp())     # parsed from the plain log
+        cached = sat.load_cycle_data(self.DAY, now=monday.timestamp())
+        self.assertEqual(self.parse.call_count, 1)
+        self.assertEqual(ret.compress_file(self.path)["action"], "compressed")
+        self.assertFalse(os.path.exists(self.path))
+        after = sat.load_cycle_data(self.DAY, now=monday.timestamp())
+        self.assertEqual(self.parse.call_count, 1)                         # same sig: still the cache
+        for a, b in zip(cached[:2], after[:2]):
+            pd.testing.assert_frame_equal(a, b)
+        self.assertEqual(cached[2], after[2])
+        shutil.rmtree(sat.CACHE_DIR)
+        cold = sat.load_cycle_data(self.DAY, now=monday.timestamp())       # parses the .gz itself
+        self.assertEqual(self.parse.call_count, 2)
+        for a, b in zip(first[:2], cold[:2]):
+            pd.testing.assert_frame_equal(a, b)
+        self.assertEqual(first[2], cold[2])
+        self.assertEqual(int(cold[1]["n_cycles"].sum()), 48)
+
     def test_complete_once_its_day_is_over_and_the_log_has_settled(self):
         end = _utc(2026, 9, 30).timestamp()
         last = {"mtime_ns": int((end - 30) * 1e9)}                    # last write 23:59:30Z

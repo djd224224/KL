@@ -206,6 +206,59 @@ class TestPerPeriodFloor(unittest.TestCase):
         self.assertEqual(rec._scan_cycle_log.__defaults__, (None,))
 
 
+class TestCompressedCycleLogs(unittest.TestCase):
+    """R-261124-03: imm_log_retention gzips cycle logs older than 35 days in
+    place. The estimates must read them the same, and the per-file caches
+    must carry over (a rescan of every old day would cost the 7:00 jobs
+    minutes)."""
+
+    def setUp(self):
+        import time
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        for name, val in (("STATUS_DIR", d), ("EST_CACHE", os.path.join(d, "reward_est_cache.json")),
+                          ("HOURLY_CACHE", os.path.join(d, "reward_est_hourly_cache.json"))):
+            p = mock.patch.object(rec, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        self.paths = []
+        for day, frac in (("2026-10-01", 0.1), ("2026-10-02", 0.2)):
+            path = os.path.join(d, f"cycle_log_{day}.csv")
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write("ts,ticker,a,b,c,d,e,est_frac,sides,f,g,pool,h\n")
+                for ts in ("10:59:00", "10:59:30", "11:00:00", "11:00:30"):
+                    f.write(f"{day}T{ts}Z,KXA-26OCT27-T1,0,0,0,0,0,{frac},2,0,0,86400,0\n")
+            old = time.time() - 40 * 86400
+            os.utime(path, (old, old))
+            self.paths.append(path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _both(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            est = rec.rebuild_estimates()
+            hourly = rec.rebuild_hourly()
+        return est, hourly, out.getvalue()
+
+    def test_a_compressed_day_reads_the_same_and_is_not_rescanned(self):
+        import imm_log_retention as ret
+        est0, hr0, log0 = self._both()
+        self.assertIn("scanned cycle_log_2026-10-01.csv", log0)
+        self.assertAlmostEqual(est0["KXA-26OCT27-T1"]["est"], 27.0)      # 9 + 18
+        self.assertEqual(ret.compress_file(self.paths[0])["action"], "compressed")
+        self.assertFalse(os.path.exists(self.paths[0]))
+        est1, hr1, log1 = self._both()
+        self.assertEqual((est1, hr1), (est0, hr0))
+        self.assertNotIn("scanned", log1)                    # both caches carried over
+        os.remove(rec.EST_CACHE)
+        os.remove(rec.HOURLY_CACHE)
+        est2, hr2, log2 = self._both()                       # a cold cache reads the .gz itself
+        self.assertEqual((est2, hr2), (est0, hr0))
+        self.assertIn("scanned cycle_log_2026-10-01.csv", log2)
+
+
 def _h(iso):
     """UTC hour index of an ISO time (the hourly cache's key)."""
     from datetime import datetime as _dt

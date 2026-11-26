@@ -91,6 +91,11 @@ import traceback
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
+# Day files older than 35 days are gzip-compressed in place by
+# imm_log_retention.py (R-261124-03): day_files lists both forms and the
+# readers below open either, so a backfill still sees the old days.
+import imm_logfiles
+
 try:
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
@@ -1509,14 +1514,9 @@ class FileCache:
 
 
 def day_files(prefix: str, ext: str, first_day: str):
-    """[(utc_day, path)] for STATUS_DIR/<prefix>_<YYYY-MM-DD>.<ext>, sorted,
-    from `first_day` on."""
-    out = []
-    for p in glob.glob(os.path.join(STATUS_DIR, f"{prefix}_*.{ext}")):
-        m = re.search(r"_(\d{4}-\d{2}-\d{2})\." + re.escape(ext) + "$", p)
-        if m and m.group(1) >= first_day and (DAY_FILES_LAST is None or m.group(1) <= DAY_FILES_LAST):
-            out.append((m.group(1), p))
-    return sorted(out)
+    """[(utc_day, path)] for STATUS_DIR/<prefix>_<YYYY-MM-DD>.<ext>, or its
+    .gz once imm_log_retention compressed it, sorted, from `first_day` on."""
+    return imm_logfiles.day_files(STATUS_DIR, prefix, ext, first_day, DAY_FILES_LAST)
 
 
 def _utc_day_start(day: str) -> float:
@@ -1535,7 +1535,7 @@ def file_complete(day: str, path: str, now: float) -> bool:
 
 def iter_jsonl(path: str):
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
+        with imm_logfiles.open_text(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -1617,7 +1617,7 @@ def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT,
                 rs[tkr].setdefault(hour, int(ts))
 
     try:
-        f = open(path, newline="", encoding="utf-8", errors="replace")
+        f = imm_logfiles.open_text(path, newline="", encoding="utf-8", errors="replace")
     except OSError:
         return {"hourly": {}, "rest": {}, "cycles": [], "runs": {}, "last": {}, "fine": {},
                 "rs": {}}
@@ -2005,13 +2005,13 @@ def read_last_snapshot(prefix: str = "selection_snapshot"):
     files = day_files(prefix, "jsonl", "2000-01-01")
     for _d, path in reversed(files[-2:]):
         try:
-            size = os.path.getsize(path)
+            size = imm_logfiles.orig_size(path)
         except OSError:
             continue
         span = 8 << 20
         while True:
             start = max(0, size - span)
-            with open(path, "rb") as f:
+            with imm_logfiles.open_bin(path) as f:
                 f.seek(start)
                 blob = f.read()
             lines = blob.split(b"\n")

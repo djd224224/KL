@@ -153,6 +153,13 @@ BATCH_BOOKS = os.environ.get("IMM_GAPS_BATCH_BOOKS", "1") != "0"
 BATCH_SIZE = 100
 MAX_BOOK_CALLS = int(os.environ.get("IMM_GAPS_MAX_BOOK_CALLS", "60"))
 MAX_DETAIL_MARKETS_BATCH = int(os.environ.get("IMM_GAPS_MAX_DETAILS_BATCH", "6000"))
+# WHOLE-DAY ARCHIVE (review R-261124-24, Jack 2026-11-25: "Push and archive"): every
+# scan's event rows go to STATUS_DIR/gap_scans_<UTC date>.jsonl, one compact line a
+# scan (~100 KB; ~3 MB a day at the dashboard's hourly cadence), so the 04:30 review
+# adds up the whole ET day -- a one-day program that ended before 04:30 is gone from
+# the morning scan. IMM_GAPS_ARCHIVE=0 stops it.
+ARCHIVE_SCANS = os.environ.get("IMM_GAPS_ARCHIVE", "1") != "0"
+ARCHIVE_DIR = os.environ.get("IMM_GAPS_ARCHIVE_DIR") or imm.STATUS_DIR
 
 # _screen verdicts that mean "genuinely unquotable now" — excluded entirely
 # rather than listed as opportunities (matches STICKY_DEATH_REASONS + no_target).
@@ -290,6 +297,36 @@ def fetch_books(client, tickers) -> dict:
         if t:
             out[t] = {k: v for k, v in it.items() if k != "ticker"}
     return out
+
+
+def archive_scan(event_rows, ctx: dict, now_utc: datetime, source: str = "scan", path_dir: str = None):
+    """Append one scan (its event rows and scalar ctx) to gap_scans_<UTC date>.jsonl
+    as a single line; returns the path, or None when off or the write failed (a
+    failed write never fails the scan)."""
+    if not ARCHIVE_SCANS:
+        return None
+    d = path_dir or ARCHIVE_DIR
+    path = os.path.join(d, f"gap_scans_{now_utc:%Y-%m-%d}.jsonl")
+    rows = []
+    for r in event_rows:
+        end = r.get("end")
+        rows.append({"event": r["event"], "series": r["series"], "n": r["n"], "n_est": r["n_est"],
+                     "pool": round(_f(r["pool"]), 2),
+                     "est": round(r["est"], 3) if r.get("est") is not None else None,
+                     "yld": round(r["yld"], 4) if r.get("yld") is not None else None,
+                     "reason": r.get("reason") or "",
+                     "end": end.timestamp() if hasattr(end, "timestamp") else end})
+    line = json.dumps({"ts": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "source": source,
+                       "ctx": {k: v for k, v in ctx.items() if isinstance(v, (int, float, str, bool))},
+                       "rows": rows}, separators=(",", ":"))
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError as e:
+        log(f"! [GAPS] scan archive write failed ({e})")
+        return None
+    return path
 
 
 def _estimate_row(bot, r: dict) -> None:
@@ -549,10 +586,11 @@ def scan_gap_label(bot, t: str, now_utc: datetime, meta=None) -> str:
     return "screens pending"
 
 
-def classify_and_estimate(client, bot, now_utc: datetime):
+def classify_and_estimate(client, bot, now_utc: datetime, archive_source: str = "scan"):
     """Returns (event_rows, ctx). Walks every live-program market the bot is
     not currently quoting, classifies why, and estimates what the bot's
-    standard ladder would earn there (bounded book reads)."""
+    standard ladder would earn there (bounded book reads). Each scan is
+    appended to the whole-day archive (archive_scan)."""
     now_ts = now_utc.timestamp()
     # Same hot-reload the bot does each refresh: overrides + auto-enrolled
     # series + rain fairs + the AS test's daily picks (2026-10-27).
@@ -824,6 +862,7 @@ def classify_and_estimate(client, bot, now_utc: datetime):
         ctx["heartbeat_stale"] = age_min > 30
     except ValueError:
         pass
+    archive_scan(event_rows, ctx, now_utc, source=archive_source)
     return event_rows, ctx
 
 
@@ -906,7 +945,7 @@ def build_report(now_utc: datetime):
     """Returns (plain_text, html, subject)."""
     client = imm.build_client()
     bot = imm.IncentiveMarketMaker(client, live=False)
-    event_rows, ctx = classify_and_estimate(client, bot, now_utc)
+    event_rows, ctx = classify_and_estimate(client, bot, now_utc, archive_source="email")
     ovr_tallies, ovr_act, ovr_info, ovr_warn = load_overrides_runs(now_utc)
     ovr_act = list(ovr_act or []) + config_gap_lines(now_utc)
     # The PICK-OFF WINDOWS block (imm_pickoff) is out of this email (Jack

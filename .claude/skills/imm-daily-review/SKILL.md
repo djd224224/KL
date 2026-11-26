@@ -106,6 +106,9 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 - **Not enrolled with a real pool:** read the imm_unquoted call. An ADD or ADD WITH CARE whose tape makers are at or above zero and whose x1 clears $5/day is an enrollment suggestion. Name the file (extra_allow_series.json) and the cutoff rule it needs.
 - **Config gaps** (fail-closed, missing verified dates): list them. If two sources settle the date in minutes, put both in the plan; the row is written in apply mode with `imm_rows.py`.
 - **Capacity / economics / deliberate with a sizeable estimate:** ask whether the rule still earns its keep. Deliberate blocks get re-litigated only weekly, or when a new pool is large.
+- **The whole day:** rank misses by `counterfactual.whole_day.top` when it is there (R-261124-24): it gives the modelled $ over the ET day from every hourly gap scan, netted by family tax.
+  - The morning list (`top_estimated`) sees only what is unquoted at 04:30. `whole_day.ended_before_review` holds the pools that lived and ended during the day.
+  - The archive starts 11/25, so the first full day is in the 11/27 review.
 - **Unmeasured pool:** use `counterfactual.unmeasured` (R-261124-21), never the gap scan's raw `unest_pool`. Most of what the gap scan leaves unread is estimated elsewhere: the not-enrolled scan scores each series outside the allowlist, and the bot estimates every allowed candidate each hour. Report only what nothing reads, with the part blocked on purpose split out. Putting a price on a block is Jack's decision to make, not a blind spot.
 - **Before calling anything "dark", "misread" or "not quoted", confirm it in the bot's own sinks.** Check that the market or event is absent from `selection_snapshot_<utc>.jsonl` (or decided `cutoff` there), and that it earned nothing in `dashboard/cache/day_archive` while it was live. A local import of incentive_mm does NOT reproduce the running bot: family rules register at runtime through `globals().get(...)` hooks and reload files (crypto-open / FX-event / Vercel / rain-day series). The first run (11/25) called 13 events "dark" from an offline sweep. The live bot had quoted all of them, and 12 were already finalized (R-261124-01, closed as a false positive).
 - **Floor misses** (periods that closed under $1 of accrual): use `floor_misses.split`, `wave_forced`, `cost_7d` and `size_needed` (R-261124-23).
@@ -129,6 +132,12 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   For uncommitted files, raise only the ones untouched for 24h+ (`dirty_stale_24h`), naming the commit they belong in. An edit made today is probably a session at work: committing it would sweep up that session's in-flight hunks (the 9/09 incident). The plan for a stale file is to commit exactly those paths in the live tree after their own tests pass, then push at once.
 - **Check the claim, not the label.** The first run called the 429 balance skip a "$1 payout floor" check when it is the account-value halt (`_check_balance_floor`). Read the emitting code before naming what a log line means.
 - **(f)** Machine: days-to-full under 60 is P1, under 21 is P0; research token older than 330 days is P1; memory pressure.
+  - Log retention (the evidence's "Log retention" line; `imm_log_retention.py`, R-261124-03) is P1 when any of these hold:
+    - a file failed or a .gz conflicted (the original is kept, so nothing is lost, but the backlog stops);
+    - the mode is `refused` (a reader lost its .gz support);
+    - the run is STALE (no run in 30 h).
+  - A dry run before 11/27 is expected.
+  - Old days are `.gz` past 35 days: read them through `imm_logfiles`, never a plain glob.
 - **(g)** Data health: MISSING or LOW sinks; sinks not in IMM_LOGGING.md (a docs finding).
 - **(h)** Code review of D's commits that touch incentive_mm.py, biggest first: `git show <sha> -- incentive_mm.py`. Look for:
   - logic errors, inverted conditions, units (cents vs dollars, contracts vs $);
