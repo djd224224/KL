@@ -11206,3 +11206,37 @@ Jack: "KXBRFINMIN-26OCT25, KXBRDEFMIN-26OCT25 should be autoquoting due to elect
   ...and "dont trade 57, 58" -> both in ENS_SKIP_MARKETS.
 - 2026-11-04 02:23Z (Jack): "'51' still quoting. block it" -> the comp hedge (lock) legs ignored blocks: a 50 fill's legs sold
   51 at 98c (02:16, 02:19; cancelled, no fill). Now a leg on a _blocked market is never priced and a working one is pulled.
+
+## 2026-11-25 — VERCEL FAIR BLEND: the Vercel gate, edge, leads and closes read mid + w (fair - mid) (Jack)
+
+Jack: "Yes, build the blend", after "if the book is more right than our fair, should being close-to-our-fair be
+the guideline on whether to quote a vercel market but then we rest based on the book?".
+
+- **Evidence** (KL-data/vercel-logger/analysis-2026-11-25-deepvreq; today's vercel_fair replayed hourly from D-4 to the
+  cutoff on every settled event since 9/28, scored against the logger's book mid; the replay reproduces the live fair,
+  median 0.0c over 263 logged fairs): the book beat our fair on KXDEEPVREQ (Brier 0.180 vs 0.192, 27 events); our fair
+  beat the book on the other six lab series. On the strikes the gate reads (model 5-95c, two-sided books) the outcome
+  travelled w of the way from the mid toward the fair: DEEPVREQ 0.26, ANTHVSPEND 0.49, GOOGVREQ 0.63, ANTHVREQ 0.73,
+  MOONVSPEND 0.79, OPENVREQ 0.87, OPENVSPEND 0.92; the blend scored at least as well as both on every series. A decided
+  model (over 95c / under 5c) was right ~100% while the mid sat ~75c / ~22c, so "decided" keeps the model's read.
+- **Code** (incentive_mm.py, VERCEL FAIR BLEND): `vercel_blend_c` / `vercel_blend_weight` / `load_vercel_blend`;
+  `vercel_gate_reason`'s band, `vercel_bid_edge_reason`, `vercel_fair_c` (FAIR LEAD, FAIR CLOSE, the WS fast cancel's
+  model rungs) read the blend with the external two-sided mid (one-sided / empty book: the model). The WS check has no
+  cycle book: it uses the mid the cycle last recorded (`VERCEL_BLEND_MID_TTL_SECS` 180). Weights: `VERCEL_BLEND_FILE`
+  (run-logs/incentive-mm/vercel_blend.json, hot-reloaded), else `VERCEL_BLEND_DEFAULT_W` (the 11/25 fit), else 1 (the
+  open-weights shares and discovered series). Kill switch `IMM_VERCEL_BLEND=0`. Guard-skip inputs carry `model` and `w`.
+- **Refit** `vercel_blend_fit.py` (60-day window of D, >= 12 events, w clipped to [0, 1], a failed Kalshi read keeps
+  the series' previous entry; `--dry` prints only). Task "KL vercel-blend-fit" daily 10:40 local (D settles ~14:00Z
+  D+1). Recreate:
+```powershell
+$arg = '/c "set PYTHONPATH=C:\Users\jackd\AppData\Roaming\Python\Python312\site-packages&& "C:\Users\jackd\AppData\Local\Programs\Python\Python312\python.exe" "C:\Users\jackd\Documents\KL\vercel_blend_fit.py" >> "C:\Users\jackd\Documents\KL\run-logs\incentive-mm\vercel-blend-fit-task.log" 2>&1"'
+Register-ScheduledTask -TaskName 'KL vercel-blend-fit' -Force `
+  -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $arg -WorkingDirectory 'C:\Users\jackd\Documents\KL') `
+  -Trigger (New-ScheduledTaskTrigger -Daily -At '10:40AM') `
+  -Principal (New-ScheduledTaskPrincipal -UserId 'jackd' -LogonType Interactive -RunLevel Limited) `
+  -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2))
+```
+- **Not fixed by it:** the model itself. DEEPVREQ's level-space weekday term overshoots both ways (weekend medians
+  +1.2 pp high, weekday -1.1 pp low); the blend shrinks what that costs, it does not correct it (log space for
+  DEEPVREQ scored 0.182 in the replay; not built). The w are in-sample on 24-27 events; DEEPVREQ's 90% band is
+  0.03-0.55. The logger's touch includes thin placeholder quotes.

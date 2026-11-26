@@ -15390,6 +15390,8 @@ _CONFIG_CODE_KNOBS = (
     # no YES bid under a touch over the fair less 3c, lab series (2026-11-23)
     "VERCEL_BID_EDGE", "VERCEL_BID_EDGE_C",
     "VERCEL_ASKS_ONLY_SERIES",    # series quoting asks only (2026-11-24)
+    # the model fair blended with the book's mid (2026-11-25)
+    "VERCEL_BLEND", "VERCEL_BLEND_DEFAULT_W", "VERCEL_BLEND_MID_TTL_SECS",
     "VERCEL_FAIR_HOLD_MIN", "VERCEL_FAIR_REFRESH_SECS",
     "VERCEL_RUN_TTL_MIN", "VERCEL_RUN_ANCHOR",
     "VERCEL_SIZE_MULT",           # the family x2 (2026-10-09)
@@ -21846,17 +21848,31 @@ def vercel_gate_reason(ticker: str, now_ts: float,
     p = vercel_fair_p(e, k)
     x_lbl = f"{'running' if run else 'X_L'} {e['x_l']:.2f}"
     if p < VERCEL_FAIR_MIN_P or p > 1.0 - VERCEL_FAIR_MIN_P:
+        # "decided" reads the MODEL's own fair, never the blend (VERCEL FAIR
+        # BLEND: on these strikes the model was right ~100% of the time)
         return (f"decided: fair {p * 100:.0f}c ({x_lbl} vs K {k:g})",
                 {"reason": "decided", "fair": round(p * 100, 2)})
-    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, p * 100.0,
-                                        VERCEL_FAIR_TOL_CENTS, p * 100.0)
+    fair_c = p * 100.0
+    blend: dict = {}
+    if ext_bid is not None or ext_ask is not None:
+        # VERCEL FAIR BLEND: the band reads the model fair blended with the
+        # book's external two-sided mid (that mid recorded for the WS check)
+        fb = vercel_blend_c(ticker, fair_c, now_ts, (ext_bid, ext_ask))
+        if fb != fair_c:
+            blend = {"model": round(fair_c, 2),
+                     "w": round(vercel_blend_weight(series_of(ticker)), 3)}
+            fair_c = fb
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair_c,
+                                        VERCEL_FAIR_TOL_CENTS, fair_c)
     if bid_bad or ask_bad:
-        return (f"book {ext_bid}x{ext_ask} vs fair {p * 100:.0f}c (tol "
+        b_lbl = (f" (the {blend['model']:.0f}c model blended with the book's "
+                 f"mid, w {blend['w']:g})" if blend else "")
+        return (f"book {ext_bid}x{ext_ask} vs fair {fair_c:.0f}c{b_lbl} (tol "
                 f"{VERCEL_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
                 f"{x_lbl} vs K {k:g})",
-                {"reason": "band", "fair": round(p * 100, 2),
-                 "tol": VERCEL_FAIR_TOL_CENTS, "bid_bad": bid_bad,
-                 "ask_bad": ask_bad})
+                dict({"reason": "band", "fair": round(fair_c, 2),
+                      "tol": VERCEL_FAIR_TOL_CENTS, "bid_bad": bid_bad,
+                      "ask_bad": ask_bad}, **blend))
     return "", {}
 
 
@@ -21988,6 +22004,144 @@ VERCEL_ASKS_ONLY_SERIES: Tuple[str, ...] = tuple(sorted(
     s.strip() for s in os.environ.get("IMM_VERCEL_ASKS_ONLY_SERIES", "").split(",")
     if s.strip()))
 
+# VERCEL FAIR BLEND (Jack 2026-11-25: "Yes, build the blend", on "have the gate
+# and the leads read a blended price per series ... refitting them on new
+# settled events", after "if the book is more right than our fair, should
+# being close-to-our-fair be the guideline on whether to quote a vercel market
+# but then we rest based on the book?"). The 11/25 replay of today's
+# vercel_fair, hourly from D-4 to the cutoff on every settled event since 9/28
+# against the logger's book mid (KL-data/vercel-logger/analysis-2026-11-25-
+# deepvreq; it reproduces the live fair, median 0.0c): the book beat our fair
+# on KXDEEPVREQ (Brier 0.180 vs 0.192, 27 events) and our fair beat the book
+# on the other lab series -- but nowhere did the outcome land ON the fair.
+# Regressing (outcome - mid) on (fair - mid) over the strikes the gate reads
+# (model 5-95c, two-sided books), the outcome travelled w of the way from the
+# mid toward the fair: KXDEEPVREQ 0.26 (90% 0.03-0.55), KXANTHVSPEND 0.49,
+# KXGOOGVREQ 0.63, KXANTHVREQ 0.73, KXMOONVSPEND 0.79, KXOPENVREQ 0.87,
+# KXOPENVSPEND 0.92, and mid + w (fair - mid) scored at least as well as both
+# on every one (KXDEEPVREQ 0.179 vs the book's 0.183 and the fair's 0.195).
+# The fair still points the right way where it loses: on KXDEEPVREQ a fair
+# 15c+ over the mid settled +7c over the mid, 15c+ under it -5c; and the
+# family's adding fills 3c+ on the good side of the fair made +$473, the
+# wrong side -$435. Now the gate's band (VERCEL_FAIR_TOL_CENTS), the fair's
+# edge (VERCEL BIDS UNDER THE FAIR), a FAIR LEAD (and its disagreement guard)
+# and a FAIR CLOSE read the BLEND of the market's model fair with its external
+# two-sided mid. "Decided" keeps the model's own read: there the model was
+# right -- a fair over 95c settled YES 95-100% on five of seven series (the
+# mid ~75c), under 5c settled NO 98-100% (the mid ~22c). A one-sided or empty
+# book has no mid: the model fair stands. w is VERCEL_BLEND_FILE's, which
+# vercel_blend_fit.py rewrites daily (task KL vercel-blend-fit) from the
+# events settled in its window; a series it does not carry takes
+# VERCEL_BLEND_DEFAULT_W (the 11/25 fit), and one in neither -- the
+# open-weights shares, whose chart-based fair the logger cannot replay, and
+# discovered series without the events -- keeps w = 1, the model fair. The
+# WS fast cancel, which has no cycle book, judges a lead or close against the
+# blend with the mid the cycle last recorded (within
+# VERCEL_BLEND_MID_TTL_SECS): the one it was priced off.
+# IMM_VERCEL_BLEND=0 restores the model fair everywhere (env => task-level
+# restart).
+VERCEL_BLEND = os.environ.get("IMM_VERCEL_BLEND", "1") == "1"
+VERCEL_BLEND_FILE = os.environ.get(
+    "IMM_VERCEL_BLEND_FILE", os.path.join(STATUS_DIR, "vercel_blend.json"))
+VERCEL_BLEND_DEFAULT_W: Dict[str, float] = {
+    "KXDEEPVREQ": 0.26, "KXANTHVSPEND": 0.49, "KXGOOGVREQ": 0.63,
+    "KXANTHVREQ": 0.73, "KXMOONVSPEND": 0.79, "KXOPENVREQ": 0.87,
+    "KXOPENVSPEND": 0.92}
+VERCEL_BLEND_MID_TTL_SECS = _env_float("IMM_VERCEL_BLEND_MID_TTL_SECS", 180.0)
+# the file's weights by series, its mtime and fit stamp; ticker -> (mid, ts)
+_vercel_blend_state: dict = {"mtime": 0.0, "w": {}, "at": None, "mid": {}}
+
+
+def load_vercel_blend() -> int:
+    """Hot-reload VERCEL_BLEND_FILE by mtime (VERCEL FAIR BLEND): the number
+    of series weights loaded on a reload, 0 when unchanged or absent, -1 when
+    unreadable (the weights in hand stay)."""
+    try:
+        mtime = os.path.getmtime(VERCEL_BLEND_FILE)
+    except OSError:
+        return 0
+    if mtime == _vercel_blend_state["mtime"]:
+        return 0
+    _vercel_blend_state["mtime"] = mtime
+    try:
+        with open(VERCEL_BLEND_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+        w: Dict[str, float] = {}
+        for s, e in (data.get("series") or {}).items():
+            try:
+                v = float(e["w"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(v):
+                w[str(s)] = min(max(v, 0.0), 1.0)
+        at = data.get("at")
+    except (OSError, ValueError, AttributeError) as e:
+        log(f"[IMM] ! vercel blend file unreadable: {e}")
+        return -1
+    _vercel_blend_state["w"] = w
+    _vercel_blend_state["at"] = at
+    return len(w)
+
+
+def vercel_blend_weight(series: str) -> float:
+    """w of `series`'s VERCEL FAIR BLEND: its VERCEL_BLEND_FILE weight, else
+    VERCEL_BLEND_DEFAULT_W's, else 1 (the model fair); 1 with the blend off."""
+    if not VERCEL_BLEND:
+        return 1.0
+    w = _vercel_blend_state["w"].get(series)
+    if w is None:
+        w = VERCEL_BLEND_DEFAULT_W.get(series, 1.0)
+    return min(max(float(w), 0.0), 1.0)
+
+
+def vercel_blend_desc() -> str:
+    """The weights in force, for the log: 'KXDEEPVREQ 0.26 (file), ...'."""
+    if not VERCEL_BLEND:
+        return "off (IMM_VERCEL_BLEND=0)"
+    names = sorted(set(VERCEL_BLEND_DEFAULT_W) | set(_vercel_blend_state["w"]))
+    return ", ".join(
+        f"{s} {vercel_blend_weight(s):.2f}"
+        + ("" if s in _vercel_blend_state["w"] else " (default)") for s in names)
+
+
+def vercel_blend_mid(ext_bid: Optional[float], ext_ask: Optional[float]
+                     ) -> Optional[float]:
+    """The external two-sided mid (YES cents) the blend reads, else None."""
+    if ext_bid is None or ext_ask is None:
+        return None
+    b, a = float(ext_bid), float(ext_ask)
+    if not 0.0 < b < a < 100.0:
+        return None
+    return (a + b) / 2.0
+
+
+def vercel_blend_c(ticker: str, fair_c: float, now_ts: float,
+                   book: Optional[Tuple[Optional[float], Optional[float]]] = None
+                   ) -> float:
+    """`ticker`'s VERCEL FAIR BLEND (YES cents): mid + w (fair_c - mid), mid
+    the external two-sided mid of `book` = (ext_bid, ext_ask) -- recorded as
+    the market's last -- or, with no book given, the last one recorded within
+    VERCEL_BLEND_MID_TTL_SECS. No mid, or w = 1: fair_c itself."""
+    mids = _vercel_blend_state["mid"]
+    if book is not None:
+        mid = vercel_blend_mid(*book)
+        if mid is None:
+            mids.pop(ticker, None)
+        else:
+            if len(mids) > 4000:            # forget the long-gone markets
+                for t in [t for t, v in mids.items()
+                          if now_ts - v[1] > VERCEL_BLEND_MID_TTL_SECS]:
+                    mids.pop(t, None)
+            mids[ticker] = (mid, now_ts)
+    else:
+        last = mids.get(ticker)
+        mid = (last[0] if last is not None
+               and now_ts - last[1] <= VERCEL_BLEND_MID_TTL_SECS else None)
+    w = vercel_blend_weight(series_of(ticker))
+    if mid is None or w >= 1.0:
+        return fair_c
+    return mid + w * (fair_c - mid)
+
 
 def vercel_asks_only_reason(ticker: str) -> str:
     """Why `ticker`'s bid side rests no rung (VERCEL ASKS ONLY), else ''."""
@@ -21998,16 +22152,19 @@ def vercel_asks_only_reason(ticker: str) -> str:
 
 
 def vercel_bid_edge_reason(ticker: str, now_ts: float, ext_bid: Optional[float],
-                           fair_c: Optional[float] = None) -> str:
+                           fair_c: Optional[float] = None,
+                           ext_ask: Optional[float] = None) -> str:
     """Why `ticker`'s bid side rests no rung (VERCEL BIDS UNDER THE FAIR),
     else '': a lab-series market whose external touch bid sits over its
-    Vercel fair (`fair_c`, else read as FAIR LEAD reads it) less
-    VERCEL_BID_EDGE_C. No touch bid or no fair: ''."""
+    Vercel fair (`fair_c`, else read as FAIR LEAD reads it: the VERCEL FAIR
+    BLEND with the book ext_bid x ext_ask) less VERCEL_BID_EDGE_C. No touch
+    bid or no fair: ''."""
     if not VERCEL_BID_EDGE or ext_bid is None \
             or not vercel_lab_series(series_of(ticker)):
         return ""
     if fair_c is None:
-        fair_c = vercel_fair_c(ticker, now_ts)
+        fair_c = vercel_fair_c(ticker, now_ts,
+                               (ext_bid, ext_ask) if ext_ask is not None else None)
         if fair_c is None:
             return ""
     bar = fair_c - VERCEL_BID_EDGE_C
@@ -22037,7 +22194,8 @@ def vercel_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
             off, rsn = vercel_tail_bid_reason(ticker, ext_bid, ext_ask), "tail_bid"
         if not off:
             off, rsn = vercel_bid_edge_reason(ticker, now_ts, ext_bid,
-                                              inp.get("fair")), "bid_edge"
+                                              inp.get("fair"),
+                                              ext_ask=ext_ask), "bid_edge"
         if off and inp.get("side_out") == "ask":
             # the asks out on the fair and the bids on the series, the tail
             # or the fair's edge: nothing left
@@ -22061,16 +22219,21 @@ def vercel_side_out(series: str, ticker: str, now_ts: float,
     return vercel_gate(ticker, now_ts, ext_bid, ext_ask, close_time)[1].get("side_out")
 
 
-def vercel_fair_c(ticker: str, now_ts: float) -> Optional[float]:
+def vercel_fair_c(ticker: str, now_ts: float,
+                  book: Optional[Tuple[Optional[float], Optional[float]]] = None
+                  ) -> Optional[float]:
     """`ticker`'s Vercel fair (YES cents) while the family's gate reads it --
     a fresh read, no new-anchor hold, before the measured day, not decided --
-    else None: FAIR LEAD's view of the family (the gate's book tests apart)."""
+    else None: FAIR LEAD's view of the family (the gate's book tests apart).
+    The VERCEL FAIR BLEND of the model with `book` = (ext_bid, ext_ask)'s
+    mid, or with no book given the mid the cycle last recorded."""
     if vercel_gate_reason(ticker, now_ts, None, None)[0]:
         return None
     ev, _, ks = ticker.rpartition("-")
     m = _VERCEL_STRIKE_RE.match(ks)
-    return vercel_fair_p(_vercel_state["entries"][ev],
-                         float(f"{m.group(1)}.{m.group(2) or 0}")) * 100.0
+    model = vercel_fair_p(_vercel_state["entries"][ev],
+                          float(f"{m.group(1)}.{m.group(2) or 0}")) * 100.0
+    return vercel_blend_c(ticker, model, now_ts, book)
 
 
 # ----------------------------------------------------------------------------
@@ -29062,11 +29225,15 @@ def fair_lead_series(series: str) -> bool:
             and in_fair_lead_series(series) and not home_lead_off(series))
 
 
-def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
+def fair_model_c(ticker: str, series: str, now_ts: float,
+                 book: Optional[Tuple[Optional[float], Optional[float]]] = None
+                 ) -> Optional[float]:
     """A FAIR_LEAD_SERIES market's model fair (YES cents) while its family's
     gate would still read it, else None: weekend rain's (rain_wknd_fair.py),
-    the Vercel family's (vercel_fair_c), the OpenRouter weekly's (or_fair_c)
-    or an ARRAY TAIL LEADS strike's shadow read as it is (ca_array_lead_p)."""
+    the Vercel family's (vercel_fair_c: its VERCEL FAIR BLEND with `book` =
+    the external (bid, ask), else the mid the cycle last recorded), the
+    OpenRouter weekly's (or_fair_c) or an ARRAY TAIL LEADS strike's shadow
+    read as it is (ca_array_lead_p). Only the Vercel family reads `book`."""
     if not in_fair_lead_series(series):
         return None
     if ca_array_lead_series(series):
@@ -29078,7 +29245,7 @@ def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
             return None
         return float(e["p"]) * 100.0
     if vercel_series(series):
-        return vercel_fair_c(ticker, now_ts)
+        return vercel_fair_c(ticker, now_ts, book)
     if or_fair_series(series):
         return or_fair_c(ticker, now_ts)
     if home_series(series):
@@ -29123,12 +29290,15 @@ def fair_model_label(series: str) -> str:
     return "its model fair"
 
 
-def fair_lead_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
+def fair_lead_fair_c(ticker: str, series: str, now_ts: float,
+                     book: Optional[Tuple[Optional[float], Optional[float]]] = None
+                     ) -> Optional[float]:
     """The fair (YES cents) `ticker` leads off, or None: its family's model
-    (fair_model_c) on a FAIR_LEAD_SERIES market, else its BOOK LEAD anchor."""
+    (fair_model_c, with `book` for a Vercel market's VERCEL FAIR BLEND) on a
+    FAIR_LEAD_SERIES market, else its BOOK LEAD anchor."""
     if not fair_lead_series(series):
         return book_lead_anchor(ticker, series, now_ts)
-    return fair_model_c(ticker, series, now_ts)
+    return fair_model_c(ticker, series, now_ts, book)
 
 
 # BOOK LEAD (Jack 2026-11-10: "build it live", after "are you casting a wide
@@ -29500,15 +29670,18 @@ FAIR_CLOSE_MODE = os.environ.get("IMM_FAIR_CLOSE", "on").strip().lower()
 FAIR_CLOSE_OVER_C = max(0, _env_int("IMM_FAIR_CLOSE_OVER_C", 1))
 
 
-def fair_close_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
+def fair_close_fair_c(ticker: str, series: str, now_ts: float,
+                      book: Optional[Tuple[Optional[float], Optional[float]]] = None
+                      ) -> Optional[float]:
     """The fair (YES cents) a FAIR_LEAD_SERIES market closes off, or None:
-    its family's while its gate would still read it (fair_model_c), under
-    FAIR_CLOSE_MODE's own switch (a lead switched off still closes); never
-    an ARRAY TAIL LEADS array's (fair_close_series)."""
+    its family's while its gate would still read it (fair_model_c, with
+    `book` for a Vercel market's VERCEL FAIR BLEND), under FAIR_CLOSE_MODE's
+    own switch (a lead switched off still closes); never an ARRAY TAIL LEADS
+    array's (fair_close_series)."""
     if FAIR_CLOSE_MODE not in ("on", "dry") or LADDER_MODE != "atref" \
             or not fair_close_series(series):
         return None
-    return fair_model_c(ticker, series, now_ts)
+    return fair_model_c(ticker, series, now_ts, book)
 
 
 def fair_close_group(yes_levels: List[List[float]], no_levels: List[List[float]],
@@ -37516,6 +37689,10 @@ class IncentiveMarketMaker:
         if _vc_moved:
             log(f"{self.tag} vercel-fair reloaded: {_vc_n} events, "
                 f"{_vc_moved} with a new anchor")
+        _vb_n = load_vercel_blend()        # VERCEL FAIR BLEND weights (2026-11-25)
+        if _vb_n > 0:
+            log(f"{self.tag} vercel blend weights reloaded (fit "
+                f"{_vercel_blend_state['at']}): {vercel_blend_desc()}")
         if YTW_ENABLE:
             load_ytw_fair()
         if YT1_ENABLE:
@@ -40157,7 +40334,9 @@ class IncentiveMarketMaker:
                                        meta.target_size, meta.discount_factor,
                                        hold_bid=held[0], hold_ask=held[1])
         if src == "fair":
-            fair_c = fair_lead_fair_c(t, meta.series, time.time())
+            # a Vercel market leads off its VERCEL FAIR BLEND with this book
+            fair_c = fair_lead_fair_c(t, meta.series, time.time(),
+                                      book=external_best(yes_ext, no_ext))
             if fair_c is None:
                 return None, None
             self._fair_gap_note(t, yes_ext, no_ext, fair_c)
@@ -45402,7 +45581,8 @@ class IncentiveMarketMaker:
             close_b = close_a = None
             close_n = 0
             _cpos = own_pos if coexist else pos
-            _cfair = (fair_close_fair_c(t, meta.series, now_ts)
+            _cfair = (fair_close_fair_c(t, meta.series, now_ts,
+                                        book=(ext_bid, ext_ask))
                       if abs(_cpos) >= 1 and not reduce_only and not _pub_out
                       and meta.price_step >= 0.01 else None)
             if _cfair is not None:
@@ -49977,6 +50157,7 @@ class IncentiveMarketMaker:
         else:
             log("quake gate: OFF -- KXBIGGESTQUAKE not enrolled")
         if VERCEL_ENABLE:
+            load_vercel_blend()           # the startup line names the weights in force
             log(f"vercel gate: {','.join(sorted(VERCEL_SERIES))} PRE-D only, "
                 f"size x{VERCEL_SIZE_MULT:g}, "
                 f"fail-closed, out {VERCEL_CUTOFF_BEFORE_D_MIN}m before the "
@@ -49996,6 +50177,10 @@ class IncentiveMarketMaker:
                    else "; bids over the fair's edge allowed (IMM_VERCEL_BID_EDGE=0)")
                 + (f"; asks only on {','.join(VERCEL_ASKS_ONLY_SERIES)}"
                    if VERCEL_ASKS_ONLY_SERIES else "")
+                + ("; the band, the fair's edge, leads and closes read the model "
+                   "blended with the book's mid, w: " + vercel_blend_desc()
+                   + f" (file {VERCEL_BLEND_FILE}; decided reads the model)"
+                   if VERCEL_BLEND else "; the model fair alone (IMM_VERCEL_BLEND=0)")
                 + f"), decided outside "
                 f"{VERCEL_FAIR_MIN_P * 100:g}-{100 - VERCEL_FAIR_MIN_P * 100:g}c, "
                 f"ttl {VERCEL_FAIR_TTL_MIN}m, hold {VERCEL_FAIR_HOLD_MIN:g}m, "

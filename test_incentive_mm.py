@@ -232,6 +232,9 @@ def setUpModule():
     # the Vercel pre-D fair file (2026-09-27) is read by every run_cycle
     imm.VERCEL_FAIR_FILE = os.path.join(tmp, "vercel_fair.json")
     imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
+    # ... and its blend weights (VERCEL FAIR BLEND, 2026-11-25): never the live file
+    imm.VERCEL_BLEND_FILE = os.path.join(tmp, "vercel_blend.json")
+    imm._vercel_blend_state.update(mtime=0.0, w={}, at=None, mid={})
     # the YouTube weekly pilot's fair file (2026-10-06) is read by every run_cycle
     imm.YTW_FAIR_FILE = os.path.join(tmp, "yt_weekly_fair.json")
     imm._ytw_state.update(mtime=0.0, entries={})
@@ -16482,6 +16485,8 @@ class TestVercelFloorBoost(unittest.TestCase):
         for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
                   mock.patch.object(imm, "LADDER_MODE", "atref"),
                   mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                  # the model fair (VERCEL FAIR BLEND is tested in TestVercelBlend)
+                  mock.patch.object(imm, "VERCEL_BLEND", False),
                   mock.patch.object(imm, "ADMIT_SUSTAIN_SECS", 0),
                   mock.patch.object(imm, "LEVELS", [(0, 20)]),
                   mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99),
@@ -24051,10 +24056,12 @@ class TestVercelPreDGate(unittest.TestCase):
         except FileNotFoundError:
             pass
         # the fixture book (49x51 against a 40c fair) bids over the fair's
-        # edge; VERCEL BIDS UNDER THE FAIR is tested apart (TestVercelBidEdge)
-        p = mock.patch.object(imm, "VERCEL_BID_EDGE", False)
-        p.start()
-        self.addCleanup(p.stop)
+        # edge; VERCEL BIDS UNDER THE FAIR is tested apart (TestVercelBidEdge),
+        # and so is VERCEL FAIR BLEND (TestVercelBlend): the model fair here
+        for p in (mock.patch.object(imm, "VERCEL_BID_EDGE", False),
+                  mock.patch.object(imm, "VERCEL_BLEND", False)):
+            p.start()
+            self.addCleanup(p.stop)
 
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
@@ -24519,6 +24526,10 @@ class TestVercelBidEdge(unittest.TestCase):
             os.remove(imm.VERCEL_FAIR_FILE)
         except FileNotFoundError:
             pass
+        # the rule on the model fair; VERCEL FAIR BLEND is TestVercelBlend's
+        p = mock.patch.object(imm, "VERCEL_BLEND", False)
+        p.start()
+        self.addCleanup(p.stop)
 
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
@@ -24674,6 +24685,254 @@ class TestVercelBidEdge(unittest.TestCase):
             bot._estimate_candidate_yield(meta, [])
             self.assertAlmostEqual(meta.est_frac, both / 2, places=6)
             self.assertAlmostEqual(meta.floor_dollars_per_day, floor_both / 2, places=6)
+
+
+class TestVercelBlend(unittest.TestCase):
+    """VERCEL FAIR BLEND (Jack 2026-11-25: "Yes, build the blend"): the Vercel
+    gate's band, the fair's edge, a FAIR LEAD and a FAIR CLOSE read
+    mid + w (fair - mid), the market's model fair blended with its external
+    two-sided mid, w per series (VERCEL_BLEND_FILE, else
+    VERCEL_BLEND_DEFAULT_W, else 1); "decided" reads the model. Fixture:
+    TestVercelBidEdge's far event on KXDEEPVREQ (w 0.26 by default); the
+    sample about X_L 20.0 prices T20 at 40c, 21.0 at 80c, 23.0 at 99c."""
+
+    T = "KXDEEPVREQ-05DEC68-T20"
+    EV = "KXDEEPVREQ-05DEC68"
+    CLOSE = datetime(2068, 12, 6, 3, 59, tzinfo=timezone.utc)
+    # TestVercelFairLead's walled book: touch 7x87, mid 47
+    YES = [[1, 1], [2, 100], [7, 6837]]
+    NO = [[1, 1], [2, 100], [3, 1], [13, 6490]]
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
+        self._reset()
+        self.addCleanup(self._reset)
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        for f in (imm.VERCEL_FAIR_FILE,):
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    @staticmethod
+    def _reset():
+        imm._vercel_blend_state.update(mtime=0.0, w={}, at=None, mid={})
+        try:
+            os.remove(imm.VERCEL_BLEND_FILE)
+        except FileNotFoundError:
+            pass
+
+    def _write(self, x_l=20.0):
+        entry = {"x_l": x_l, "errs": [-1.0, -0.5, 0.0, 0.5, 1.0] * 12,
+                 "last": "2068-12-03", "d": "2068-12-05", "h": 2, "n": 60,
+                 "series": "KXDEEPVREQ",
+                 "fetched_at": datetime.now(timezone.utc).isoformat()}
+        with open(imm.VERCEL_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {self.EV: entry}}, f)
+        os.utime(imm.VERCEL_FAIR_FILE, (time.time(), time.time() + 3000 + self._bump))
+        TestVercelBlend._bump += 1
+        return imm.load_vercel_fair()
+
+    def _weights(self, series, raw=None):
+        with open(imm.VERCEL_BLEND_FILE, "w", encoding="utf-8") as f:
+            f.write(raw if raw is not None else json.dumps(
+                {"at": "2026-11-25T15:30:00+00:00", "series": series}))
+        os.utime(imm.VERCEL_BLEND_FILE, (time.time(), time.time() + 3000 + self._bump))
+        TestVercelBlend._bump += 1
+        return imm.load_vercel_blend()
+
+    def test_armed_by_default_with_a_kill_switch(self):
+        self.assertTrue(imm.VERCEL_BLEND)
+        self.assertEqual(imm.VERCEL_BLEND_DEFAULT_W, {
+            "KXDEEPVREQ": 0.26, "KXANTHVSPEND": 0.49, "KXGOOGVREQ": 0.63,
+            "KXANTHVREQ": 0.73, "KXMOONVSPEND": 0.79, "KXOPENVREQ": 0.87,
+            "KXOPENVSPEND": 0.92})
+        for k in ("VERCEL_BLEND", "VERCEL_BLEND_DEFAULT_W", "VERCEL_BLEND_MID_TTL_SECS"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS, k)
+        self.assertEqual(imm.vercel_blend_weight("KXDEEPVREQ"), 0.26)
+        # the open-weights shares and a discovered series keep the model fair
+        self.assertEqual(imm.vercel_blend_weight("KXOPENSOURCESHARE"), 1.0)
+        self.assertEqual(imm.vercel_blend_weight("KXZAIVREQ"), 1.0)
+        with mock.patch.object(imm, "VERCEL_BLEND", False):
+            self.assertEqual(imm.vercel_blend_weight("KXDEEPVREQ"), 1.0)
+            self.assertIn("off", imm.vercel_blend_desc())
+
+    def test_the_weights_file(self):
+        self.assertEqual(imm.load_vercel_blend(), 0)              # none yet
+        n = self._weights({"KXDEEPVREQ": {"w": 0.4}, "KXOPENVREQ": {"w": 1.7},
+                           "KXGOOGVREQ": {"w": -0.2}, "KXANTHVREQ": {"lo": 0.1},
+                           "KXMOONVSPEND": {"w": "nan"}})
+        self.assertEqual(n, 3)                                    # clipped; bad rows out
+        self.assertEqual(imm.vercel_blend_weight("KXDEEPVREQ"), 0.4)
+        self.assertEqual(imm.vercel_blend_weight("KXOPENVREQ"), 1.0)
+        self.assertEqual(imm.vercel_blend_weight("KXGOOGVREQ"), 0.0)
+        self.assertEqual(imm.vercel_blend_weight("KXANTHVREQ"), 0.73)   # the default
+        self.assertEqual(imm.vercel_blend_weight("KXMOONVSPEND"), 0.79)
+        self.assertEqual(imm._vercel_blend_state["at"], "2026-11-25T15:30:00+00:00")
+        d = imm.vercel_blend_desc()
+        self.assertIn("KXDEEPVREQ 0.40,", d)
+        self.assertIn("KXANTHVREQ 0.73 (default)", d)
+        self.assertEqual(imm.load_vercel_blend(), 0)              # unchanged
+        # an unreadable file keeps the weights in hand; so does a missing one
+        self.assertEqual(self._weights(None, raw="{not json"), -1)
+        self.assertEqual(imm.vercel_blend_weight("KXDEEPVREQ"), 0.4)
+        os.remove(imm.VERCEL_BLEND_FILE)
+        self.assertEqual(imm.load_vercel_blend(), 0)
+        self.assertEqual(imm.vercel_blend_weight("KXDEEPVREQ"), 0.4)
+
+    def test_the_blend(self):
+        now = time.time()
+        c = lambda f, book, t=self.T, at=now: imm.vercel_blend_c(t, f, at, book)
+        self.assertAlmostEqual(c(40.0, (49, 51)), 50 + 0.26 * (40 - 50))     # 47.4
+        self.assertAlmostEqual(c(80.0, (49, 51)), 50 + 0.26 * 30)            # 57.8
+        # no two-sided mid: the model fair stands
+        for book in ((None, 51), (49, None), (None, None), (51, 49), (50, 50), (0, 51)):
+            self.assertEqual(c(40.0, book), 40.0, book)
+        # the mid a book records serves a later read with no book, for a while
+        c(40.0, (49, 51))
+        self.assertEqual(imm._vercel_blend_state["mid"][self.T], (50.0, now))
+        self.assertAlmostEqual(c(40.0, None, at=now + 10), 47.4)
+        self.assertEqual(c(40.0, None, at=now + imm.VERCEL_BLEND_MID_TTL_SECS + 1), 40.0)
+        c(40.0, (None, 51))                                       # one-sided: forgotten
+        self.assertNotIn(self.T, imm._vercel_blend_state["mid"])
+        self.assertEqual(c(40.0, None, at=now + 10), 40.0)
+        # w = 1 (the open-weights share), and the kill switch: the model fair
+        self.assertEqual(c(40.0, (49, 51), t="KXOPENSOURCESHARE-68DEC06-T67.5"), 40.0)
+        with mock.patch.object(imm, "VERCEL_BLEND", False):
+            self.assertEqual(c(40.0, (49, 51)), 40.0)
+        # the file's weight wins over the default
+        self._weights({"KXDEEPVREQ": {"w": 0.5}})
+        self.assertAlmostEqual(c(40.0, (49, 51)), 45.0)
+
+    def test_the_band_reads_the_blend_and_decided_the_model(self):
+        now = time.time()
+        g = lambda b, a: imm.vercel_gate(self.T, now, b, a, self.CLOSE)
+        self.assertEqual(self._write(x_l=21.0), (1, 0))           # model 80c
+        # on the model alone the 51c offer sits 15c+ under the fair: bid only
+        with mock.patch.object(imm, "VERCEL_BLEND", False):
+            why, inp = g(49, 51)
+            self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "ask", "band"))
+            self.assertNotIn("model", inp)
+        # the blend, 50 + 0.26 x 30 = 57.8c: both sides quote
+        self.assertEqual(g(49, 51), ("", {}))
+        self.assertIsNone(imm.vercel_side_out("KXDEEPVREQ", self.T, now, 49, 51, self.CLOSE))
+        # a breach of the blend names the model and w (a 10x12 book: blend
+        # 11 + 0.26 x 69 = 28.9c, the 12c offer 15c+ under it -- and its 11c
+        # mid takes the bids out too: nothing left)
+        why, inp = g(10, 12)
+        self.assertIn("the 80c model blended with the book's mid, w 0.26", why)
+        self.assertEqual(inp["reason"], "tail_bid")
+        self.assertEqual((inp["model"], inp["w"]), (80.0, 0.26))
+        self.assertAlmostEqual(inp["fair"], 28.94, places=2)
+        # decided reads the model, never the blend (99c here, ~63c blended)
+        self._write(x_l=23.0)
+        why, inp = g(49, 51)
+        self.assertTrue(why.startswith("decided"), why)
+        self.assertEqual(inp["reason"], "decided")
+
+    def test_the_fairs_edge_reads_the_blend(self):
+        now = time.time()
+        g = lambda b, a: imm.vercel_gate(self.T, now, b, a, self.CLOSE)
+        self._write()                                             # model 40c
+        # on the model the 40c bid sits over 40 - 3: the bids out
+        with mock.patch.object(imm, "VERCEL_BLEND", False):
+            why, inp = g(40, 50)
+            self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "bid_edge"))
+        # blended, 45 - 0.26 x 5 = 43.7c: its edge 40.7c clears the 40c bid
+        self.assertEqual(g(40, 50), ("", {}))
+        why, inp = g(44, 46)                                      # blend 43.7c, bid 44
+        self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "bid_edge"))
+        self.assertIn("over the 43.7c fair", inp["why"])
+        # called with the book, the rule blends it; with none it reads the
+        # mid the cycle last recorded, and the model once that is gone
+        self.assertEqual(imm.vercel_bid_edge_reason(self.T, now, 40, ext_ask=50), "")
+        imm._vercel_blend_state["mid"].clear()
+        self.assertIn("over the 40.0c fair", imm.vercel_bid_edge_reason(self.T, now, 40))
+
+    def test_leads_and_closes_read_the_blend(self):
+        for p in (mock.patch.object(imm, "LADDER_MODE", "atref"),
+                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                  mock.patch.object(imm, "FAIR_CLOSE_MODE", "on")):
+            p.start()
+            self.addCleanup(p.stop)
+        now = time.time()
+        self._write()                                             # model 40c
+        book = (49, 51)                                           # blend 47.4c
+        self.assertAlmostEqual(imm.fair_lead_fair_c(self.T, "KXDEEPVREQ", now, book=book), 47.4)
+        self.assertAlmostEqual(imm.fair_close_fair_c(self.T, "KXDEEPVREQ", now, book=book), 47.4)
+        self.assertAlmostEqual(imm.fair_model_c(self.T, "KXDEEPVREQ", now, book), 47.4)
+        # no book (the WS fast cancel): the mid the cycle last recorded
+        self.assertAlmostEqual(imm.fair_model_c(self.T, "KXDEEPVREQ", now + 5), 47.4)
+        self.assertAlmostEqual(imm.fair_model_c(
+            self.T, "KXDEEPVREQ", now + imm.VERCEL_BLEND_MID_TTL_SECS + 5), 40.0)
+        # a decided strike still leads nothing
+        self.assertIsNone(imm.fair_lead_fair_c(f"{self.EV}-T30", "KXDEEPVREQ", now, book=book))
+        with mock.patch.object(imm, "VERCEL_BLEND", False):
+            self.assertAlmostEqual(imm.fair_lead_fair_c(self.T, "KXDEEPVREQ", now, book=book), 40.0)
+
+    def test_the_loop_leads_and_closes_off_the_blend(self):
+        # the walled 7x87 book (mid 47) against a 40c model: the blend is
+        # 47 + 0.26 x (40 - 47) = 45.18c, and the lead, the close and the WS
+        # check all read it
+        self._write()
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.0700", "yes_ask_dollars": "0.8700",
+            "volume_fp": "0.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.YES],
+            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.NO]}}
+        client.positions[self.T] = -50.0
+        leads, closes = [], []
+        real_lead, real_close = imm.fair_lead_group, imm.fair_close_group
+
+        def lead(yes, no, fair_c, *a, **k):
+            leads.append(fair_c)
+            return real_lead(yes, no, fair_c, *a, **k)
+
+        def close(yes, no, fair_c, *a, **k):
+            closes.append(fair_c)
+            return real_close(yes, no, fair_c, *a, **k)
+
+        try:
+            os.remove(os.path.join(imm.STATUS_DIR, imm.COMP_HOLD_FILE))
+        except FileNotFoundError:
+            pass
+        with contextlib.ExitStack() as st:
+            for name, v in {"LEVELS": [(0, 20)], "MAX_JOIN_SPREAD_CENTS": 99,
+                            "JOIN_AHEAD_MODE": "off", "LADDER_MODE": "atref",
+                            "FAIR_LEAD_MODE": "on", "FAIR_CLOSE_MODE": "on"}.items():
+                st.enter_context(mock.patch.object(imm, name, v))
+            st.enter_context(mock.patch.object(imm, "series_in_blackout", return_value=False))
+            st.enter_context(mock.patch.object(imm, "fair_lead_group", side_effect=lead))
+            st.enter_context(mock.patch.object(imm, "fair_close_group", side_effect=close))
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot.pnl.pos[self.T] = -50.0                           # ours, not manual
+            with mock.patch.object(imm, "log", lambda *_a, **_k: None):
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+        self.assertTrue(leads, "the market never led")
+        self.assertTrue(closes, "the short never closed")
+        for f in leads + closes:
+            self.assertAlmostEqual(f, 45.18, places=2)
+        self.assertEqual(imm._vercel_blend_state["mid"][self.T][0], 47.0)
+        self.assertAlmostEqual(imm.fair_model_c(self.T, "KXDEEPVREQ", time.time()), 45.18, places=2)
 
 
 class TestYouTube2Pilot(unittest.TestCase):
@@ -37036,7 +37295,9 @@ class TestVercelFairLead(unittest.TestCase):
         imm.SERIES_HOUR_MULTS = []
         for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
                   mock.patch.object(imm, "LADDER_MODE", "atref"),
-                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on")):
+                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                  # the model fair (VERCEL FAIR BLEND is tested in TestVercelBlend)
+                  mock.patch.object(imm, "VERCEL_BLEND", False)):
             p.start()
             self.addCleanup(p.stop)
         self._drop_holds()
