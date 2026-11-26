@@ -4013,6 +4013,10 @@ def event_top_n_for(series: str) -> int:
         # graduates' 3 per event
         return _scaled_top_n(SCAN_GRADUATE_EVENT_TOP_N)
     if awards_auto_rules(series):
+        if series == GOODREADS_SERIES:
+            # KXGOODREADS: every finalist, 0 = uncapped (2026-11-26,
+            # GOODREADS_EVENT_TOP_N)
+            return _scaled_top_n(GOODREADS_EVENT_TOP_N)
         # an awards family member by Kalshi tag (2026-10-12): the award
         # shows' cap (5 per event since 2026-11-06)
         return _scaled_top_n(AWARDS_AUTO_EVENT_TOP_N)
@@ -7297,9 +7301,9 @@ def awards_auto_rules(series: str) -> bool:
     return awards_extra_series(series) and (
         ov is None or ov == parent
         # a Grammy winner category / the count ladder clones the rule set at
-        # its own size (grammy_size_mult, 2026-11-24): still a member, same
-        # 5/event
-        or (grammy_size_mult(series) != 1.0 and parent is not None
+        # its own size (grammy_size_mult, 2026-11-24), KXGOODREADS at its x3
+        # (award_size_mult, 2026-11-26): still a member
+        or (award_size_mult(series) != 1.0 and parent is not None
             and replace(ov, size_mult=parent.size_mult) == parent))
 
 
@@ -7355,6 +7359,33 @@ def grammy_size_mult(series: str) -> float:
     if series == GRAMMY_COUNT_SERIES:
         return GRAMMY_COUNT_SIZE_MULT
     return GRAMMY_WIN_SIZE_MULT if grammy_win_series(series) else 1.0
+
+
+# GOODREADS CHOICE AWARDS x3, EVERY FINALIST (Jack 2026-11-26: "Yes All 10,
+# and don't add to wave just normal quoting but at 3x", on "Lift the
+# Goodreads cap from 5 to all 10 finalists per category?"). KXGOODREADS is
+# a tag member (AWARDS_EXTRA_FILE) on the awards rule set: 15 categories x
+# 10 finalists, programs 11/26 18:01Z / 19:01Z - 11/29 05:00Z, final-round
+# voting Nov 24-29, winners Dec 3 (its KXGOODREADS-26* row in
+# awards_dates_extra.json: out from 00:00 ET Dec 2). Safe-join and that
+# stand-down are unchanged; the size_mult wire as the Grammy families' (the
+# rungs, the per-market and per-event caps, the skew knees and the floor
+# projection together), and no per-event cap: a category's 10 finalists
+# are its whole event. IMM_GOODREADS_SIZE_MULT=1 goes back to x1 (a
+# *_SIZE_MULT name, so env_overrides.txt can carry it);
+# IMM_GOODREADS_EVENT_TOP_N=5 back to the awards' 5 (launcher env).
+GOODREADS_SERIES = "KXGOODREADS"
+GOODREADS_SIZE_MULT = _env_float("IMM_GOODREADS_SIZE_MULT", 3.0)
+GOODREADS_EVENT_TOP_N = _env_int("IMM_GOODREADS_EVENT_TOP_N", 0)
+
+
+def award_size_mult(series: str) -> float:
+    """The size an awards tag member takes on the awards rule set: the
+    Grammy families' (grammy_size_mult), KXGOODREADS' GOODREADS_SIZE_MULT
+    (2026-11-26), else 1."""
+    if series == GOODREADS_SERIES:
+        return GOODREADS_SIZE_MULT
+    return grammy_size_mult(series)
 
 
 # NFL GAME / SEASON FAMILIES, AUTO-ENROLLED (Jack 2026-10-12: "can you
@@ -13731,6 +13762,12 @@ def ensure_family_override(series: str) -> None:
         elif kind == "family_suffix":
             if not series.endswith(pat):
                 continue
+            if FAMILY_SOURCE_CHECK and family_verdict(series) is False:
+                # a name that only LOOKS like a Carbon Arc family: its source
+                # verdict says not Carbon Arc, so the family that admits it
+                # below takes it (KXGOODREADS ends in ADS and took the *ADS
+                # guard set, never the awards rules, 2026-11-26)
+                continue
         elif kind == "predicate":
             if not pat(series):
                 continue
@@ -13765,11 +13802,11 @@ def ensure_family_override(series: str) -> None:
             # family size (KXSUEZWEEKLY x2, 2026-10-11, FAMILY_X2_1011): a
             # graduate clones the scan's guard set, never that size.
             ov = replace(ov, size_mult=None)
-        if parent == AWARDS_AUTO_PARENT and grammy_size_mult(series) != 1.0:
+        if parent == AWARDS_AUTO_PARENT and award_size_mult(series) != 1.0:
             # a Grammy winner category by tag (KXGRAMAOTY, KXGRAMBNA) or the
             # count ladder (KXGRAMMYCOUNT): the awards rule set at its
-            # Grammy size (2026-11-24)
-            ov = replace(ov, size_mult=grammy_size_mult(series))
+            # Grammy size (2026-11-24); KXGOODREADS at its x3 (2026-11-26)
+            ov = replace(ov, size_mult=award_size_mult(series))
         SERIES_OVERRIDES[series] = ov
         log(f"[IMM] {series}: family override inherited from {parent}")
         return
@@ -15669,6 +15706,7 @@ _CONFIG_CODE_KNOBS = (
     "SEATS_SIZE_MULT",            # the 2029 seat-count ladders x4 (2026-11-25)
     "GRAMMY_WIN_SIZE_MULT",       # the Grammy winner families x3 (2026-11-25)
     "GRAMMY_COUNT_SIZE_MULT",     # KXGRAMMYCOUNT x3 (2026-11-25)
+    "GOODREADS_SIZE_MULT", "GOODREADS_EVENT_TOP_N",   # KXGOODREADS x3, all 10 (2026-11-26)
     "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
     "SPRLVLDATE_SIZE_MULT",       # KXSPRLVLDATE x2 (2026-11-10)
     "GTEMP_SIZE_MULT",            # KXGTEMP x3 (2026-11-24)

@@ -34190,6 +34190,87 @@ class TestAwardsByKalshiTag(unittest.TestCase):
             parent, size_mult=3.0, safe_join=False)
         self.assertFalse(imm.awards_auto_rules("KXGRAMBNA"))
 
+    def test_goodreads_quotes_every_finalist_at_x3(self):
+        # Jack 2026-11-26: "Yes All 10, and don't add to wave just normal
+        # quoting but at 3x" -- KXGOODREADS on the awards rule set at x3 with
+        # no per-event cap; another tag member keeps x1 and 5 an event
+        self.assertEqual(imm.GOODREADS_SIZE_MULT, 3.0)
+        self.assertEqual(imm.GOODREADS_EVENT_TOP_N, 0)
+        for k in ("GOODREADS_SIZE_MULT", "GOODREADS_EVENT_TOP_N"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        # the family verdict the live box holds (11/25 18:02Z: "NOT Carbon
+        # Arc"): KXGOODREADS ends in ADS, so without it the Carbon Arc *ADS
+        # family would take it first
+        imm.FAMILY_VERDICTS["KXGOODREADS"] = {
+            "carbon_arc": False, "ts": time.time(), "title": "Goodreads Choice Awards"}
+        self.addCleanup(imm.FAMILY_VERDICTS.pop, "KXGOODREADS", None)
+        self._write(["KXGOODREADS", "KXGAMEAWARDS"])
+        parent = imm.SERIES_OVERRIDES[imm.AWARDS_AUTO_PARENT]
+        for s in ("KXGOODREADS", "KXGAMEAWARDS"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+            imm.ensure_family_override(s)
+        self.assertEqual(imm.SERIES_OVERRIDES["KXGOODREADS"],
+                         imm.replace(parent, size_mult=3.0))
+        self.assertTrue(imm.awards_auto_rules("KXGOODREADS"))   # still a member
+        self.assertEqual(imm.event_top_n_for("KXGOODREADS"), 0)  # uncapped
+        with mock.patch.object(imm, "size_test_mult", return_value=1.0):
+            self.assertEqual(imm.applied_mention_mult("KXGOODREADS"), 3.0)
+            self.assertEqual(imm.series_max_position("KXGOODREADS"),
+                             3.0 * imm.MAX_POSITION_CONTRACTS)
+            self.assertEqual(imm.applied_mention_mult("KXGAMEAWARDS"), 1.0)
+        self.assertEqual(imm.SERIES_OVERRIDES["KXGAMEAWARDS"], parent)
+        self.assertEqual(imm.event_top_n_for("KXGAMEAWARDS"), 5)
+        # the Grammy sizes are unchanged through the shared helper
+        self.assertEqual(imm.award_size_mult("KXGRAMAOTY"), 3.0)
+        self.assertEqual(imm.award_size_mult("KXGAMEAWARDS"), 1.0)
+        # each knob reverts on its own
+        with mock.patch.object(imm, "GOODREADS_EVENT_TOP_N", 5):
+            self.assertEqual(imm.event_top_n_for("KXGOODREADS"), 5)
+        imm.SERIES_OVERRIDES.pop("KXGOODREADS", None)
+        with mock.patch.object(imm, "GOODREADS_SIZE_MULT", 1.0):
+            imm.ensure_family_override("KXGOODREADS")
+            self.assertEqual(imm.SERIES_OVERRIDES["KXGOODREADS"], parent)
+            self.assertEqual(imm.event_top_n_for("KXGOODREADS"), 0)
+        # off the awards file it is no member: no cap of ours, no size
+        self._write(["KXGAMEAWARDS"])
+        imm.SERIES_OVERRIDES.pop("KXGOODREADS", None)
+        self.assertFalse(imm.awards_auto_rules("KXGOODREADS"))
+
+    def test_a_carbon_arc_lookalike_name_takes_its_own_family(self):
+        # KXGOODREADS ends in ADS: before 2026-11-26 the *ADS suffix family
+        # gave it the Carbon Arc guard set even with a "NOT Carbon Arc"
+        # verdict, so the awards rules (stand-down, size, cap) never applied
+        self._write(["KXGOODREADS"])
+        ads = imm.SERIES_OVERRIDES["KXAMUSEMENTADS"]
+        awards = imm.SERIES_OVERRIDES[imm.AWARDS_AUTO_PARENT]
+        self.assertNotEqual(ads, awards)
+        cases = (
+            ("KXGOODREADS", False, "awards"),     # look-alike, in the awards file
+            ("KXFAKEADS", True, "ads"),           # a real Carbon Arc *ADS series
+            ("KXFAKE2ADS", None, "ads"),          # unread yet: as before
+            ("KXFAKE3ADS", False, None),          # look-alike, no family of its own
+        )
+        for s, verdict, want in cases:
+            imm.SERIES_OVERRIDES.pop(s, None)
+            imm.FAMILY_VERDICTS.pop(s, None)
+            if verdict is not None:
+                imm.FAMILY_VERDICTS[s] = {"carbon_arc": verdict, "ts": time.time(),
+                                          "title": ""}
+            self.addCleanup(imm.FAMILY_VERDICTS.pop, s, None)
+            self.addCleanup(imm.SERIES_OVERRIDES.pop, s, None)
+            with mock.patch.object(imm, "FAMILY_SOURCE_CHECK", True):
+                imm.ensure_family_override(s)
+            got = imm.SERIES_OVERRIDES.get(s)
+            if want is None:
+                self.assertIsNone(got, s)
+            elif want == "awards":
+                self.assertTrue(imm.awards_auto_rules(s), s)
+                self.assertEqual(got.pre_event_days, awards.pre_event_days, s)
+            else:
+                self.assertIsNotNone(got, s)
+                self.assertFalse(imm.awards_auto_rules(s), s)
+                self.assertEqual(got.min_est_per_day, ads.min_est_per_day, s)
+
     def test_the_edition_is_read_from_either_end_of_the_segment(self):
         self.assertEqual(imm._awards_edition("69BPDGP"), "69")
         self.assertEqual(imm._awards_edition("69*"), "69")
