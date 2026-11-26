@@ -34,6 +34,35 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
   - **Two latent bugs it exposed, both fixed before landing:**
     - CRLF input to `put` was written as CR CR LF, which reads back as a blank line after every line and broke every table in the email;
     - `[[fp:...]]` tags for earlier items rendered empty. The sender now resolves them through the ledger.
+- **The change registry (11/26):** Jack's "Yes, build it", to "Build the change registry next, so every IMM commit gets measured at 7 days?". It was the step-8 answer with the most behind it: 11 of the 12 commits that changed the bot's code or launcher on 11/25-26 came from other sessions, and nothing measured whether any change worked.
+  - **Built the same day:** evidence section 12 and `daily_review/changes.jsonl`:
+    - every commit that changes what the bot does, and every IMM_* env change between two bot runs, registered with a scope guessed from what the commit names;
+    - the live time from the bot's own run records (`config_history` git_sha), including runs that started on edits committed later;
+    - a 7-day before/after per scope, with supply, the rest of the book and overlapping changes alongside;
+    - step 7 scopes what went live and judges each readout in findings.json `changes`;
+    - the email's "Changes measured at 7 days" block and a health chip.
+  - **The statistics, the same afternoon.** Jack, mid-build: "remember you're building the next jane street of prediction markets". The first version called a change at |t| >= 2, which on the back-fill meant 23 calls among 164 testable readouts, where chance alone gives about 8. Each readout now carries:
+    - an exact permutation p;
+    - a Benjamini-Hochberg q across the day's readouts;
+    - the smallest move it can see (80% power);
+    - whether its expectation was pre-registered.
+
+    A call needs p <= 0.05 and q <= 0.10.
+  - **The back-fill on 11/25's data** (scratch, 12 s): 389 changes since 10/27 (296 bot, 60 input-writer, 14 launcher, 19 env), all live. 199 readouts, 50 of them the same money as another (live the same day on overlapping series). Per cluster: 6 better, 3 worse, 108 no clear change, 22 book-wide, 10 no activity.
+    - **Worse:**
+      - cheap-side whole-cent rungs (44316cf, 11/15), -$10/day, q 0.05;
+      - the Billboard and VoteHub AS families (1f5e7e4, 10/27), -$28/day, q 0.07;
+      - weekend-rain ladder leads (278b672, 10/29), -$63/day, q 0.07.
+    - **Missed FDR:** its twin, the 5c fair-lead margin (797937b), at q 0.102; and the Trump-mention halving (46943dd), +$187/day at t 2.6, at q 0.108. One +$418 day drove the halving, and its test can only see moves over $206/day.
+    - 115f94c (2028 sides x1.5) read +$86/day at a program pool x8.6: the pool, not the change. That is why supply sits beside every call.
+  - **The first headless run of step 7** (scratch copy, 11/26 15:06, D = 11/25, the t-based first version): 23 min, 55 turns, a reported $8.02. It wrote 25 `changes` entries and ingest rejected none: 11 scoped, 17 judged, 1 skipped (emails only).
+    - **It re-scoped** two weekend-rain readouts as whole-book settings, leaving their verdicts for the next readout: the profit lock and `FAIR_LEAD_MARGIN_C`, whose subjects named rain series only as examples. Zillow, weather and FX changes got patterns.
+    - **It judged the CPI-core block "hurt"** (net +$16 -> $0/day) and proposed no revert: Jack's 11/11 live-feed call stands, and the question goes to the Sunday pass.
+    - **It found two flaws, both fixed before landing:**
+      - `measure` crashed on any scope with an idle day (a KeyError);
+      - the registry's headline totals double-counted the same money. The weekend-rain pair was half the "worse" total, and one TRUMPSAY launch counted twice. Hence the same-day clusters.
+    - **The trap it exposed:** a Git Bash `tail -F` on run.log blocked every Add-Content line of the launcher's log (memory: reference-tail-f-blocks-add-content).
+  - **Scope guesses are the weak link:** a family named next to its series widened KXHAUSTTS to all 149 Carbon Arc series, so a subject that names series is now those series only. Body-only series (a third of commits) are often examples, so the review re-scopes them when they go live.
 
 ## 2026-11-25: what the survey found before the first run (the baseline)
 

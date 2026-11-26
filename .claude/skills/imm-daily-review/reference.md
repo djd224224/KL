@@ -37,6 +37,7 @@ The facts the runbook (`SKILL.md`) leans on. Sourced from the 11/25 survey of th
 | Data | sizes of each sink's UTC-day file vs its 14-day median | LOW < 0.3x, HIGH > 3x, MISSING when present 10+ of 14 days |
 | Changes | `git log` (local HEAD + origin/main), `config_manifest.jsonl` + `config_store/` (the reloadable files, versioned by the review since 11/25) | Commit subjects naming `R-YYMMDD-NN` mark that item shipped |
 | Moat (section 10) | `daily_review/moat/`:<br>- `family_daily.csv`: per day x family, from the day archive. `share` = sum(est_frac x pool_per_day) / sum(pool_per_day) over the cycle log's market-cycles, and `pool_cov` = the average pool $/day managed.<br>- `priors.json`: 30 days, shrunk with m = 5 days toward the book.<br>- `playbook.md`.<br>Plus the edge watch and the review's calibration from the ledger. | Share is our cut of the pool where we quote, the cleanest competition signal. The first run back-fills share for 7 days; older days carry none. |
+| Change registry (section 12, since 11/26) | `git log main origin/main --no-merges` (subjects, bodies, files); `git rev-list --topo-order --parents` and main's reflog (when main got each commit); `config_history_<utc>.jsonl` (each bot run's start, `git_sha`, `source_mtime`, config); the day archive by (series, event); `program_history.jsonl` (pool per series per day); `post_vote_dead_books.json` (wave events). Writes `daily_review/changes.jsonl`. | **What registers:** a commit touching the bot file, its launcher (`run_incentive_mm.ps1`, `restart_imm.ps1`), a repo module the bot imports (the fair modules and client libraries, found by reading its imports), or an input writer (`INPUT_FILES`: pvd_*, wave_fair, cheap_scan, imm_release_calendar, imm_upcoming, imm_family_watch, imm_rows, imm_earnings_overrides, release_calendar.json). So does every IMM_* env change between two bot runs.<br>**Live:** a bot or launcher commit at the first bot run whose HEAD has it, or earlier, at a run that started on its uncommitted edits (the file's mtime is after the HEAD reached main, and the commit follows within 6 h); anything else when main got it.<br>**Readout:** 7 full ET days after the live day vs the 7 before, Welch t on daily values; changes live the same day with the same scope share one readout. |
 | The review itself (section 11, since 11/26) | the ledger; `git log` of the day (subjects, bodies, files); Claude Code's project memory (`~/.claude/projects/C--Users-jackd-Documents-KL/memory/*.md` by mtime, `IMM_REVIEW_MEMORY_DIR` overrides); each earlier run's `claude_stream.jsonl` + `run.log`; this collect's section times against `$CollectTimeoutMin` / `$ClaudeTimeoutMin` read from the launcher; `watches.json` + `watch_results.jsonl` | Step 8's input. "Reported cost" is what Claude Code prints for the run (API-equivalent), not a bill. Command kinds are a heuristic: the first word, the script, and the sinks a command names. |
 
 ## 3. Data map and reading recipes
@@ -184,6 +185,30 @@ Calibrate: each day's top predictions are logged, and when those events get quot
   Normalise by supply, compare against a family that didn't change, and say which confounders apply.
 - **Verdict rules:** verified needs the effect to meet the item's own success rule, a |t| around 2 or more (or an effect larger than the day-to-day sd), and agreement after supply normalisation. Otherwise inconclusive, and say what would settle it.
 - **Holdouts settle what before/after can't.** The repo has the pattern: hash-split series (the 10/26 size test), random control trips (the sweep breaker's 20% `control` mode), a dry-run sink. Propose one when the expected effect is under about 1 sd of daily net.
+- **The change registry does this for every change** (evidence section 12; `python imm_review.py changes readout KEY` for one now). Its statistics, to a trading desk's standard (Jack 11/26: "the next jane street of prediction markets"):
+  - **p** is an exact two-sided permutation p for the difference in daily means: every split of the 14 days into 7 and 7 (3,432 of them), or 20,000 seeded relabellings past 20,000 splits. Daily P&L is fat-tailed and 7 days a side cannot support a t-table.
+  - **q** is Benjamini-Hochberg across the readouts read out together that day; only testable ones count, not book-wide, no-data or no-activity.
+  - **can see** (MDE) = 2.8 standard errors: the move the test detects 80% of the time at p 0.05.
+  - **pre-registered** means `expect` was written before the readout's day.
+  - **clusters:** readouts of changes live the same ET day on overlapping series are the same money. They are counted once in the day's calls, the board and the email, led by the strongest called member (lowest q), else the widest scope. A narrow change that moved stays visible inside a wider one that didn't. Different days are never merged.
+
+  Its provisional call:
+  - **better / worse:** p <= 0.05, q <= 0.10, and |delta| >= max($5/day, 15% of the before level);
+  - **new, ...** when the scope had no activity before (an enrolment);
+  - **no activity** when neither window has any;
+  - **book-wide** for a whole-book scope, which gets no call: every change in the window moves it.
+
+  Read three columns before trusting a call:
+  - **supply x:** the program pool on the scope's series, after over before;
+  - **outside:** the rest of the book over the same days;
+  - **overlapping changes:** other changes on the same series in either window, with the clean days before the next one.
+
+  **11/25's back-fill:** 164 of 199 readouts were testable.
+  - At |t| >= 2, 23 were called (15 better, 8 worse), where chance alone gives about 8.
+  - Permutation p plus FDR kept 11 (8 better, 3 worse).
+  - 50 readouts were the same money as another; per cluster that is 6 better and 3 worse.
+  - The Trump-mention halving (46943dd) read +$187/day at t 2.6, but one +$418 day drove it: p 0.0099, q 0.108, and it can only see moves over $206/day.
+  - 115f94c (2028 sides at x1.5) read +$86/day at a program pool x8.6: that was the pool, not the change.
 
 ## 8. Invariants the collector checks (add one for every bug class the review finds)
 
@@ -198,6 +223,7 @@ Calibrate: each day's top predictions are logged, and when those events get quot
 | Ops | failing scheduled tasks (new vs chronic); task-log errors |
 | Selection | config gaps (fail-closed); floor misses |
 | The review itself | collect time against its limit; the last runs' errors, denials and minutes; promised rechecks due; the review's own watches |
+| Changes | every bot change read out at 7 days; early warnings (a change down $20+/day at t <= -2.5 after 2+ days); commits that never went live |
 
 **Two ways to add one:**
 - **A watch** (since 11/26): a simple symptom the review can see by itself (a log line, a sink count, a stale file, a status number, a family's net). The review adds it unattended through findings.json `watches`, and it runs from the next collect. It needs no approval because it only reads run-logs.

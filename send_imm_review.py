@@ -411,11 +411,63 @@ def load_ctx(day: date) -> dict:
                for iid, it in sorted(ledger.items())
                if it.get("compound") and it.get("status") == "proposed" and iid not in today_ids]
     return {"day": day, "ev": ev, "findings": findings, "rows": rows, "decisions": decisions,
-            "compound": compound, "compound_backlog": backlog[:6],
+            "compound": compound, "compound_backlog": backlog[:6], "change_rows": change_rows(day, ev),
             "waiting": waiting[:8], "review": review_md, "title": title, "intro": intro,
             "sections": sections,
             "open": sum(1 for it in ledger.values() if it.get("status") not in rv.TERMINAL),
             "verdict": _short(findings.get("verdict") or findings.get("headline") or title or "", 300)}
+
+
+def _change_title(subject: str, n: int = 90) -> str:
+    """A commit subject for a phone: the topic prefix without its "imm"
+    ("imm fair lead: ..." -> "Fair lead: ..."; "imm: ..." -> "..."), no
+    trailing "(Jack 2026-11-26: ...)" or "(review R-...)" quote."""
+    s = str(subject or "")
+    s = re.sub(r"^env (IMM_\w+):", r"Setting \1:", s)
+    s = re.sub(r"^(?:imm|pvd) +(?=[A-Z])", "", s)          # "imm Trump mentions: ..." -> "Trump mentions: ..."
+    m = re.match(r"^([a-z][a-z0-9_ .+/-]{0,40}): (.*)$", s, re.S)   # lower-case topic prefixes only
+    if m:
+        topic = re.sub(r"^(?:imm|incentive_mm|pvd)\b[ _]?", "", m.group(1)).strip()
+        if topic and not re.search(r"[_.]", topic):
+            topic = topic[:1].upper() + topic[1:]
+        s = f"{topic}: {m.group(2)}" if topic else m.group(2)
+    s = re.sub(r"\s*\((?:Jack \d{4}-\d{2}-\d{2}|review R-\d{6}-\d{2})[^)]*\)?\s*$", "", s)
+    if not re.match(r"^[a-z0-9]+_[a-z0-9_]*:", s):        # a module name keeps its case
+        s = s[:1].upper() + s[1:]
+    return _short(s, n)
+
+
+def change_rows(day: date, ev: dict) -> List[dict]:
+    """Today's 7-day readouts (evidence section 12) with the review's verdict,
+    for the email's "Changes measured" block."""
+    rg = ev.get("registry") or {}
+    try:
+        st = rv.registry_state()
+    except Exception:
+        st = {}
+    iso = day.isoformat()
+    out = []
+    for r in rg.get("readouts") or []:
+        if r.get("same_money_as"):
+            continue          # the same money as another readout: shown once, under that one
+        keys = r.get("keys") or []
+        verdict = note = ""
+        for k in keys:
+            for v in reversed((st.get(k) or {}).get("verdicts") or []):
+                if v.get("day") == iso:
+                    verdict, note = v.get("verdict") or "", v.get("note") or ""
+                    break
+            if verdict:
+                break
+        subj = (r.get("subjects") or [""])[0]
+        out.append({"keys": keys, "title": _change_title(subj), "more": max(0, len(keys) - 1),
+                    "split": r.get("split"), "scope": r.get("scope"), "call": r.get("call") or "",
+                    "metric": r.get("metric") or "net", "before": (r.get("before") or {}).get("net"),
+                    "after": (r.get("after") or {}).get("net"), "delta": r.get("delta") or {},
+                    "t": (r.get("t") or {}).get("net"), "p": r.get("p"), "q": r.get("q"),
+                    "mde": r.get("mde"), "supply": r.get("supply_ratio"),
+                    "verdict": verdict, "note": _short(note, 220), "ids": r.get("ids") or []})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +526,13 @@ def health_checks(ev: dict) -> List[Tuple[str, str]]:
         hot = any((x.get("severity") or "") in ("P0", "P1") for x in w.get("firing") or [])
         out.append((f"Review checks: {nf} of {w['active']} firing" if nf else f"Review checks: all {w['active']} OK",
                     "green" if not nf else ("red" if hot else "amber")))
+    rg = ev.get("registry") or {}
+    if rg.get("n_readouts"):
+        worse = sum(n for c, n in (rg.get("readout_calls") or {}).items() if c.endswith("worse"))
+        tot = int(rv._f(rg["n_readouts"])) - int(rv._f(rg.get("n_merged")))
+        out.append((f"Changes at {rv.REGISTRY_DAYS} days: {worse} of {tot} worse" if worse
+                    else f"Changes at {rv.REGISTRY_DAYS} days: none of {tot} worse",
+                    "amber" if worse else "green"))
     b = ((ev.get("self") or {}).get("budget")) or {}
     if rv._f(b.get("collect_pct")) >= 0.6:
         out.append((f"Review data gathering at {rv._f(b['collect_pct']) * 100:.0f}% of its limit",
@@ -613,6 +672,109 @@ def render_compound(ctx: dict) -> str:
     return "".join(P)
 
 
+CHANGE_SHOW = 8
+CHANGE_SHOW_WORSE = 5        # on a day with more readouts than fit: 5 that look worse, then 3 better
+_CALL_COLOUR = {"better": GREEN, "new, better": GREEN, "worse": RED, "new, worse": RED}
+_VERDICT_COLOUR = {"worked": GREEN, "hurt": RED, "no-effect": MUTED, "inconclusive": AMBER, "extend": AMBER}
+
+
+def _change_side(r: dict) -> str:
+    """worse / better / other, by the review's verdict when there is one."""
+    if r.get("verdict") in ("hurt", "worked"):
+        return "worse" if r["verdict"] == "hurt" else "better"
+    c = r.get("call") or ""
+    return "worse" if c.endswith("worse") else ("better" if c.endswith("better") else "other")
+
+
+def pick_changes(rows: List[dict], n: int = CHANGE_SHOW) -> List[dict]:
+    """The rows the email shows: all of them when they fit; else up to 5 that
+    look worse and then the better ones, in the evidence's order, topped up with
+    the rest. The first back-fill (199 readouts) otherwise showed 8 worse rows."""
+    if len(rows) <= n:
+        return list(rows)
+    worse = [r for r in rows if _change_side(r) == "worse"][:CHANGE_SHOW_WORSE]
+    better = [r for r in rows if _change_side(r) == "better"][:n - len(worse)]
+    pick = worse + better
+    pick += [r for r in rows if not any(r is p for p in pick)][:n - len(pick)]
+    return [r for r in rows if any(r is p for p in pick)]
+
+
+def _short_day(iso: str) -> str:
+    try:
+        return _dow(date.fromisoformat(iso))
+    except (TypeError, ValueError):
+        return str(iso or "")
+
+
+def render_changes(ctx: dict) -> str:
+    """Every IMM change read out 7 days after it went live (evidence section 12,
+    Jack 2026-11-26): the biggest moves first, each with the review's verdict."""
+    ev = ctx.get("ev") or {}
+    rg = ev.get("registry") or {}
+    if not rg or rg.get("error"):
+        return ""
+    rows = ctx.get("change_rows") or []
+    n = int(rv._f(rg.get("n_readouts"))) - int(rv._f(rg.get("n_merged")))
+    P = [_h2(f"Changes measured at {rv.REGISTRY_DAYS} days", n)]
+    sy = rg.get("sync") or {}
+    nd = rg.get("next_due") or []
+    line = (f"Every change to the bot is measured {rv.REGISTRY_DAYS} days after it went live: the "
+            f"{rv.REGISTRY_DAYS} days after against the {rv.REGISTRY_DAYS} before, on the markets it names "
+            "(before/after, not proof). Better or worse means it beat chance after allowing for how many "
+            "changes were tested together. ")
+    if sy.get("first"):
+        line += (f"First readout: every change since {sy.get('since')} measured at once ({n} distinct "
+                 "readouts); the biggest moves are below. ")
+    line += (f"{int(rv._f(rg.get('n_went_live')))} went live yesterday; {int(rv._f(rg.get('in_window')))} are "
+             f"inside their {rv.REGISTRY_DAYS} days"
+             + (f"; next readouts {_short_day(nd[0][0])} ({nd[0][1]})" if nd else "") + ".")
+    P.append(f'<div style="margin:0 0 8px;font-size:13px;color:{MUTED}">{esc(line)}</div>')
+    if rows:
+        inner = []
+        for i, r in enumerate(pick_changes(rows)):
+            top = "" if i == 0 else f"border-top:1px solid {LINE};padding-top:10px;"
+            d = r["delta"] or {}
+            more = f' <span style="color:{MUTED};font-size:12px">(+{r["more"]} more)</span>' if r["more"] else ""
+            t = "" if r.get("p") is None else (", p < 0.001" if rv._f(r["p"]) < 0.001
+                                               else f", p {rv._f(r['p']):.3f}".rstrip("0").rstrip("."))
+            sup = r.get("supply")
+            sup_t = "" if sup is None or 0.8 <= rv._f(sup) <= 1.25 else f" &middot; program pool x{rv._f(sup):.1f}"
+            call_col = _CALL_COLOUR.get(r["call"], MUTED)
+            verdict = ""
+            if r["verdict"]:
+                verdict = (f'<div style="margin-top:4px;font-size:14px"><b style="color:'
+                           f'{_VERDICT_COLOUR.get(r["verdict"], INK)}">Review: {esc(r["verdict"])}</b>'
+                           f'{" &mdash; " + inline(r["note"]) if r["note"] else ""}</div>')
+            metric = "" if r["metric"] == "net" else (f' <span style="font-size:12px;color:{MUTED}">'
+                                                       f'(judged on {esc(r["metric"])})</span>')
+            if r["call"].endswith("no clear change") and r.get("mde") is not None:
+                metric += (f' <span style="font-size:12px;color:{MUTED};font-weight:400">(this test only sees '
+                           f'moves over {esc(money(r["mde"], False))}/day)</span>')
+            inner.append(
+                f'<div style="{top}margin-bottom:10px">'
+                f'<div style="font-weight:700">{esc(r["title"])}{more}</div>'
+                f'<div style="font-size:13px;color:{MUTED}">Live {esc(_short_day(r["split"]))} &middot; '
+                f'{esc(_short(r["scope"], 70))}{"".join(" " + id_chip(x) for x in r["ids"][:2])}</div>'
+                f'<div style="font-size:14px">Net {_num(r["before"])} &rarr; {_num(r["after"])} a day '
+                f'({_num(d.get("net"))}{esc(t)}) &middot; rewards {_num(d.get("rew"))} &middot; trading '
+                f'{_num(d.get("pnl"))}{sup_t}</div>'
+                f'<div style="font-size:13px;font-weight:600;color:{call_col}">{esc(r["call"])}{metric}</div>'
+                f'{verdict}</div>')
+        if n > CHANGE_SHOW:
+            inner.append(f'<div style="font-size:12px;color:{MUTED}">and {n - CHANGE_SHOW} more in the '
+                         'evidence pack (section 12)</div>')
+        P.append(_card("".join(inner)))
+    warns = rg.get("warnings") or []
+    if warns:
+        P.append(_card(f'<div style="font-weight:700;margin-bottom:4px;color:{AMBER}">Down hard already '
+                       f'(before day {rv.REGISTRY_DAYS})</div>'
+                       + "".join(f'<div style="padding:3px 0">{esc(_change_title(w.get("subject"), 90))}: '
+                                 f'{esc(w.get("metric"))} {_num(w.get("before"))} &rarr; {_num(w.get("after"))} '
+                                 f'a day over {int(rv._f(w.get("after_days")))} days</div>' for w in warns[:5]),
+                       AMBER))
+    return "".join(P)
+
+
 def render_html(ctx: dict, fallback_reason: str = "") -> str:
     day: date = ctx["day"]
     ev = ctx["ev"]
@@ -636,6 +798,7 @@ def render_html(ctx: dict, fallback_reason: str = "") -> str:
     if fallback_reason:
         a(_card(f'<b style="color:{RED}">The analysis did not run</b> ({esc(fallback_reason)}). Below are the '
                 'numbers and the evidence pack exactly as the collector built them; nothing was judged.', RED))
+        a(render_changes(ctx))        # deterministic: the readouts stand without the analysis
     else:
         if ctx["verdict"]:
             a(f'<div style="margin:12px 0 0;font-size:17px;font-weight:600;line-height:1.4">{inline(ctx["verdict"])}</div>')
@@ -661,7 +824,9 @@ def render_html(ctx: dict, fallback_reason: str = "") -> str:
                          f'<span style="white-space:nowrap">no {esc(idt)}</span> to drop it '
                          f'&middot; details below</div>')
             a(_card("".join(inner), SEV_STYLE[r["sev"]][1]))
-        # 2b. the review's answer to its own daily question
+        # 2b. every bot change, read out at 7 days (evidence section 12)
+        a(render_changes(ctx))
+        # 2c. the review's answer to its own daily question
         a(render_compound(ctx))
         # 3. the full review, section by section
         for head, body in ctx["sections"]:
@@ -786,6 +951,14 @@ def render_text(ctx: dict, fallback_reason: str = "") -> str:
             L.append(f"   Approve: text \"do {r['id']}\"")
         if not ctx["decisions"]:
             L.append("Nothing today.")
+        crs = ctx.get("change_rows") or []
+        if crs:
+            L += ["", f"CHANGES MEASURED AT {rv.REGISTRY_DAYS} DAYS ({len(crs)})"]
+            for r in pick_changes(crs):
+                d = r["delta"] or {}
+                L.append(f"- {r['title']} (live {_short_day(r['split'])}): net {money(r['before'])} -> "
+                         f"{money(r['after'])}/day ({money(d.get('net'))}) [{r['call']}]"
+                         + (f" review: {r['verdict']}" + (f" - {r['note']}" if r["note"] else "") if r["verdict"] else ""))
         comp = ctx.get("compound") or []
         L += ["", f"MAKING THE REVIEW BETTER ({len(comp)})"]
         if self_line(ctx["ev"]):

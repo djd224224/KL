@@ -240,6 +240,7 @@ Edit and Write are switched off. Write your two outputs only with the put comman
 then run: python imm_review.py ledger ingest --day $Day
 then write review.md the same way: python imm_review.py put review.md --day $Day <<'EOF' ... EOF
 Every run answers one question for itself (SKILL.md step 8, Jack 2026-11-26), in findings.json "compound": What else should this review be doing, daily, to compound and improve itself? Evidence section 11 is its input. At least one answer, every day.
+Every IMM change is measured at 7 days (evidence section 12, SKILL.md step 7, Jack 2026-11-26): in findings.json "changes", scope what went live on the day and judge every readout listed today.
 Do not send anything and do not run any send_*.py: this launcher sends the email when you finish.
 Finish with at most 5 lines: the verdict, the decisions, and anything that blocked you.
 "@

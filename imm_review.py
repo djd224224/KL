@@ -26,6 +26,10 @@ launcher (run_imm_daily_review.ps1) runs the three every morning.
     python imm_review.py ledger close ID --status closed|fixed-elsewhere|wontfix|reverted|false-positive --note "..."
     python imm_review.py ledger recheck ID --on YYYY-MM-DD [--note "..."]   # a promise to look again
     python imm_review.py watch list [--all] | eval [--day D] | retire W-... --note "..."
+    python imm_review.py changes list [--all] | show KEY | sync | readout KEY [--day D]
+    python imm_review.py changes add SHA | skip KEY --note "..." | verdict KEY worked|hurt|... --note "..."
+    python imm_review.py changes scope KEY [--series A,B] [--family F] [--group G] [--event E] [--wave W]
+                                 [--pattern RX] [--book] [--metric net|rew|pnl|...] [--expect "..."]
     python imm_review.py measure (--pattern REGEX | --family NAME) --split YYYY-MM-DD[THH:MM]
                                  [--before 7] [--after 7]
     python imm_review.py put findings.json|review.md --day D  < content   # the unattended run's writes
@@ -44,6 +48,8 @@ untracked, so the 30-min sync never touches it):
     lessons.md                             what the unattended runs learned (curated later)
     watches.json, watch_results.jsonl      the review's own read-only checks and their history
                                            (added by the skill through findings.json "watches")
+    changes.jsonl                          the change registry: every IMM change, when it went
+                                           live, its scope and its 7-day readout and verdict
 
 Basis tags: every number is MEASURED (Kalshi fills / marks / settlements, logs,
 files) or MODELLED (the bot's reward estimator, one-reading estimates).
@@ -57,10 +63,12 @@ import glob
 import gzip
 import hashlib
 import io
+import itertools
 import json
 import math
 import os
 import pickle
+import random
 import re
 import shutil
 import statistics
@@ -98,11 +106,20 @@ LIVE_REPO = STATUS_DIR = REVIEW_DIR = DASH_DIR = CACHE_DIR = ARCHIVE_DIR = RUN_L
 
 
 MEMORY_DIR = ""
+# the change registry's per-process caches (section 12): per-day event sums of
+# the day archive, program supply per day, the bot's module closure
+_REG_DAYS: dict = {}
+_SUPPLY_CACHE: dict = {}
+_BOT_MODULES = None
 
 
 def configure(status_dir: Optional[str] = None, review_dir: Optional[str] = None,
               repo: Optional[str] = None, memory_dir: Optional[str] = None) -> None:
     global LIVE_REPO, STATUS_DIR, REVIEW_DIR, DASH_DIR, CACHE_DIR, ARCHIVE_DIR, RUN_LOGS, MOAT_DIR, MEMORY_DIR
+    global _BOT_MODULES
+    _REG_DAYS.clear()
+    _SUPPLY_CACHE.clear()
+    _BOT_MODULES = None
     LIVE_REPO = repo or os.environ.get("IMM_REVIEW_REPO") or r"C:\Users\jackd\Documents\KL"
     # Claude Code's project memory for the repo: the notes other sessions write
     # (section 11 lists the ones written on the review day)
@@ -2351,6 +2368,8 @@ def ledger_ingest(day: date, path: Optional[str] = None) -> dict:
             closes += 1
     # the review's own read-only checks (findings.json "watches" / "retire_watches")
     wres = watches_ingest(day, data.get("watches") or [], data.get("retire_watches") or [])
+    # the change registry: scopes for what went live, skips, readout verdicts
+    cres = registry_ingest(day, data.get("changes") or [], first_time)
     lessons = [str(x).strip() for x in data.get("lessons") or [] if str(x).strip()]
     lessons = [l for l in lessons[:5] if first_time("lessons", l)]
     if lessons:
@@ -2370,6 +2389,9 @@ def ledger_ingest(day: date, path: Optional[str] = None) -> dict:
                  "closes": int(_f(prev.get("closes"))) + closes,
                  "watches": {k: list(dict.fromkeys((pw.get(k) or []) + wres[k])) if k != "rejected" else wres[k]
                              for k in ("added", "updated", "retired", "rejected")},
+                 "changes": {k: (list(dict.fromkeys(((prev.get("changes") or {}).get(k) or []) + cres[k]))
+                                 if k != "rejected" else cres[k])
+                             for k in ("scoped", "judged", "skipped", "rejected")},
                  "done": {k: sorted(v) for k, v in done.items()}})
     if rules:
         os.makedirs(MOAT_DIR, exist_ok=True)
@@ -2382,7 +2404,7 @@ def ledger_ingest(day: date, path: Optional[str] = None) -> dict:
                 fh.write(f"- {iso} [{str(p.get('evidence') or '')[:40]}] "
                          f"{str(p.get('applies_to') or 'all')[:80]}: {str(p['rule']).strip()[:400]}\n")
     return {"created": created, "seen": seen, "evals": evals, "closes": closes, "ids": ids,
-            "watches": wres}
+            "watches": wres, "changes": cres}
 
 
 def ledger_due(day: date) -> List[dict]:
@@ -3373,6 +3395,1174 @@ def sec_self(day: date, ev: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 12. The change registry: every IMM change, measured at 7 days. Jack
+# 2026-11-26: "Yes, build it" (the registry, so every IMM commit gets measured
+# at 7 days, not only the review's own: 11 of the 12 bot commits since 11/25
+# came from outside the review, and nothing measured whether they worked).
+#
+# REGISTER  every commit on main or origin/main that changes what the bot
+#           does: the bot file, its launcher, a repo module the bot or an
+#           input writer imports, a writer of a file the bot reads
+#           (INPUT_FILES); and every IMM_* env change a bot run started with
+#           (config_history). The scope (series, events, waves, families it
+#           should move) is guessed from what the commit names; the review
+#           corrects it the next morning (findings.json "changes").
+# LIVE      a bot or launcher commit: the first bot run that started on a HEAD
+#           containing it (config_history git_sha). A run started on
+#           uncommitted edits of the bot file (source_mtime after its HEAD
+#           reached main) counts for the next bot commit made within 6 hours:
+#           the apply-then-commit path (d4d28c2 ran from 15:57Z, committed
+#           17:25Z). A module or writer commit is live when main has it (the
+#           reflog); an env change, at the run that started with it.
+# READOUT   the 7 full ET days after the live day against the 7 before, for
+#           the scope, from the dashboard's day archive: net, rewards
+#           (MODELLED), trading (MEASURED at the last trade), fills, $ resting;
+#           program supply on the same series; the rest of the book over the
+#           same days; other changes on overlapping series in either window as
+#           confounds. Statistics a trading desk would accept (Jack 11/26:
+#           "remember you're building the next jane street of prediction
+#           markets"): an exact permutation p (every 7/7 split of the 14 days),
+#           Benjamini-Hochberg across the readouts read out together (199 tests
+#           at p < 0.05 give ~10 hits by chance), and the smallest move the
+#           test could see (80% power). The provisional call (better / worse:
+#           p <= 0.05, surviving FDR q 0.10, |delta| >= max($5, 15%)) is still a
+#           before/after, not causal; "no clear change" on a test that cannot
+#           see the expected move is "can't tell", and a holdout settles it.
+# VERDICT   the skill judges each readout (worked / hurt / no-effect /
+#           inconclusive / extend); a change that hurt becomes a revert
+#           finding; extend reads it again at 14 days.
+#
+# File: daily_review/changes.jsonl, append-only ops register / live / scope /
+# readout / verdict / skip, folded by registry_state().
+# ---------------------------------------------------------------------------
+
+REGISTRY_DAYS = 7                    # the readout horizon (Jack: "measured at 7 days")
+REGISTRY_EXTEND_DAYS = 14            # a readout the review extends comes again at 14 days
+REGISTRY_BACKFILL_DAYS = 30          # the first run registers this much history
+REGISTRY_LOOKBACK_DAYS = 21          # later runs re-read this much (a branch merged late)
+REGISTRY_DIRTY_SPAN_S = 6 * 3600     # a run on uncommitted bot edits: the next bot commit within this
+REGISTRY_MIN_USD = 5.0               # a move under $5/day is no clear change, whatever its p
+REGISTRY_MIN_FRAC = 0.15             # ... or under 15% of the before level
+REGISTRY_P = 0.05                    # two-sided permutation p for a call
+REGISTRY_FDR_Q = 0.10                # Benjamini-Hochberg across one collect's readouts
+REGISTRY_PERM_EXACT = 20000          # enumerate every split up to this many (7/7 days: 3,432)
+REGISTRY_PERM_SAMPLES = 20000        # else this many seeded random relabellings
+REGISTRY_MDE_Z = 2.8                 # 1.96 + 0.84: the move seen 80% of the time at p 0.05
+REGISTRY_EARLY_USD = 20.0            # early warning: down $20+/day at t <= -2.5 after 2+ days
+REGISTRY_EARLY_T = 2.5
+REGISTRY_SHOW = 15                   # readouts listed in the evidence per run (all are recorded)
+BOT_FILE = "incentive_mm.py"
+LAUNCHER_FILES = ("run_incentive_mm.ps1", "restart_imm.ps1")
+# writers of files the bot reads that it does not import (post_vote_dead_books.json
+# and the wave fairs, cheap_side_books.json, release_calendar_found.json, the
+# upcoming list the weather writers read, the family verdicts and auto-series
+# lists, the award / election date rows, the earnings cutoff overrides) and the
+# repo data file it reads. Their own imports are not followed: pvd_scan pulls in
+# the quote-gap and email modules, which change no input.
+INPUT_FILES = ("pvd_scan.py", "pvd_waves.py", "pvd_wave_pace.py", "pvd_wave_tune.py", "pvd_marginal.py",
+               "wave_fair.py", "cheap_scan.py", "imm_release_calendar.py", "imm_upcoming.py",
+               "imm_family_watch.py", "imm_rows.py", "imm_earnings_overrides.py", "release_calendar.json")
+# imported by the bot, but a change there is display or the review itself; a
+# family-rule change in imm_dashboard is registered by hand (`changes add SHA`)
+NOT_BOT_FILES = ("imm_dashboard.py", "imm_review.py", "send_imm_review.py")
+CHANGE_VERDICTS = ("worked", "hurt", "no-effect", "inconclusive", "extend")
+CHANGE_METRICS = ("net", "rew", "pnl", "fills", "cts", "rest")
+_MONEY = ("net", "rew", "pnl")
+_AGG_KEYS = ("rew", "pnl", "fills", "cts", "rest", "mt", "mt_cts")
+_KX_RX = re.compile(r"\bKX[A-Z0-9]{2,}\b")
+_WAVE_NAME_RX = re.compile(r"\bw\d{4}-[a-z0-9][a-z0-9-]*[a-z0-9]\b")
+_IMPORT_RX = re.compile(r"^[ \t]*(?:from[ \t]+([A-Za-z_]\w*)[ \t.]|import[ \t]+([A-Za-z_][\w \t,.]*))", re.M)
+_ENV_SECRET = re.compile(r"URL|KEY|TOKEN|SECRET|PASS|EMAIL|PHONE", re.I)
+# words too generic to name a family on their own in a commit subject
+_SCOPE_STOP = {"other", "general", "data", "company", "state", "international", "health", "candidates",
+               "turnout", "food", "county", "earnings", "econ", "commodities", "energy", "awards", "trump",
+               "the", "and", "new", "all", "space", "media", "prints"}
+# words subjects use for a family that its rules do not spell (case-sensitive)
+_SCOPE_WORDS = {"RT": {"series": ["KXRT"]}}
+
+
+def bot_modules() -> set:
+    """Repo modules the bot imports, transitively (`import X` or `from X import`
+    naming an X.py in the repo), less NOT_BOT_FILES: the fair modules and the
+    client libraries. A change there changes what the bot does at its next start."""
+    global _BOT_MODULES
+    if _BOT_MODULES is not None:
+        return _BOT_MODULES
+    seen: set = set()
+    todo = [BOT_FILE]
+    while todo and len(seen) < 500:
+        f = todo.pop()
+        if f in seen:
+            continue
+        seen.add(f)
+        try:
+            with open(os.path.join(LIVE_REPO, f), encoding="utf-8", errors="replace") as fh:
+                txt = fh.read()
+        except OSError:
+            continue
+        for m in _IMPORT_RX.finditer(txt):
+            names = [m.group(1)] if m.group(1) else [p.strip().split()[0].split(".")[0]
+                                                     for p in m.group(2).split(",") if p.strip()]
+            for n in names:
+                fn = n + ".py"
+                if fn not in seen and fn not in NOT_BOT_FILES and os.path.isfile(os.path.join(LIVE_REPO, fn)):
+                    todo.append(fn)
+    _BOT_MODULES = seen - {BOT_FILE} - set(INPUT_FILES)
+    return _BOT_MODULES
+
+
+def change_kind(files: Iterable[str]) -> Optional[str]:
+    """bot / launcher / input for a commit touching those files, else None."""
+    names = {str(f).replace("\\", "/") for f in files}
+    if BOT_FILE in names:
+        return "bot"
+    if names & set(LAUNCHER_FILES):
+        return "launcher"
+    mods = bot_modules()
+    if any(n in mods or n in INPUT_FILES for n in names):
+        return "input"
+    return None
+
+
+def _family_aliases(series: Iterable[str]) -> Dict[str, Tuple[str, str]]:
+    """{alias: ("families" | "groups", name)} for the families and groups the
+    dashboard rules give `series`: each name, and its first word or two when
+    distinctive ("Vercel shares" -> "vercel"; "Carbon Arc consumer" -> "carbon arc").
+    A family wins an alias it shares with one of its groups."""
+    pool: Dict[str, set] = {"families": set(), "groups": set()}
+    for s in series:
+        f, g = family_of(s)
+        for kind, n in (("families", f), ("groups", g)):
+            if n and n != s and not re.fullmatch(r"KX[A-Z0-9]+", n):
+                pool[kind].add(n)
+    out: Dict[str, Tuple[str, str]] = {}
+    for kind in ("groups", "families"):
+        for n in sorted(pool[kind]):
+            words = re.findall(r"[A-Za-z][A-Za-z0-9]*", n)
+            cands = {n.lower()}
+            if len(words) >= 2:
+                if len(words[0]) >= 4:
+                    cands.add(words[0].lower())
+                cands.add((words[0] + " " + words[1]).lower())
+            for c in cands:
+                if c in _SCOPE_STOP or len(c) < 3:
+                    continue
+                if kind == "families" or c not in out:
+                    out[c] = (kind, n)
+    return out
+
+
+def _named_families(text: str, aliases: Dict[str, Tuple[str, str]]) -> Dict[str, List[str]]:
+    """Families and groups `text` names: the longest alias wins where two overlap
+    ("sports ladders" is the group, not the Sports family)."""
+    low = (text or "").lower()
+    hits = []
+    for al, (kind, name) in aliases.items():
+        for m in re.finditer(r"(?<![a-z0-9])" + re.escape(al) + r"(?![a-z0-9])", low):
+            hits.append((m.start(), m.end(), kind, name))
+    hits.sort(key=lambda h: (-(h[1] - h[0]), h[0]))
+    taken: List[Tuple[int, int]] = []
+    out: Dict[str, set] = {"families": set(), "groups": set()}
+    for s, e, kind, name in hits:
+        if any(s < te and ts < e for ts, te in taken):
+            continue
+        taken.append((s, e))
+        out[kind].add(name)
+    return {k: sorted(v) for k, v in out.items() if v}
+
+
+def infer_scope(subject: str, body: str = "", aliases: Optional[Dict[str, Tuple[str, str]]] = None) -> dict:
+    """What a commit should move, from what it names: series in the subject,
+    families and groups the subject names, wave names; series named only in the
+    body when the subject names nothing; else the whole book."""
+    subj, body = subject or "", body or ""
+    sc: dict = {}
+    basis = []
+    st = list(dict.fromkeys(_KX_RX.findall(subj)))
+    if st:
+        sc["series"] = st[:12]
+        basis.append("series in the subject")
+    # a family only when the subject names no series: "Carbon Arc TikTok Shop
+    # series (KXHAUSTTS ...)" is those series, not all 149 Carbon Arc ones
+    named = {} if st else _named_families(subj, aliases or {})
+    if named:
+        sc.update(named)
+        basis.append("family in the subject")
+    for word, extra in _SCOPE_WORDS.items():
+        if re.search(r"(?<![A-Za-z0-9])" + re.escape(word) + r"(?![A-Za-z0-9])", subj):
+            for k, v in extra.items():
+                sc[k] = sorted(set(sc.get(k) or []) | set(v))
+            basis.append(f"'{word}' in the subject")
+    waves = sorted(set(_WAVE_NAME_RX.findall(subj + " " + body)))
+    if waves:
+        sc["waves"] = waves[:6]
+        basis.append("wave named")
+    if not sc:
+        bt = list(dict.fromkeys(_KX_RX.findall(body)))
+        if bt:
+            sc["series"] = bt[:12]
+            basis.append("series in the body")
+    if not sc:
+        return {"book": True, "basis": "names no series, wave or family"}
+    sc["basis"] = "; ".join(basis)
+    return sc
+
+
+def clean_scope(sc) -> Tuple[Optional[dict], str]:
+    """A scope from findings.json or the CLI, or (None, why)."""
+    if not isinstance(sc, dict):
+        return None, "scope must be an object"
+    if sc.get("book"):
+        return {"book": True, "basis": str(sc.get("basis") or "the whole book")[:200]}, ""
+    out: dict = {}
+    for k in ("series", "events", "waves", "families", "groups"):
+        v = sc.get(k) or []
+        if isinstance(v, str):
+            v = [x for x in re.split(r"[,\s]+", v) if x] if k in ("series", "events", "waves") else [v]
+        v = [str(x).strip() for x in v if str(x).strip()][:40]
+        if v:
+            out[k] = v
+    if sc.get("pattern"):
+        try:
+            re.compile(str(sc["pattern"]))
+        except re.error as e:
+            return None, f"bad pattern: {e}"
+        out["pattern"] = str(sc["pattern"])[:200]
+    if not out:
+        return None, "the scope names nothing (book: true for the whole book)"
+    out["basis"] = str(sc.get("basis") or "set by the review")[:200]
+    return out, ""
+
+
+def scope_label(sc: Optional[dict]) -> str:
+    if not sc or sc.get("book"):
+        return "whole book"
+    parts = []
+    for k, n in (("series", 4), ("events", 3), ("waves", 3), ("groups", 3), ("families", 3)):
+        v = sc.get(k) or []
+        if v:
+            parts.append(", ".join(v[:n]) + (f" +{len(v) - n}" if len(v) > n else ""))
+    if sc.get("pattern"):
+        parts.append("/" + sc["pattern"] + "/")
+    return "; ".join(parts) or "whole book"
+
+
+def scope_key(sc: Optional[dict]) -> str:
+    if not sc or sc.get("book"):
+        return "book"
+    return json.dumps({k: (sorted(sc[k]) if isinstance(sc[k], list) else sc[k])
+                       for k in ("series", "events", "waves", "families", "groups", "pattern") if sc.get(k)},
+                      sort_keys=True)
+
+
+def registry_path() -> str:
+    return os.path.join(REVIEW_DIR, "changes.jsonl")
+
+
+def registry_append(ev: dict) -> None:
+    ev = dict(ev)
+    ev.setdefault("at", _now_iso())
+    os.makedirs(REVIEW_DIR, exist_ok=True)
+    with open(registry_path(), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(ev, sort_keys=True, default=str) + "\n")
+
+
+def registry_state() -> Dict[str, dict]:
+    """{key: entry} folded from changes.jsonl. A key is the commit's short sha
+    or env:<NAME>@<run_id>."""
+    st: Dict[str, dict] = {}
+    for ev in _iter_jsonl(registry_path()):
+        op = ev.get("op")
+        keys = ev.get("keys") if isinstance(ev.get("keys"), list) else [ev.get("key")]
+        if op == "register":
+            k = ev.get("key")
+            if k and k not in st:
+                st[k] = {**{x: ev.get(x) for x in ("key", "full", "kind", "ct", "subject", "files", "ids",
+                                                    "body", "registered", "run_id")},
+                         "scope": ev.get("scope") or {"book": True}, "scope_by": "auto",
+                         "readouts": {}, "verdicts": []}
+            continue
+        for k in keys:
+            it = st.get(k)
+            if it is None:
+                continue
+            if op == "live":
+                it["live_at"] = _f(ev.get("live_at")) or None
+                it["live_basis"] = ev.get("basis")
+            elif op == "scope":
+                if isinstance(ev.get("scope"), dict):
+                    it["scope"] = ev["scope"]
+                it["scope_by"] = ev.get("by") or "review"
+                for x in ("metric", "expect"):
+                    if ev.get(x):
+                        it[x] = ev[x]
+                if ev.get("expect"):          # when it was written: before the readout = pre-registered
+                    it["expect_day"] = ev.get("day") or str(ev.get("at") or "")[:10]
+            elif op == "readout":
+                it["readouts"][str(ev.get("horizon"))] = {"day": ev.get("day"), "group": ev.get("group"),
+                                                          "result": ev.get("result") or {}}
+            elif op == "verdict":
+                it["verdicts"].append({x: ev.get(x) for x in ("day", "verdict", "note", "finding", "by")})
+                it["verdict"] = ev.get("verdict")
+                if ev.get("verdict") == "extend":
+                    it["horizon"] = REGISTRY_EXTEND_DAYS
+            elif op == "skip":
+                it["skipped"] = str(ev.get("note") or "skipped")
+            elif op == "unskip":
+                it.pop("skipped", None)
+    return st
+
+
+def resolve_key(st: Dict[str, dict], k) -> Optional[str]:
+    """A registry key from a key, a full sha or a 4+ character prefix of either."""
+    k = str(k or "").strip()
+    if not k:
+        return None
+    if k in st:
+        return k
+    if len(k) < 4:
+        return None
+    c = [key for key, it in st.items() if key.startswith(k) or (it.get("full") or "").startswith(k)]
+    return c[0] if len(c) == 1 else None
+
+
+def _utc_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def registry_commits(since_ts: float) -> List[dict]:
+    """Non-merge commits on main and origin/main since `since_ts`: full sha,
+    commit time, subject, body, files."""
+    code, out = _git("log", "main", "origin/main", "--no-merges", f"--since={_utc_iso(since_ts)}",
+                     "--format=%x1e%H%x1f%ct%x1f%s%x1f%b%x1d", "--name-only", timeout=120)
+    if code != 0:
+        return []
+    res = []
+    for chunk in out.split("\x1e"):
+        if not chunk.strip():
+            continue
+        head, _, files = chunk.partition("\x1d")
+        parts = head.split("\x1f")
+        if len(parts) < 3 or not re.fullmatch(r"[0-9a-f]{40}", parts[0].strip()):
+            continue
+        res.append({"full": parts[0].strip(), "ct": int(_f(parts[1])), "subject": parts[2].strip(),
+                    "body": (parts[3] if len(parts) > 3 else "").strip(),
+                    "files": [l.strip() for l in files.splitlines() if l.strip()]})
+    return res
+
+
+def registry_dag(since_ts: float) -> Tuple[List[str], Dict[str, List[str]]]:
+    """Commits reachable from main or origin/main since `since_ts` (3 days of
+    slack), children before parents, and each one's parents."""
+    code, out = _git("rev-list", "--topo-order", "--parents", f"--since={_utc_iso(since_ts - 3 * 86400)}",
+                     "main", "origin/main", timeout=120)
+    order: List[str] = []
+    parents: Dict[str, List[str]] = {}
+    if code == 0:
+        for line in out.splitlines():
+            p = line.split()
+            if p and re.fullmatch(r"[0-9a-f]{40}", p[0]):
+                order.append(p[0])
+                parents[p[0]] = p[1:]
+    return order, parents
+
+
+def registry_reflog() -> List[Tuple[int, str]]:
+    """(unix time, sha) of every move of main on this box, oldest first."""
+    code, out = _git("reflog", "show", "--date=unix", "--format=%H%x1f%gd", "main", timeout=60)
+    res = []
+    if code == 0:
+        for line in out.splitlines():
+            h, _, gd = line.partition("\x1f")
+            m = re.search(r"@\{(\d{9,})\}", gd)
+            if m and re.fullmatch(r"[0-9a-f]{40}", h.strip()):
+                res.append((int(m.group(1)), h.strip()))
+    res.sort()
+    return res
+
+
+def bot_runs(since_ts: float) -> List[dict]:
+    """Every bot run since `since_ts` (config_history): start, run id, the HEAD
+    it started on, its source file's mtime and its config, oldest first."""
+    d0 = datetime.fromtimestamp(since_ts, timezone.utc).date() - timedelta(days=1)
+    rows = []
+    for p in glob.glob(os.path.join(STATUS_DIR, "config_history_*.jsonl")):
+        m = re.search(r"config_history_(\d{4}-\d{2}-\d{2})\.jsonl$", p)
+        if not m or date.fromisoformat(m.group(1)) < d0:
+            continue
+        for r in _iter_jsonl(p):
+            ts = _ts_of(r.get("ts"))
+            if ts is None:
+                continue
+            src = r.get("source_mtime")
+            rows.append({"ts": ts, "run_id": str(r.get("run_id") or ""), "sha": str(r.get("git_sha") or ""),
+                         "src": float(src) if isinstance(src, (int, float)) else None,
+                         "config": r.get("config") if isinstance(r.get("config"), dict) else {}})
+    rows.sort(key=lambda r: r["ts"])
+    return rows
+
+
+def resolve_live(order: List[str], parents: Dict[str, List[str]], reflog: List[Tuple[int, str]],
+                 runs: List[dict], commits: List[dict]) -> Dict[str, Tuple[float, str]]:
+    """{full sha: (live ts, basis)} for `commits` (full, kind, ct). Bot and
+    launcher commits: the first run whose HEAD has them, or an earlier run that
+    started on the uncommitted edits they became. Others: when main got them."""
+    idx = {h: i for i, h in enumerate(order)}
+    reach: Dict[str, int] = {}
+    for h in reversed(order):                 # parents first: --topo-order lists children first
+        b = 1 << idx[h]
+        for p in parents.get(h) or ():
+            b |= reach.get(p, 0)
+        reach[h] = b
+    by_short: Dict[str, List[str]] = defaultdict(list)
+    for h in order:
+        by_short[h[:7]].append(h)
+
+    def full(s: str) -> Optional[str]:
+        if s in reach:
+            return s
+        c = [h for h in by_short.get(s[:7], []) if h.startswith(s)] if len(s) >= 7 else []
+        return c[0] if len(c) == 1 else None
+
+    def members(mask: int):
+        while mask:
+            low = mask & -mask
+            yield order[low.bit_length() - 1]
+            mask ^= low
+
+    arrival: Dict[str, float] = {}
+    seen = 0
+    for ts, h in reflog:
+        b = reach.get(h)
+        if b is None:
+            continue
+        for c in members(b & ~seen):
+            arrival[c] = float(ts)
+        seen |= b
+    first_run: Dict[str, dict] = {}
+    seen = 0
+    for r in runs:
+        h = full(r.get("sha") or "")
+        if h is None:
+            continue
+        for c in members(reach[h] & ~seen):
+            first_run[c] = r
+        seen |= reach[h]
+    bot_by_ct = sorted((int(_f(c.get("ct"))), c["full"]) for c in commits if c.get("kind") == "bot")
+    dirty: Dict[str, dict] = {}
+    for r in runs:
+        h = full(r.get("sha") or "")
+        if h is None or r.get("src") is None or arrival.get(h) is None or r["src"] <= arrival[h] + 5:
+            continue
+        # the bot file changed after its HEAD reached main: the run is on edits a
+        # later commit records -- the next bot commit made within 6 hours
+        for ct, c in bot_by_ct:
+            if ct < r["src"] - 5:
+                continue
+            if ct - r["src"] > REGISTRY_DIRTY_SPAN_S:
+                break
+            if c not in idx or (reach[h] >> idx[c]) & 1:
+                continue
+            if c not in dirty or r["ts"] < dirty[c]["ts"]:
+                dirty[c] = r
+            break
+    out: Dict[str, Tuple[float, str]] = {}
+    for c in commits:
+        f, kind = c["full"], c.get("kind")
+        if kind in ("bot", "launcher"):
+            fr, dr = first_run.get(f), dirty.get(f)
+            if dr is not None and (fr is None or dr["ts"] < fr["ts"]):
+                out[f] = (dr["ts"], f"bot run {dr['run_id']} {et_str(dr['ts'])} ET started on these edits "
+                                    f"before they were committed ({et_str(_f(c.get('ct')))})")
+            elif fr is not None:
+                out[f] = (fr["ts"], f"first bot run on it: {fr['run_id']} {et_str(fr['ts'])} ET")
+        elif arrival.get(f) is not None:
+            out[f] = (arrival[f], f"reached main {et_str(arrival[f])} ET")
+    return out
+
+
+def env_changes(runs: List[dict]) -> List[dict]:
+    """IMM_* env values that changed from one bot run to the next (a launcher
+    edit or env_overrides.txt, applied at a task restart). Sets printed in
+    another order are not changes; names that look like secrets are skipped."""
+    out = []
+    for prev, r in zip(runs, runs[1:]):
+        a, b = prev.get("config") or {}, r.get("config") or {}
+        if not a or not b:
+            continue
+        for k in sorted(set(a) | set(b)):
+            if not k.startswith("IMM_") or _ENV_SECRET.search(k) or a.get(k) == b.get(k):
+                continue
+            ia, ib = _set_items(a.get(k)), _set_items(b.get(k))
+            if ia is not None and ib is not None:
+                if ia == ib:
+                    continue
+                add, rem = sorted(set(ib) - set(ia)), sorted(set(ia) - set(ib))
+                desc = " ".join(x for x in (("+" + ",".join(add)) if add else "",
+                                            ("-" + ",".join(rem)) if rem else "") if x)
+                words = add + rem
+            else:
+                desc = f"{str(a.get(k))[:80]} -> {str(b.get(k))[:80]}"
+                words = [str(a.get(k) or ""), str(b.get(k) or "")]
+            out.append({"key": f"env:{k}@{r['run_id']}", "name": k, "change": desc[:240], "ts": r["ts"],
+                        "run_id": r["run_id"], "tokens": sorted(set(_KX_RX.findall(" ".join(words))))[:12]})
+    return out
+
+
+def _day_agg(iso: str) -> Optional[Dict[Tuple[str, str], List[float]]]:
+    """{(series, event): [rew, pnl, fills, cts, rest, mt, mt_cts, markets]} for an
+    archived ET day, cached for the process."""
+    if iso in _REG_DAYS:
+        return _REG_DAYS[iso]
+    blob = load_archive(iso)
+    agg: Optional[dict] = None
+    if blob:
+        agg = {}
+        for t, v in market_rows(blob):
+            k = (series_of(t), event_of(t))
+            a = agg.get(k)
+            if a is None:
+                a = agg[k] = [0.0] * (len(_AGG_KEYS) + 1)
+            for i, f in enumerate(_AGG_KEYS):
+                a[i] += _f(v.get(f))
+            a[-1] += 1
+    _REG_DAYS[iso] = agg
+    return agg
+
+
+def _supply_days(days: Iterable[str]) -> Dict[str, Dict[str, float]]:
+    """{day: {series: program reward pool}} from program_history.jsonl, one pass
+    for every day not yet cached."""
+    days = sorted(set(days))
+    want = [d for d in days if d not in _SUPPLY_CACHE]
+    if want:
+        got: Dict[str, Dict[str, float]] = {d: {} for d in want}
+        for r in _iter_jsonl(os.path.join(STATUS_DIR, "program_history.jsonl")):
+            d = r.get("date")
+            if d in got:
+                s = r.get("series") or ""
+                got[d][s] = got[d].get(s, 0.0) + _f(r.get("total_reward_raw"))
+        _SUPPLY_CACHE.update(got)
+    return {d: _SUPPLY_CACHE.get(d) or {} for d in days}
+
+
+def scope_matcher(sc: Optional[dict], universe: set, wave_events: Optional[dict] = None):
+    """match(series, event) -> bool for a scope. A series token is exact when the
+    archive knows that series, else a prefix (KXRAIN covers KXRAINNYCM)."""
+    if not sc or sc.get("book"):
+        return lambda s, e: True
+    toks = [t for t in sc.get("series") or [] if t]
+    exact = {t for t in toks if t in universe}
+    pre = tuple(t for t in toks if t not in universe)
+    fams = {x.lower() for x in sc.get("families") or []}
+    grps = {x.lower() for x in sc.get("groups") or []}
+    evs = set(sc.get("events") or [])
+    if sc.get("waves"):
+        we = wave_events if wave_events is not None else pvd_wave_events()
+        for w in sc["waves"]:
+            evs |= {e for e, v in we.items() if w in (v.get("waves") or ())}
+    pat = None
+    if sc.get("pattern"):
+        try:
+            pat = re.compile(sc["pattern"])
+        except re.error:
+            pat = None
+    memo: Dict[Tuple[str, str], bool] = {}
+
+    def m(s: str, e: str) -> bool:
+        k = (s, e)
+        if k in memo:
+            return memo[k]
+        hit = s in exact or (bool(pre) and s.startswith(pre)) or (bool(e) and e in evs)
+        if not hit and (fams or grps):
+            f, g = family_of(s)
+            hit = (f or "").lower() in fams or (g or "").lower() in grps
+        if not hit and pat is not None:
+            hit = bool(pat.search(e or "") or pat.search(s))
+        memo[k] = hit
+        return hit
+    return m
+
+
+def _scope_rows(match, days: List[str]) -> Tuple[List[dict], set]:
+    rows, hit = [], set()
+    for iso in days:
+        agg = _day_agg(iso)
+        if agg is None:
+            continue
+        a = [0.0] * (len(_AGG_KEYS) + 1)
+        bn = br = 0.0
+        for (s, e), v in agg.items():
+            bn += v[0] + v[1]
+            br += v[4]
+            if match(s, e):
+                for i in range(len(a)):
+                    a[i] += v[i]
+                hit.add(s)
+        r = dict(zip(_AGG_KEYS, a))
+        r.update(day=iso, markets=a[-1], net=a[0] + a[1], book_net=bn, book_rest=br)
+        rows.append(r)
+    return rows, hit
+
+
+def _mean(vals: List[float]) -> Optional[float]:
+    return round(sum(vals) / len(vals), 2) if vals else None
+
+
+def _welch_t(a: List[float], b: List[float]) -> Optional[float]:
+    """(mean b - mean a) / its standard error, sample variances."""
+    if len(a) < 2 or len(b) < 2:
+        return None
+    se = math.sqrt(statistics.variance(a) / len(a) + statistics.variance(b) / len(b))
+    if se <= 1e-9:
+        return None
+    return round((sum(b) / len(b) - sum(a) / len(a)) / se, 2)
+
+
+def perm_p(a: List[float], b: List[float]) -> Optional[float]:
+    """Two-sided p that mean(b) - mean(a) is as far from 0 as observed when the
+    days are relabelled at random: exact over every split up to
+    REGISTRY_PERM_EXACT of them (7 days a side: 3,432), else seeded samples. No
+    normality assumption, which 7 daily P&L values a side cannot support."""
+    na, nb = len(a), len(b)
+    if na < 2 or nb < 2:
+        return None
+    pool = [float(x) for x in a] + [float(x) for x in b]
+    tot = sum(pool)
+    obs = abs(sum(b) / nb - sum(a) / na)
+    if obs <= 1e-9:
+        return 1.0
+    tol = obs * 1e-9 + 1e-12
+
+    def far(sb: float) -> bool:
+        return abs(sb / nb - (tot - sb) / na) >= obs - tol
+
+    if math.comb(na + nb, nb) <= REGISTRY_PERM_EXACT:
+        hits = n = 0
+        for comb in itertools.combinations(pool, nb):
+            n += 1
+            hits += far(sum(comb))
+        return round(hits / n, 5)
+    rng = random.Random(7)
+    hits = sum(far(sum(rng.sample(pool, nb))) for _ in range(REGISTRY_PERM_SAMPLES))
+    return round((hits + 1) / (REGISTRY_PERM_SAMPLES + 1), 5)
+
+
+def bh_qvalues(ps: List[Optional[float]]) -> List[Optional[float]]:
+    """Benjamini-Hochberg adjusted p (q) for each p; None stays None. A call
+    survives at q <= REGISTRY_FDR_Q: across a batch, at most ~10% of the calls
+    that survive are expected to be noise."""
+    idx = [i for i, p in enumerate(ps) if p is not None]
+    m = len(idx)
+    out: List[Optional[float]] = [None] * len(ps)
+    running = 1.0
+    for rank, i in reversed(list(enumerate(sorted(idx, key=lambda i: ps[i]), 1))):
+        running = min(running, ps[i] * m / rank)
+        out[i] = round(min(1.0, running), 5)
+    return out
+
+
+def mde(a: List[float], b: List[float]) -> Optional[float]:
+    """The smallest move in the mean this test sees 80% of the time at p 0.05
+    (2.8 standard errors, sample variances; one side may be all zeros)."""
+    if len(a) < 2 or len(b) < 2:
+        return None
+    se = math.sqrt(statistics.variance(a) / len(a) + statistics.variance(b) / len(b))
+    return round(REGISTRY_MDE_Z * se, 2)
+
+
+def change_call(r: dict) -> str:
+    """The provisional call on a readout (before/after, not causal). better /
+    worse need the move to be big, p <= REGISTRY_P, and to survive the batch's
+    false-discovery control (fdr_ok, set by sec_registry; a lone readout has it)."""
+    if r.get("book"):
+        return "book-wide"
+    if not r.get("before_days") or not r.get("after_days"):
+        return "no data"
+    b, d = r.get("before") or {}, r.get("delta") or {}
+
+    def active(x: dict) -> bool:
+        return abs(_f(x.get("net"))) >= 1 or _f(x.get("fills")) >= 1 or _f(x.get("rest")) >= 100
+
+    if not active(b) and not active(r.get("after") or {}):
+        return "no activity"
+    m = r.get("metric") or "net"
+    dv, p = d.get(m), r.get("p")
+    new = not active(b)
+    if dv is not None:
+        floor = REGISTRY_MIN_USD if m in _MONEY else 1.0
+        big = abs(dv) >= max(floor, REGISTRY_MIN_FRAC * abs(_f(b.get(m))))
+        if big and p is not None and p <= REGISTRY_P and r.get("fdr_ok", True):
+            word = ("better" if dv > 0 else "worse") if m in _MONEY else ("up" if dv > 0 else "down")
+            return ("new, " + word) if new else word
+    return "new, no clear change" if new else "no clear change"
+
+
+def change_readout(sc: Optional[dict], split: date, horizon: int, day: date, metric: str = "net",
+                   universe: Optional[set] = None, wave_events: Optional[dict] = None) -> dict:
+    """The scope's ET days split+1..split+horizon (to `day`) against
+    split-horizon..split-1. Rewards MODELLED, trading MEASURED at the last trade."""
+    sc = sc or {"book": True}
+    before = [(split - timedelta(days=i)).isoformat() for i in range(horizon, 0, -1)]
+    after = [(split + timedelta(days=i)).isoformat() for i in range(1, horizon + 1)
+             if split + timedelta(days=i) <= day]
+    if universe is None:
+        universe = {s for iso in before + after for s, _e in (_day_agg(iso) or {})}
+    match = scope_matcher(sc, universe, wave_events)
+    rb, hb = _scope_rows(match, before)
+    ra, ha = _scope_rows(match, after)
+    hits = hb | ha
+    sup = _supply_days([r["day"] for r in rb + ra])
+    for r in rb + ra:
+        d = sup.get(r["day"]) or {}
+        r["supply"] = sum(x for s, x in d.items() if s in hits or match(s, "")) if d else None
+    keys = ("net", "rew", "pnl", "fills", "cts", "rest", "markets")
+    out: dict = {"split": split.isoformat(), "horizon": horizon, "metric": metric,
+                 "scope": scope_label(sc), "scope_key": scope_key(sc), "book": bool(sc.get("book")),
+                 "before_days": len(rb), "after_days": len(ra), "complete": len(ra) >= horizon,
+                 "series_hit": len(hits), "series_sample": sorted(hits)[:8],
+                 "before": {k: _mean([r[k] for r in rb]) for k in keys},
+                 "after": {k: _mean([r[k] for r in ra]) for k in keys}}
+    out["delta"] = {k: (round(out["after"][k] - out["before"][k], 2) if rb and ra else None) for k in keys}
+    out["t"] = {k: _welch_t([r[k] for r in rb], [r[k] for r in ra]) for k in keys if k != "markets"}
+    m = metric if metric in keys else "net"
+    out["p"] = perm_p([r[m] for r in rb], [r[m] for r in ra])
+    out["mde"] = mde([r[m] for r in rb], [r[m] for r in ra])
+    out["net_sd"] = {"before": round(statistics.pstdev([r["net"] for r in rb]), 2) if len(rb) > 1 else None,
+                     "after": round(statistics.pstdev([r["net"] for r in ra]), 2) if len(ra) > 1 else None}
+    ob = [r["book_net"] - r["net"] for r in rb]
+    oa = [r["book_net"] - r["net"] for r in ra]
+    out["outside"] = {"before": _mean(ob), "after": _mean(oa),
+                      "delta": round(_mean(oa) - _mean(ob), 2) if ob and oa else None, "t": _welch_t(ob, oa)}
+    sb = [r["supply"] for r in rb if r.get("supply") is not None]
+    sa = [r["supply"] for r in ra if r.get("supply") is not None]
+    out["supply_ratio"] = round(_mean(sa) / _mean(sb), 2) if sb and sa and _f(_mean(sb)) > 0 else None
+
+    def per1k(rows):
+        rest = sum(r["rest"] for r in rows)
+        return round(sum(r["net"] for r in rows) / rest * 1000, 2) if rest > 0 else None
+
+    out["net_per_1k"] = {"before": per1k(rb), "after": per1k(ra)}
+    out["daily"] = {"before": [[r["day"][5:], round(r["net"], 2)] for r in rb],
+                    "after": [[r["day"][5:], round(r["net"], 2)] for r in ra]}
+    out["call"] = change_call(out)
+    return out
+
+
+def _split_day(it: dict) -> Optional[date]:
+    return datetime.fromtimestamp(it["live_at"], ET).date() if it.get("live_at") else None
+
+
+def _horizon(it: dict) -> int:
+    return int(_f(it.get("horizon")) or REGISTRY_DAYS)
+
+
+def registry_groups(st: Dict[str, dict], keys: Iterable[str]) -> Dict[str, dict]:
+    """Changes that went live the same ET day with the same scope, horizon and
+    metric share one readout: a day archive cannot tell them apart."""
+    groups: Dict[str, dict] = {}
+    for k in keys:
+        it = st[k]
+        sp, h, m = _split_day(it), _horizon(it), it.get("metric") or "net"
+        sc = it.get("scope") or {"book": True}
+        gk = f"{sp.isoformat()}|{h}|{m}|{scope_key(sc)}"
+        g = groups.setdefault(gk, {"group": gk, "split": sp, "horizon": h, "metric": m, "scope": sc, "keys": []})
+        g["keys"].append(k)
+    return groups
+
+
+def _registry_due(it: dict, day: date) -> bool:
+    """Past its horizon with no readout for it -- or one taken on this same day
+    (a re-collect recomputes), or under a scope or metric changed since."""
+    sp = _split_day(it)
+    if sp is None or it.get("skipped"):
+        return False
+    h = _horizon(it)
+    if day < sp + timedelta(days=h):
+        return False
+    rd = (it.get("readouts") or {}).get(str(h))
+    if rd is None or rd.get("day") == day.isoformat():
+        return True
+    res = rd.get("result") or {}
+    return (res.get("scope_key") != scope_key(it.get("scope"))
+            or (res.get("metric") or "net") != (it.get("metric") or "net"))
+
+
+def registry_sync(day: date, now: Optional[float] = None) -> dict:
+    """Register new IMM changes and resolve when pending ones went live."""
+    now = now or time.time()
+    st = registry_state()
+    first = not st
+    since = now - (REGISTRY_BACKFILL_DAYS if first else REGISTRY_LOOKBACK_DAYS) * 86400
+    commits = registry_commits(since)
+    have = {it.get("full") for it in st.values() if it.get("full")}
+    reg = []
+    for c in commits:
+        if c["full"] in have or _NOT_A_CHANGE.match(c["subject"]):
+            continue
+        c["kind"] = change_kind(c["files"])
+        if c["kind"]:
+            reg.append(c)
+    aliases = _family_aliases(_recent_series(day)) if reg else {}
+    used = set(st)
+    new = []
+    for c in sorted(reg, key=lambda c: c["ct"]):
+        key = c["full"][:7] if c["full"][:7] not in used else c["full"][:10]
+        used.add(key)
+        registry_append({"op": "register", "key": key, "full": c["full"], "kind": c["kind"], "ct": c["ct"],
+                         "subject": c["subject"][:200], "body": c["body"][:600], "files": c["files"][:40],
+                         "ids": subject_ids(c["subject"]), "scope": infer_scope(c["subject"], c["body"], aliases),
+                         "registered": day.isoformat()})
+        new.append(key)
+    st = registry_state()
+    runs = bot_runs(since)
+    pending = [it for it in st.values() if it.get("full") and not it.get("live_at") and not it.get("skipped")]
+    resolved = 0
+    if pending:
+        order, parents = registry_dag(since)
+        live = resolve_live(order, parents, registry_reflog(), runs,
+                            [{"full": it["full"], "kind": it.get("kind"), "ct": it.get("ct")}
+                             for it in st.values() if it.get("full")])
+        for it in pending:
+            got = live.get(it["full"])
+            if got:
+                registry_append({"op": "live", "key": it["key"], "live_at": round(got[0], 1), "basis": got[1]})
+                resolved += 1
+    n_env = 0
+    st = registry_state()
+    # a launcher commit that went live in the same run is the change; its env
+    # lines are recorded, not measured twice
+    launch_at = {round(_f(it.get("live_at")), 1): k for k, it in st.items()
+                 if it.get("kind") == "launcher" and it.get("live_at")}
+    for e in env_changes(runs):
+        if e["key"] in st:
+            continue
+        sc = ({"series": e["tokens"], "basis": "series in the env value"} if e["tokens"]
+              else {"book": True, "basis": "an env knob"})
+        registry_append({"op": "register", "key": e["key"], "kind": "env", "ct": int(e["ts"]),
+                         "subject": f"env {e['name']}: {e['change']}"[:200], "files": [], "ids": [],
+                         "scope": sc, "registered": day.isoformat(), "run_id": e["run_id"]})
+        registry_append({"op": "live", "key": e["key"], "live_at": round(e["ts"], 1),
+                         "basis": f"bot run {e['run_id']} started with it {et_str(e['ts'])} ET"})
+        lk = launch_at.get(round(e["ts"], 1))
+        if lk:
+            registry_append({"op": "skip", "key": e["key"], "by": "registry",
+                             "note": f"measured with launcher commit {lk} (the same bot run)"})
+        new.append(e["key"])
+        n_env += 1
+    return {"first": first, "registered": new, "env": n_env, "resolved": resolved,
+            "commits_read": len(commits), "runs_read": len(runs), "since": et_str(since, "%Y-%m-%d")}
+
+
+def _recent_series(day: date, days: int = 30) -> List[str]:
+    out: set = set()
+    for i in range(days):
+        out.update(s for s, _e in (_day_agg((day - timedelta(days=i)).isoformat()) or {}))
+    return sorted(out)
+
+
+_CALLED = ("better", "worse", "up", "down")
+
+
+def registry_clusters(readouts: List[dict]) -> None:
+    """Readouts that measure the same money -- live the same ET day on
+    overlapping series, so their windows are the same days -- form one cluster
+    that counts once (the 11/26 headless run: the two weekend-rain readouts were
+    the same -$63/day, one TRUMPSAY launch counted as +$24 and +$20). The lead is
+    the strongest called member (lowest q), else the widest scope: a narrow
+    change that moved stays visible inside a wider one that didn't. Sets
+    `cluster` (the lead's group) on each, `same_money_as` (the lead's keys) on
+    the others. Whole-book readouts overlap everything and get no call: never
+    merged. Different days are never merged (no chains across the week)."""
+    idx = [i for i, r in enumerate(readouts) if r.get("_fp")]
+    parent = {i: i for i in idx}
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for a_, i in enumerate(idx):
+        for j in idx[a_ + 1:]:
+            ri, rj = readouts[i], readouts[j]
+            if ri["split"] == rj["split"] and ri["_fp"] & rj["_fp"]:
+                parent[find(i)] = find(j)
+    members: Dict[int, List[int]] = defaultdict(list)
+    for i in idx:
+        members[find(i)].append(i)
+    for ms in members.values():
+        called = [i for i in ms if str(readouts[i].get("call") or "").endswith(_CALLED)]
+        if called:
+            lead = min(called, key=lambda i: (_f(readouts[i].get("q"), 1.0),
+                                              -abs(_f((readouts[i].get("delta") or {}).get(
+                                                  readouts[i].get("metric") or "net")))))
+        else:
+            lead = max(ms, key=lambda i: (len(readouts[i]["_fp"]), -_f(readouts[i].get("p"), 1.0)))
+        for i in ms:
+            readouts[i]["cluster"] = readouts[lead]["group"]
+            if i != lead:
+                readouts[i]["same_money_as"] = readouts[lead]["keys"]
+
+
+def registry_board(st: Dict[str, dict]) -> dict:
+    """The registry's running score: one vote per readout group, and in the
+    calls and the dollar sums one per cluster (overlapping readouts of the
+    same money count once, at the widest scope)."""
+    kinds = Counter(it.get("kind") for it in st.values())
+    seen: set = set()
+    calls: Counter = Counter()
+    better = worse = 0.0
+    merged = 0
+    for it in st.values():
+        for h, rd in (it.get("readouts") or {}).items():
+            gk = (rd.get("group"), h)
+            if gk in seen:
+                continue
+            seen.add(gk)
+            res = rd.get("result") or {}
+            if res.get("same_money_as"):
+                merged += 1
+                continue
+            c = res.get("call") or "?"
+            calls[c] += 1
+            dv = _f((res.get("delta") or {}).get(res.get("metric") or "net"))
+            if c.endswith("better"):
+                better += dv
+            elif c.endswith("worse"):
+                worse += dv
+    return {"changes": len(st), "kinds": dict(kinds),
+            "live": sum(1 for it in st.values() if it.get("live_at")),
+            "not_live": sum(1 for it in st.values() if not it.get("live_at") and not it.get("skipped")),
+            "skipped": sum(1 for it in st.values() if it.get("skipped")),
+            "read_out": len(seen), "merged": merged, "calls": dict(calls),
+            "verdicts": dict(Counter(it["verdict"] for it in st.values() if it.get("verdict"))),
+            "better_usd_day": round(better, 2), "worse_usd_day": round(worse, 2)}
+
+
+def sec_registry(day: date, now: Optional[float] = None) -> dict:
+    iso = day.isoformat()
+    s, e = et_bounds(day)
+    now = now or time.time()
+    sync = registry_sync(day, now)
+    st = registry_state()
+    live = {k: it for k, it in st.items() if it.get("live_at") and not it.get("skipped")}
+    due, window = [], []
+    for k, it in live.items():
+        sp = _split_day(it)
+        if sp is None or sp > day:
+            continue
+        if _registry_due(it, day):
+            due.append(k)
+        elif sp < day < sp + timedelta(days=_horizon(it)):
+            window.append(k)
+    lo = day - timedelta(days=2 * REGISTRY_EXTEND_DAYS + 2)
+    need = {(lo + timedelta(days=i)).isoformat() for i in range((day - lo).days + 1)}
+    for k in due + window:
+        sp, h = _split_day(live[k]), _horizon(live[k])
+        need |= {(sp + timedelta(days=i)).isoformat() for i in range(-h, h + 1) if sp + timedelta(days=i) <= day}
+    _supply_days(need)                  # one pass over program_history for every readout
+    uk: set = set()
+    for d in sorted(need):
+        uk |= set(_day_agg(d) or {})
+    universe = {x for x, _e in uk}
+    we = pvd_wave_events() if any((it.get("scope") or {}).get("waves") for it in live.values()) else {}
+    fps: Dict[str, Optional[frozenset]] = {}
+
+    def footprint(sc: dict) -> Optional[frozenset]:
+        sk = scope_key(sc)
+        if sk not in fps:
+            if sk == "book":
+                fps[sk] = None
+            else:
+                m = scope_matcher(sc, universe, we)
+                fps[sk] = frozenset(x for x, ev in uk if m(x, ev))
+        return fps[sk]
+
+    # every change that can overlap a window read today, back to the oldest
+    # due readout's before window (the first run reads out 30 days at once)
+    near_lo = min([lo] + [_split_day(live[k]) - timedelta(days=_horizon(live[k])) for k in due])
+    near = [k for k, it in live.items() if near_lo <= _split_day(it) <= day]
+
+    def confounds(g: dict) -> Tuple[List[dict], int]:
+        sp, h = g["split"], g["horizon"]
+        mine = footprint(g["scope"])
+        out, n_book = [], 0
+        for k in near:
+            if k in g["keys"]:
+                continue
+            it = live[k]
+            sk = _split_day(it)
+            if not (sp - timedelta(days=h) <= sk <= sp + timedelta(days=h)):
+                continue
+            other = footprint(it.get("scope") or {})
+            if other is None or mine is None:
+                n_book += 1          # a whole-book change on either side: counted, not listed
+                continue
+            if mine & other:
+                out.append({"key": k, "split": sk.isoformat(), "subject": (it.get("subject") or "")[:90],
+                            "side": "before" if sk < sp else ("same day" if sk == sp else "after")})
+        out.sort(key=lambda x: x["split"])
+        return out[:12], n_book
+
+    readouts = []
+    for gk, g in registry_groups(st, due).items():
+        r = change_readout(g["scope"], g["split"], g["horizon"], day, g["metric"], universe, we)
+        cf, nb = confounds(g)
+        later = [c for c in cf if c["side"] == "after"]
+        exp_days = [st[k].get("expect_day") for k in g["keys"] if st[k].get("expect")]
+        r["_fp"] = footprint(g["scope"])
+        r.update(keys=g["keys"], group=gk, confounds=cf, book_changes_in_windows=nb,
+                 clean_days=((date.fromisoformat(later[0]["split"]) - g["split"]).days - 1) if later else g["horizon"],
+                 ids=sorted({i for k in g["keys"] for i in st[k].get("ids") or []}),
+                 kinds=sorted({st[k].get("kind") or "?" for k in g["keys"]}),
+                 expect="; ".join(dict.fromkeys(st[k]["expect"] for k in g["keys"] if st[k].get("expect"))),
+                 # pre-registered: the expectation was written before this readout's day
+                 expect_pre=bool(exp_days) and all(d_ and d_ < iso for d_ in exp_days),
+                 scope_by=sorted({st[k].get("scope_by") or "auto" for k in g["keys"]}),
+                 scope_basis="; ".join(sorted({str((st[k].get("scope") or {}).get("basis") or "")
+                                               for k in g["keys"]} - {""})),
+                 live=et_str(min(st[k]["live_at"] for k in g["keys"])))
+        readouts.append(r)
+    # false-discovery control across everything read out together: a call must
+    # survive Benjamini-Hochberg at q 0.10 (11/25's back-fill: 164 testable
+    # readouts, 23 called at |t| >= 2, where chance alone gives ~8 at p < 0.05)
+    qs = bh_qvalues([r.get("p") if r["call"] not in ("book-wide", "no data", "no activity") else None
+                     for r in readouts])
+    for r, q in zip(readouts, qs):
+        r["q"], r["fdr_ok"], r["fdr_m"] = q, q is not None and q <= REGISTRY_FDR_Q, sum(x is not None for x in qs)
+        r["call"] = change_call(r)
+    registry_clusters(readouts)
+    for r in readouts:
+        r.pop("_fp", None)
+        registry_append({"op": "readout", "keys": r["keys"], "group": r["group"], "horizon": r["horizon"],
+                         "day": iso, "result": r})
+        r["subjects"] = [st[k].get("subject") or "" for k in r["keys"]][:6]
+    rank = {"worse": 0, "new, worse": 0, "better": 1, "new, better": 1, "down": 2, "up": 2}
+    # called first (worse, then better); then the most suggestive by p, a big
+    # delta at p 0.9 being noise; whole-book last
+    readouts.sort(key=lambda r: (rank.get(r["call"], 3 if r["call"] != "book-wide" else 4),
+                                 r["p"] if r.get("p") is not None else 2.0,
+                                 -abs(_f((r.get("delta") or {}).get(r["metric"])))))
+    warns = []
+    for gk, g in registry_groups(st, window).items():
+        if g["scope"].get("book") or g["metric"] not in _MONEY or (day - g["split"]).days < 2:
+            continue
+        r = change_readout(g["scope"], g["split"], g["horizon"], day, g["metric"], universe, we)
+        dv, t = _f(r["delta"].get(g["metric"])), r["t"].get(g["metric"])
+        if r["after_days"] >= 2 and t is not None and t <= -REGISTRY_EARLY_T and \
+                dv <= -max(REGISTRY_EARLY_USD, 0.25 * abs(_f(r["before"].get(g["metric"])))):
+            warns.append({"keys": g["keys"], "subject": st[g["keys"][0]].get("subject"), "split": g["split"].isoformat(),
+                          "scope": r["scope"], "metric": g["metric"], "after_days": r["after_days"],
+                          "before": r["before"].get(g["metric"]), "after": r["after"].get(g["metric"]),
+                          "delta": dv, "t": t, "supply_ratio": r.get("supply_ratio"),
+                          "outside_delta": (r.get("outside") or {}).get("delta")})
+    warns.sort(key=lambda w: w["delta"])
+    went = sorted((it for it in st.values() if it.get("live_at") and s <= it["live_at"] < e),
+                  key=lambda it: it["live_at"])
+    went_rows = [{"key": it["key"], "at": et_str(it["live_at"]), "kind": it.get("kind"),
+                  "scope": scope_label(it.get("scope")), "scope_by": it.get("scope_by"),
+                  "basis": (it.get("scope") or {}).get("basis"), "subject": it.get("subject"),
+                  "ids": it.get("ids") or [], "skipped": it.get("skipped"), "live_basis": it.get("live_basis")}
+                 for it in went]
+    cutoff = now - 7 * 86400
+    pend = sorted((it for it in st.values() if it.get("full") and not it.get("live_at") and not it.get("skipped")),
+                  key=lambda it: -_f(it.get("ct")))
+    nxt: Counter = Counter()
+    for k in window:
+        nxt[(_split_day(live[k]) + timedelta(days=_horizon(live[k]))).isoformat()] += 1
+    return {"sync": sync, "board": registry_board(registry_state()),
+            "went_live": went_rows[:40], "n_went_live": len(went_rows),
+            "readouts": readouts[:REGISTRY_SHOW], "n_readouts": len(readouts),
+            # one call per cluster: a readout of the same money as another is listed, not counted
+            "readout_calls": dict(Counter(r["call"] for r in readouts if not r.get("same_money_as"))),
+            "n_merged": sum(1 for r in readouts if r.get("same_money_as")),
+            "warnings": warns[:10], "in_window": len(window),
+            "next_due": sorted(nxt.items())[:3],
+            "not_live": [{"key": it["key"], "at": et_str(_f(it.get("ct"))), "kind": it.get("kind"),
+                          "subject": it.get("subject")} for it in pend if _f(it.get("ct")) >= cutoff][:15],
+            "not_live_old": sum(1 for it in pend if _f(it.get("ct")) < cutoff)}
+
+
+def registry_ingest(day: date, items: list, first_time=None) -> dict:
+    """findings.json "changes": the review scopes what went live, skips what
+    cannot move P&L, and judges readouts."""
+    st = registry_state()
+    iso = day.isoformat()
+    res: Dict[str, list] = {"scoped": [], "judged": [], "skipped": [], "rejected": []}
+    for c in items[:100] if isinstance(items, list) else []:
+        if not isinstance(c, dict):
+            continue
+        raw = c.get("keys") or c.get("shas") or c.get("key") or c.get("sha")
+        raw = raw if isinstance(raw, list) else ([raw] if raw else [])
+        keys = [resolve_key(st, x) for x in raw]
+        if not keys or None in keys:
+            res["rejected"].append({"keys": [str(x) for x in raw[:6]],
+                                    "why": "unknown change key (use the Key column of evidence section 12)"})
+            continue
+        if first_time is not None and not first_time("changes", c):
+            continue
+        note = str(c.get("note") or "")[:400]
+        if c.get("skip"):
+            why = c["skip"] if isinstance(c["skip"], str) else (note or "skipped")
+            for k in keys:
+                registry_append({"op": "skip", "key": k, "note": str(why)[:300], "by": "review", "day": iso})
+            res["skipped"] += keys
+            continue
+        sc = None
+        if c.get("scope") is not None:
+            sc, why = clean_scope(c["scope"])
+            if sc is None:
+                res["rejected"].append({"keys": keys, "why": why})
+                continue
+        met = c.get("metric")
+        if met is not None and met not in CHANGE_METRICS:
+            res["rejected"].append({"keys": keys, "why": "metric must be one of " + ", ".join(CHANGE_METRICS)})
+            continue
+        v = c.get("verdict")
+        if v is not None and v not in CHANGE_VERDICTS:
+            res["rejected"].append({"keys": keys, "why": "verdict must be one of " + ", ".join(CHANGE_VERDICTS)})
+            continue
+        if sc is not None or met or c.get("expect"):
+            for k in keys:
+                registry_append({"op": "scope", "key": k, "scope": sc or st[k].get("scope"), "metric": met,
+                                 "expect": str(c.get("expect") or "")[:300] or None, "by": "review", "day": iso})
+            res["scoped"] += keys
+        if v is not None:
+            for k in keys:
+                registry_append({"op": "verdict", "key": k, "verdict": v, "note": note,
+                                 "finding": c.get("finding"), "by": "review", "day": iso})
+            res["judged"] += keys
+    return res
+
+
+def registry_add(sha: str, day: date, note: str = "") -> Optional[str]:
+    """Register a commit the rules missed (an imm_dashboard family rule, say)."""
+    code, out = _git("log", "-1", "--format=%x1e%H%x1f%ct%x1f%s%x1f%b%x1d", "--name-only", sha)
+    if code != 0:
+        return None
+    st = registry_state()
+    for chunk in out.split("\x1e"):
+        head, _, files = chunk.partition("\x1d")
+        parts = head.split("\x1f")
+        if len(parts) < 3 or not re.fullmatch(r"[0-9a-f]{40}", parts[0].strip()):
+            continue
+        full = parts[0].strip()
+        if any(it.get("full") == full for it in st.values()):
+            return next(k for k, it in st.items() if it.get("full") == full)
+        names = [l.strip() for l in files.splitlines() if l.strip()]
+        key = full[:7] if full[:7] not in st else full[:10]
+        registry_append({"op": "register", "key": key, "full": full, "kind": change_kind(names) or "manual",
+                         "ct": int(_f(parts[1])), "subject": parts[2].strip()[:200],
+                         "body": (parts[3] if len(parts) > 3 else "").strip()[:600], "files": names[:40],
+                         "ids": subject_ids(parts[2]), "registered": day.isoformat(), "note": note[:300],
+                         "scope": infer_scope(parts[2], parts[3] if len(parts) > 3 else "",
+                                              _family_aliases(_recent_series(day)))})
+        return key
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Before/after measurement for loop closure
 # ---------------------------------------------------------------------------
 
@@ -3413,7 +4603,9 @@ def measure(pattern: Optional[str], family: Optional[str], split: str,
             b = load_archive(d)
             if not b:
                 continue
-            a = defaultdict(float)
+            # every key present on an idle day too: summ() reads fills / rest / mt
+            # directly (the 11/26 headless run's finding: measure died on an idle-day scope)
+            a = defaultdict(float, {k: 0.0 for k in SUM_KEYS})
             for t, v in market_rows(b):
                 if match(t):
                     for k in SUM_KEYS:
@@ -3491,6 +4683,9 @@ def collect(day: date, bootstrap_days: int = 14, only: Optional[List[str]] = Non
         ev["changes"] = _section("changes", sec_changes, day)
     commits = (ev.get("changes") or {}).get("commits") or []
     ev["ledger"] = _section("ledger", sec_ledger, day, commits)
+    # every IMM change, measured at 7 days (Jack 2026-11-26); IMM_REVIEW_REGISTRY=0 turns it off
+    if want("registry") and os.environ.get("IMM_REVIEW_REGISTRY", "1") != "0":
+        ev["registry"] = _section("registry", sec_registry, day)
     if want("self"):          # last: it reads the other sections' times and the ledger
         ev["self"] = _section("self", sec_self, day, ev)
     ev["secs"] = round(time.time() - t0, 1)
@@ -3925,6 +5120,7 @@ def render_evidence(ev: dict) -> str:
         if mo.get("review_calibration"):
             a(f"The review's own calibration (realised / predicted $/day, by kind): {mo['review_calibration']}")
     render_self(ev.get("self") or {}, a)
+    render_registry(ev.get("registry") or {}, a)
     a("")
     return "\n".join(L)
 
@@ -4017,6 +5213,122 @@ def render_self(se: dict, a) -> None:
             a(f"Never fired in {WATCH_STALE_DAYS}+ days (retire?): {', '.join(w['stale'])}")
 
 
+def _cell(s, n: int = 100) -> str:
+    return _one_line(str(s or "").replace("|", "/"), n)
+
+
+def render_registry(rg: dict, a) -> None:
+    a(f"\n## 12. Change registry (every IMM change, measured at {REGISTRY_DAYS} days)")
+    if not rg:
+        a("- not collected (IMM_REVIEW_REGISTRY=0 turns it off)")
+        return
+    if rg.get("error"):
+        a(f"- ERROR: {rg['error']}")
+        return
+    a(f"Every commit that changes what the bot does, and every IMM_* env change a bot run started with, is "
+      f"read out {REGISTRY_DAYS} full ET days after the day it went live against the {REGISTRY_DAYS} before, "
+      "on the series it names (Jack 11/26). Before/after, not causal: rewards MODELLED, trading MEASURED "
+      "at the last trade; 'outside' is the rest of the book over the same days; supply x is the program "
+      "pool on the scope's series, after / before. p is an exact permutation p (every split of the days); "
+      f"q is Benjamini-Hochberg across today's readouts, and a call needs p <= {REGISTRY_P} and q <= "
+      f"{REGISTRY_FDR_Q}; 'can see' is the smallest move this test detects 80% of the time. A 'no clear "
+      "change' whose expected move is under 'can see' is can't-tell, not no-effect.")
+    b = rg.get("board") or {}
+    sy = rg.get("sync") or {}
+    kinds = ", ".join(f"{n} {k}" for k, n in sorted((b.get("kinds") or {}).items(), key=lambda x: -x[1]))
+    calls = ", ".join(f"{n} {c}" for c, n in sorted((b.get("calls") or {}).items(), key=lambda x: -x[1])) or "none yet"
+    verd = ", ".join(f"{n} {v}" for v, n in sorted((b.get("verdicts") or {}).items(), key=lambda x: -x[1])) or "none yet"
+    a(f"**Registry:** {b.get('changes')} changes ({kinds}); {b.get('live')} live, {b.get('not_live')} not live, "
+      f"{b.get('skipped')} skipped. {b.get('read_out')} readouts so far, {b.get('merged') or 0} of them the same "
+      f"money as another (live within a day on overlapping series), counted once: {calls}. The review's "
+      f"verdicts: {verd}. Calls of better add up to {usd(b.get('better_usd_day'))}/day, worse to "
+      f"{usd(b.get('worse_usd_day'))}/day (before/after deltas, one per cluster).")
+    if sy.get("first"):
+        a(f"**First run:** registered {len(sy.get('registered') or [])} changes since {sy.get('since')}; every "
+          f"one past its {REGISTRY_DAYS} days is read out today, so only the {REGISTRY_SHOW} biggest are listed.")
+    elif sy.get("registered"):
+        a(f"Registered since the last run: {len(sy['registered'])} ({sy.get('env')} env).")
+    wl = rg.get("went_live") or []
+    a(f"**Went live on the day** ({rg.get('n_went_live')}). Scope each one whose guess is wrong, and skip what "
+      "cannot move P&L, in findings.json `changes` (SKILL.md step 7):")
+    if wl:
+        a("| Key | Live (ET) | Kind | Scope (from) | Subject |")
+        a("|---|---|---|---|---|")
+        for w in wl:
+            by = w.get("basis") if w.get("scope_by") == "auto" else f"set by {w.get('scope_by')}"
+            skip = f" SKIPPED: {w['skipped']}" if w.get("skipped") else ""
+            a(f"| {w['key']} | {w['at']} | {w['kind']} | {_cell(w['scope'], 60)} ({_cell(by, 50)}) | "
+              f"{_cell(w['subject'], 120)}{_cell(skip, 80)} |")
+    else:
+        a("- none")
+    ro = rg.get("readouts") or []
+    rc = ", ".join(f"{n} {c}" for c, n in sorted((rg.get("readout_calls") or {}).items(), key=lambda x: -x[1]))
+    if rg.get("n_merged"):
+        rc += f"; {rg['n_merged']} more are the same money as one of these"
+    a(f"**Read out today** ({rg.get('n_readouts')}{'' if not rc else ': ' + rc}"
+      f"{'' if len(ro) == rg.get('n_readouts') else f'; the {len(ro)} biggest listed'}). Judge each in "
+      "findings.json `changes` (worked / hurt / no-effect / inconclusive / extend):")
+    if ro:
+        a("| Keys | Live | Scope | Net/day before -> after | Delta (t; p; q) | Can see | Rewards / Trading delta | "
+          "Outside delta | Supply x | Call | Overlapping changes |")
+        a("|---|---|---|---:|---:|---:|---:|---:|---:|---|---|")
+        for r in ro:
+            bb, aa, d, t = r.get("before") or {}, r.get("after") or {}, r.get("delta") or {}, r.get("t") or {}
+            m = r.get("metric") or "net"
+            md = "" if m == "net" else f" ({m}: {_fmt(bb.get(m))} -> {_fmt(aa.get(m))}, t {_fmt(t.get(m))})"
+            ov = len(r.get("confounds") or [])
+            ovs = (f"{ov} on its series" if ov else "none on its series") + (
+                f" + {r.get('book_changes_in_windows')} whole-book" if r.get("book_changes_in_windows") else "")
+            a(f"| {', '.join(r.get('keys') or [])[:60]} | {r.get('split')} | {_cell(r.get('scope'), 50)} | "
+              f"{usd(bb.get('net'))} -> {usd(aa.get('net'))} | {usd(d.get('net'))} "
+              f"({_fmt(t.get('net'))}; {_fmt(r.get('p'), 3)}; {_fmt(r.get('q'), 3)}) | "
+              f"{'' if r.get('mde') is None else ('+/-' + usd(r['mde'], False))} | "
+              f"{usd(d.get('rew'))} / {usd(d.get('pnl'))} | {usd((r.get('outside') or {}).get('delta'))} | "
+              f"{_fmt(r.get('supply_ratio'))} | {r.get('call')}{md} | {ovs} |")
+        a("Details:")
+        for r in ro:
+            subj = " / ".join(_cell(s, 110) for s in (r.get("subjects") or [])[:3])
+            more = len(r.get("keys") or []) - 3
+            a(f"- {', '.join(r.get('keys') or [])} ({'/'.join(r.get('kinds') or [])}; live {r.get('live')} ET; "
+              f"scope by {'/'.join(r.get('scope_by') or [])}"
+              f"{' from ' + _cell(r['scope_basis'], 60) if r.get('scope_basis') else ''}; {r.get('series_hit')} series, e.g. "
+              f"{', '.join(r.get('series_sample') or [])[:80]}): {subj}{f' (+{more} more)' if more > 0 else ''}")
+            extra = []
+            if r.get("same_money_as"):
+                extra.append("SAME MONEY as " + ", ".join(r["same_money_as"]) + " (counted there; judge them together)")
+            if r.get("ids"):
+                extra.append("ledger " + ", ".join(r["ids"]))
+            if r.get("expect"):
+                extra.append(("pre-registered: " if r.get("expect_pre") else "expected (written at the readout, "
+                              "not pre-registered): ") + _cell(r["expect"], 160))
+            if r.get("confounds"):
+                extra.append("overlapping: " + "; ".join(f"{c['key']} {c['side']} {c['split'][5:]} "
+                                                        f"{_cell(c['subject'], 60)}" for c in r["confounds"][:5]))
+            if r.get("clean_days") is not None and r["clean_days"] < r.get("horizon", REGISTRY_DAYS):
+                extra.append(f"{r['clean_days']} clean days before the next overlapping change")
+            n1k = r.get("net_per_1k") or {}
+            extra.append(f"net per $1k resting {_fmt(n1k.get('before'))} -> {_fmt(n1k.get('after'))}; "
+                         f"$ resting {usd0((r.get('before') or {}).get('rest'), False)} -> "
+                         f"{usd0((r.get('after') or {}).get('rest'), False)}; fills "
+                         f"{_fmt((r.get('before') or {}).get('fills'), 1)} -> {_fmt((r.get('after') or {}).get('fills'), 1)}"
+                         f"; daily net after: {', '.join(f'{x[0]} {x[1]:+.0f}' for x in (r.get('daily') or {}).get('after') or [])}")
+            a("  " + "; ".join(extra))
+    else:
+        a("- none due")
+    if rg.get("warnings"):
+        a("**Early warnings** (in their window and down hard already; look now, don't wait for day 7):")
+        for w in rg["warnings"]:
+            a(f"- {', '.join(w['keys'])} live {w['split']} ({_cell(w['scope'], 50)}): {w['metric']} "
+              f"{usd(w['before'])} -> {usd(w['after'])}/day over {w['after_days']} days (t {_fmt(w['t'])}); "
+              f"supply x {_fmt(w.get('supply_ratio'))}; outside {usd(w.get('outside_delta'))}: {_cell(w['subject'], 100)}")
+    nd = ", ".join(f"{d} ({n})" for d, n in rg.get("next_due") or [])
+    a(f"In their window: {rg.get('in_window')} changes; next readouts: {nd or 'none scheduled'}.")
+    nl = rg.get("not_live") or []
+    if nl:
+        a(f"**Committed, not live yet** (no bot run or main has them; {rg.get('not_live_old')} older ones never went live): "
+          + "; ".join(f"{x['key']} {x['at']} {_cell(x['subject'], 70)}" for x in nl))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -4058,6 +5370,77 @@ def _print_item(it: dict) -> None:
     print(json.dumps(it, indent=1, sort_keys=True, default=str))
 
 
+def _changes_cli(a, ap) -> int:
+    day = _day_arg(a.day)
+    if a.action == "sync":
+        print(json.dumps(registry_sync(day), indent=1))
+        return 0
+    if a.action == "add":
+        if not a.key:
+            ap.error("changes add needs a commit sha")
+        k = registry_add(a.key, day, a.note)
+        if not k:
+            print(f"no commit {a.key}")
+            return 1
+        res = registry_sync(day)
+        print(f"registered {k}; {res['resolved']} resolved live")
+        return 0
+    st = registry_state()
+    if a.action == "list":
+        horizon = time.time() - 14 * 86400
+        rows = sorted(st.values(), key=lambda it: -_f(it.get("live_at") or it.get("ct")))
+        for it in rows:
+            if not a.all and _f(it.get("live_at") or it.get("ct")) < horizon:
+                continue
+            rd = (it.get("readouts") or {}).get(str(_horizon(it))) or {}
+            call = (rd.get("result") or {}).get("call")
+            state = ("skipped" if it.get("skipped") else it.get("verdict") or call
+                     or ("live" if it.get("live_at") else "not live"))
+            when = et_str(it["live_at"]) if it.get("live_at") else "not live"
+            print(f"{it['key']} [{it.get('kind')}/{state}] {when} | {scope_label(it.get('scope'))} | "
+                  f"{_one_line(it.get('subject'), 100)}")
+        return 0
+    k = resolve_key(st, a.key)
+    if not k:
+        print(f"no change {a.key}")
+        return 1
+    it = st[k]
+    if a.action == "show":
+        _print_item(it)
+        return 0
+    if a.action == "readout":
+        sp = _split_day(it)
+        if sp is None:
+            print(f"{k} is not live yet")
+            return 1
+        print(json.dumps(change_readout(it.get("scope"), sp, _horizon(it), day, it.get("metric") or "net"),
+                         indent=1, default=str))
+        return 0
+    if a.action == "skip":
+        registry_append({"op": "skip", "key": k, "note": a.note or "skipped by hand", "by": a.by,
+                         "day": day.isoformat()})
+    elif a.action == "verdict":
+        if a.verdict not in CHANGE_VERDICTS:
+            ap.error("verdict takes " + "|".join(CHANGE_VERDICTS))
+        registry_append({"op": "verdict", "key": k, "verdict": a.verdict, "note": a.note, "by": a.by,
+                         "day": day.isoformat()})
+    elif a.action == "scope":
+        raw = {"book": a.book, "series": a.series, "families": [a.family] if a.family else None,
+               "groups": [a.group] if a.group else None, "events": a.event, "waves": a.wave,
+               "pattern": a.pattern, "basis": a.note or f"set by {a.by}"}
+        sc = None
+        if any(raw[x] for x in ("book", "series", "families", "groups", "events", "waves", "pattern")):
+            sc, why = clean_scope(raw)
+            if sc is None:
+                ap.error(why)
+        if sc is None and not a.metric and not a.expect:
+            ap.error("changes scope needs a scope flag, --metric or --expect")
+        registry_append({"op": "scope", "key": k, "scope": sc or it.get("scope"), "metric": a.metric,
+                         "expect": a.expect, "by": a.by, "day": day.isoformat()})
+    print(f"{a.action}: {k}")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -4084,6 +5467,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     w.add_argument("--day")
     w.add_argument("--note", default="")
     w.add_argument("--all", action="store_true")
+    ch = sub.add_parser("changes", help="the change registry (daily_review/changes.jsonl)")
+    ch.add_argument("action", choices=("list", "show", "sync", "readout", "add", "scope", "verdict", "skip"))
+    ch.add_argument("key", nargs="?")
+    ch.add_argument("verdict", nargs="?")
+    ch.add_argument("--day")
+    ch.add_argument("--note", default="")
+    ch.add_argument("--all", action="store_true")
+    ch.add_argument("--by", default="jack")
+    for f in ("series", "family", "group", "event", "wave", "pattern", "expect"):
+        ch.add_argument("--" + f)
+    ch.add_argument("--book", action="store_true")
+    ch.add_argument("--metric", choices=CHANGE_METRICS)
     pp = sub.add_parser("put", help="write findings.json or review.md from stdin into the day's folder")
     pp.add_argument("name", choices=PUT_NAMES)
     pp.add_argument("--day")
@@ -4129,6 +5524,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         res = watches_ingest(_day_arg(a.day), [], [{"id": a.id, "note": a.note}])
         print(json.dumps(res))
         return 0 if res["retired"] else 1
+    if a.cmd == "changes":
+        return _changes_cli(a, ap)
     # ledger
     if a.action == "list":
         for iid, it in sorted(ledger_state().items()):

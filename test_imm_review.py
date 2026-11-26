@@ -824,6 +824,15 @@ class MeasureTests(Base):
         self.assertAlmostEqual(out["after"]["net_day"], 13)
         self.assertAlmostEqual(out["delta_net_day"], 8)
 
+    def test_idle_days_do_not_crash(self):
+        """The 11/26 headless run: measure died on a scope idle for a day."""
+        split = DAY
+        for i in range(1, 4):
+            self.archive(split - timedelta(days=i), {"KXZZ-B-1": _row(rew=99)})          # the scope idle before
+            self.archive(split + timedelta(days=i), {"KXRT-A-1": _row(rew=12, fills=2, rest=500)})
+        out = rv.measure("^KXRT", None, split.isoformat(), 3, 3)
+        self.assertEqual((out["before"]["net_day"], out["after"]["net_day"]), (0.0, 12.0))
+
 
 class CollectAndSendTests(Base):
     def setUp(self):
@@ -1329,6 +1338,334 @@ class CompoundEmailTests(Base):
         self.assertIn("self", evj)
         with open(os.path.join(self.review, DAY.isoformat(), "evidence.md"), encoding="utf-8") as fh:
             self.assertIn("## 11. The review itself", fh.read())
+
+
+class RegistryTests(Base):
+    """The change registry (section 12): every IMM change, measured at 7 days."""
+
+    FAMS = {"KXVERA": ("AI & tech", "Vercel shares"), "KXVERB": ("AI & tech", "Vercel shares"),
+            "KXSPA": ("Sports & awards", "Sports ladders")}
+
+    def setUp(self):
+        super().setUp()
+        rv._FAM_FN = lambda s: self.FAMS.get(s, ("Fam " + s[:4], s))
+
+    def repo_file(self, name, text=""):
+        with open(os.path.join(self.root, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_bot_modules_and_change_kinds(self):
+        self.repo_file("incentive_mm.py", "import os\nimport foo_fair\n    from bar import x\ndef f():\n"
+                                          "    import baz as b, qux\n    import imm_dashboard\n"
+                                          '"""\nfrom the docstring\n"""\n')
+        self.repo_file("foo_fair.py", "import kalshi_lib\n")
+        for n in ("bar.py", "baz.py", "kalshi_lib.py", "imm_dashboard.py", "email_mod.py"):
+            self.repo_file(n)
+        self.repo_file("pvd_scan.py", "import email_mod\n")          # a writer's imports are not followed
+        self.assertEqual(rv.bot_modules(), {"foo_fair.py", "bar.py", "baz.py", "kalshi_lib.py"})
+        self.assertEqual(rv.change_kind(["incentive_mm.py", "test_incentive_mm.py"]), "bot")
+        self.assertEqual(rv.change_kind(["run_incentive_mm.ps1"]), "launcher")
+        self.assertEqual(rv.change_kind(["kalshi_lib.py"]), "input")
+        self.assertEqual(rv.change_kind(["pvd_scan.py", "test_pvd_scan.py"]), "input")
+        self.assertIsNone(rv.change_kind(["email_mod.py"]))
+        self.assertIsNone(rv.change_kind(["imm_dashboard.py", "imm_review.py"]))
+        self.assertIsNone(rv.change_kind(["README.md", ".claude/skills/x/SKILL.md"]))
+
+    def test_scope_from_what_the_commit_names(self):
+        al = rv._family_aliases(["KXVERA", "KXVERB", "KXSPA"])
+        self.assertEqual(al["vercel"], ("groups", "Vercel shares"))
+        self.assertEqual(al["sports"], ("families", "Sports & awards"))
+        s = rv.infer_scope("imm: the RCP weekly (KXAPRPOTUS) stands down; Vercel too", "", al)
+        self.assertEqual(s["series"], ["KXAPRPOTUS"])
+        self.assertNotIn("groups", s)                 # a named series is not widened to a family
+        self.assertEqual(rv.infer_scope("imm: the Vercel bid-edge margin 3c -> 2c", "", al)["groups"],
+                         ["Vercel shares"])
+        s = rv.infer_scope("imm: sports ladders x4", "", al)
+        self.assertEqual(s["groups"], ["Sports ladders"])  # the longest alias wins
+        self.assertNotIn("families", s)
+        self.assertEqual(rv.infer_scope("imm: RT ladder lean x2.25", "", al)["series"], ["KXRT"])
+        s = rv.infer_scope("imm: a held market's close is never held back", "e.g. KXFOO-26 and KXBAR", al)
+        self.assertEqual(s["series"], ["KXFOO", "KXBAR"])
+        self.assertIn("body", s["basis"])
+        self.assertEqual(rv.infer_scope("pvd waves: --cost-mult", "the w1111-elec2028 long shots", al)["waves"],
+                         ["w1111-elec2028"])
+        self.assertTrue(rv.infer_scope("imm: state save retries", "", al)["book"])
+        sc, why = rv.clean_scope({"series": "KXA, KXB", "families": "Elections"})
+        self.assertEqual((sc["series"], sc["families"]), (["KXA", "KXB"], ["Elections"]))
+        self.assertIsNone(rv.clean_scope({"pattern": "("})[0])
+        self.assertIsNone(rv.clean_scope({})[0])
+
+    def test_live_times(self):
+        A, B, C, D = "1" * 40, "2" * 40, "3" * 40, "4" * 40
+        order, parents = [D, C, B, A], {D: [C], C: [B], B: [A], A: []}
+        reflog = [(100, A), (200, B), (300, D)]                       # C reached main with D
+        runs = [{"ts": 150.0, "run_id": "r1", "sha": A[:7], "src": 90.0},
+                {"ts": 260.0, "run_id": "r2", "sha": B[:7], "src": 250.0},   # the file changed after B landed
+                {"ts": 400.0, "run_id": "r3", "sha": D[:7], "src": 300.0}]
+        commits = [{"full": A, "kind": "bot", "ct": 95}, {"full": B, "kind": "bot", "ct": 190},
+                   {"full": C, "kind": "bot", "ct": 280}, {"full": D, "kind": "input", "ct": 290}]
+        live = rv.resolve_live(order, parents, reflog, runs, commits)
+        self.assertEqual(live[A][0], 150.0)
+        self.assertEqual(live[B][0], 260.0)
+        self.assertEqual(live[C][0], 260.0)           # the run on its uncommitted edits, not r3
+        self.assertIn("before they were committed", live[C][1])
+        self.assertEqual(live[D][0], 300.0)           # an input writer: when main got it
+        self.assertEqual(rv.resolve_live(order, parents, reflog, runs[:1], commits[2:3]), {})   # not live yet
+
+    def test_env_changes_skip_reordered_sets_and_secrets(self):
+        runs = [{"ts": 1.0, "run_id": "r1", "sha": "x", "config": {
+                    "IMM_A": "1", "IMM_SET": "frozenset({'X', 'Y'})", "IMM_HEARTBEAT_URL": "u1", "code:Z": 1}},
+                {"ts": 2.0, "run_id": "r2", "sha": "x", "config": {
+                    "IMM_A": "2", "IMM_SET": "frozenset({'Y', 'X'})", "IMM_HEARTBEAT_URL": "u2", "code:Z": 2,
+                    "IMM_BLOCK": "['KXFOO', 'KXBAR']"}}]
+        ch = {c["key"]: c for c in rv.env_changes(runs)}
+        self.assertEqual(sorted(ch), ["env:IMM_A@r2", "env:IMM_BLOCK@r2"])
+        self.assertEqual(ch["env:IMM_A@r2"]["change"], "1 -> 2")
+        self.assertEqual(ch["env:IMM_BLOCK@r2"]["tokens"], ["KXBAR", "KXFOO"])
+
+    def _days(self, split, before, after, extra=None):
+        for i in range(1, 8):
+            self.archive(split - timedelta(days=i), {**before(i), **(extra or {})})
+            self.archive(split + timedelta(days=i), {**after(i), **(extra or {})})
+
+    def test_readout_and_its_call(self):
+        S = DAY - timedelta(days=8)
+        self._days(S, lambda i: {"KXAA-E1-T1": _row(rew=10 + i % 2, pnl=-5, rest=1000)},
+                   lambda i: {"KXAA-E1-T1": _row(rew=20 + i % 2, pnl=5, rest=1000)},
+                   {"KXZZ-E-T1": _row(rew=50)})
+        self.jsonl("program_history.jsonl", [{"date": (S + timedelta(days=i)).isoformat(), "series": "KXAA",
+                                              "total_reward_raw": 1e6} for i in range(-7, 8) if i])
+        end = S + timedelta(days=7)
+        r = rv.change_readout({"series": ["KXAA"]}, S, 7, end)
+        self.assertEqual((r["before_days"], r["after_days"]), (7, 7))
+        self.assertAlmostEqual(r["delta"]["net"], 20.0, places=1)
+        self.assertEqual(r["call"], "better")
+        self.assertAlmostEqual(r["outside"]["delta"], 0.0)
+        self.assertEqual(r["supply_ratio"], 1.0)
+        self.assertEqual(rv.change_readout({"book": True}, S, 7, end)["call"], "book-wide")
+        self.assertEqual(rv.change_readout({"series": ["KXNONE"]}, S, 7, end)["call"], "no activity")
+        self.assertEqual(rv.change_readout({"series": ["KXAA"]}, S, 7, end, metric="fills")["call"],
+                         "no clear change")
+        self.assertEqual(rv.change_readout({"series": ["KXAA"]}, S, 7, S + timedelta(days=3))["after_days"], 3)
+
+    def test_exact_permutation_p_fdr_and_power(self):
+        self.assertEqual(rv.perm_p([0.0] * 7, [1.0] * 7), round(2 / 3432, 5))   # the two extreme splits of 3,432
+        self.assertEqual(rv.perm_p([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]), 1.0)
+        self.assertIsNone(rv.perm_p([1.0], [2.0, 3.0]))
+        big = rv.perm_p([0.0, 1.0] * 8, [5.0, 6.0] * 8)                            # C(32,16): sampled, seeded
+        self.assertLess(big, 0.001)
+        self.assertEqual(big, rv.perm_p([0.0, 1.0] * 8, [5.0, 6.0] * 8))
+        self.assertEqual(rv.bh_qvalues([0.01, 0.04, 0.03, 0.2, None]), [0.04, 0.05333, 0.05333, 0.2, None])
+        a, b = [0, 2, 0, 2, 0, 2, 0], [1, 3, 1, 3, 1, 3, 1]
+        import statistics as st_
+        self.assertAlmostEqual(rv.mde(a, b), round(2.8 * math.sqrt(st_.variance(a) / 7 + st_.variance(b) / 7), 2))
+        r = {"before_days": 7, "after_days": 7, "metric": "net", "p": 0.01,
+             "before": {"net": 5, "fills": 2, "rest": 500}, "after": {"net": 25}, "delta": {"net": 20}}
+        self.assertEqual(rv.change_call(r), "better")                   # a lone readout
+        self.assertEqual(rv.change_call(dict(r, fdr_ok=False)), "no clear change")   # fails the batch's FDR
+        self.assertEqual(rv.change_call(dict(r, p=0.2)), "no clear change")
+
+    def test_overlapping_readouts_count_once(self):
+        """The 11/26 headless run: two weekend-rain readouts were the same -$63/day."""
+        rs = [{"split": "2026-11-10", "group": "g1", "keys": ["a"], "_fp": frozenset({"KXAA"}), "p": 0.01},
+              {"split": "2026-11-10", "group": "g2", "keys": ["b"], "_fp": frozenset({"KXAA", "KXBB"}), "p": 0.02},
+              {"split": "2026-11-11", "group": "g3", "keys": ["c"], "_fp": frozenset({"KXAA"}), "p": 0.03},
+              {"split": "2026-11-10", "group": "g4", "keys": ["d"], "_fp": frozenset({"KXCC"}), "p": 0.04},
+              {"split": "2026-11-10", "group": "g5", "keys": ["e"], "_fp": None, "p": None}]
+        rv.registry_clusters(rs)
+        self.assertEqual((rs[0]["same_money_as"], rs[0]["cluster"]), (["b"], "g2"))  # no call: the widest leads
+        self.assertNotIn("same_money_as", rs[1])
+        self.assertNotIn("same_money_as", rs[2])                     # the next day: its own window
+        self.assertNotIn("same_money_as", rs[3])                     # other series
+        self.assertNotIn("cluster", rs[4])                           # whole book: never merged
+        # a narrow change that was called leads a wider one that was not
+        rs2 = [{"split": "2026-11-10", "group": "w", "keys": ["wide"], "_fp": frozenset({"KXAA", "KXBB", "KXCC"}),
+                "p": 0.6, "call": "no clear change"},
+               {"split": "2026-11-10", "group": "n", "keys": ["narrow"], "_fp": frozenset({"KXAA"}), "p": 0.004,
+                "q": 0.05, "call": "worse", "metric": "net", "delta": {"net": -63.0}}]
+        rv.registry_clusters(rs2)
+        self.assertEqual(rs2[0]["same_money_as"], ["narrow"])
+        self.assertNotIn("same_money_as", rs2[1])
+        st = {"a": {"kind": "bot", "readouts": {"7": {"group": "g1", "result": {
+                  "call": "worse", "metric": "net", "delta": {"net": -60.0}, "same_money_as": ["b"]}}}},
+              "b": {"kind": "bot", "readouts": {"7": {"group": "g2", "result": {
+                  "call": "worse", "metric": "net", "delta": {"net": -63.0}}}}}}
+        b = rv.registry_board(st)
+        self.assertEqual((b["calls"], b["worse_usd_day"], b["merged"], b["read_out"]), ({"worse": 1}, -63.0, 1, 2))
+
+    def test_registry_off_switch(self):
+        with mock.patch.dict(os.environ, {"IMM_REVIEW_REGISTRY": "0"}), \
+                mock.patch.object(rv, "_ps_json", return_value=[]), mock.patch.object(rv, "_run", return_value=(0, "")):
+            ev = rv.collect(DAY, only=["registry"])
+        self.assertNotIn("registry", ev)
+        a = []
+        rv.render_registry({}, a.append)
+        self.assertIn("IMM_REVIEW_REGISTRY=0", "\n".join(a))
+
+    def test_small_moves_and_new_scopes(self):
+        S = DAY - timedelta(days=8)
+        self._days(S, lambda i: {"KXAA-E1-T1": _row(rew=100 + i % 2, rest=1000)},
+                   lambda i: {"KXAA-E1-T1": _row(rew=103 + i % 2, rest=1000),       # +3/day: under $5
+                              "KXNEW-E1-T1": _row(rew=30 + i % 3, rest=500)})
+        end = S + timedelta(days=7)
+        self.assertEqual(rv.change_readout({"series": ["KXAA"]}, S, 7, end)["call"], "no clear change")
+        self.assertEqual(rv.change_readout({"series": ["KXNEW"]}, S, 7, end)["call"], "new, better")
+
+    # an end-to-end registry: git (mocked), bot runs, archives
+    def _seed(self):
+        self.S = S = DAY - timedelta(days=8)
+        self.P, self.C1, self.C2, self.C3 = P, C1, C2, C3 = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+        self.k1, self.k3 = C1[:7], C3[:7]
+        ct = {P: int(_ts(DAY - timedelta(days=20))), C1: int(_ts(S, 10, 0)), C2: int(_ts(S, 11, 0)),
+              C3: int(_ts(DAY, 9, 0))}
+        meta = [(C3, "imm launcher: collateral budget 100 -> 200 (Jack 2026-11-24: \"yes\")", "",
+                 ["run_incentive_mm.ps1"]),
+                (C2, "docs: the handoff", "", ["INCENTIVE_MM_HANDOFF.md"]),
+                (C1, "imm: KXAA quotes x2 (Jack 2026-11-16: \"yes\")", "", ["incentive_mm.py", "test_incentive_mm.py"])]
+        self.log_out = "".join(f"\x1e{h}\x1f{ct[h]}\x1f{s}\x1f{b}\x1d\n" + "\n".join(f) + "\n" for h, s, b, f in meta)
+        self.rev_out = f"{C3} {C2}\n{C2} {C1}\n{C1} {P}\n{P}\n"
+        self.reflog_out = "".join(f"{h}\x1fmain@{{{ct[h]}}}\n" for h in (C3, C2, C1, P))
+        runs = [(_ts(S - timedelta(days=1)), "r0", P, ct[P], "100"),
+                (_ts(S, 10, 3), "r1", C1, _ts(S, 10, 0), "100"),
+                (_ts(DAY, 9, 2), "r2", C3, _ts(S, 10, 0), "200")]
+        by_day = defaultdict(list)
+        for ts, rid, h, src, budget in runs:
+            u = datetime.fromtimestamp(ts, timezone.utc)
+            by_day[u.date().isoformat()].append({"ts": u.isoformat(), "run_id": rid, "git_sha": h[:7],
+                                                 "source_mtime": src,
+                                                 "config": {"IMM_COLLATERAL_BUDGET": budget}})
+        for u, rows in by_day.items():
+            self.jsonl(f"config_history_{u}.jsonl", rows)
+        self._days(S, lambda i: {"KXAA-E1-T1": _row(rew=10 + i % 2, rest=1000)},
+                   lambda i: {"KXAA-E1-T1": _row(rew=30 + i % 2, rest=1000)}, {"KXZZ-E-T1": _row(rew=50)})
+        self.now = _ts(DAY + timedelta(days=1), 4)
+
+    def fake_git(self, *args, timeout=60):
+        return {"log": (0, self.log_out), "rev-list": (0, self.rev_out),
+                "reflog": (0, self.reflog_out)}.get(args[0], (1, ""))
+
+    def _sec(self, day=DAY, now=None):
+        with mock.patch.object(rv, "_git", side_effect=self.fake_git):
+            return rv.sec_registry(day, now=now or self.now)
+
+    def test_registers_resolves_and_reads_out(self):
+        self._seed()
+        rg = self._sec()
+        st = rv.registry_state()
+        env = "env:IMM_COLLATERAL_BUDGET@r2"
+        self.assertTrue(rg["sync"]["first"])
+        self.assertEqual(sorted(st), sorted([self.k1, self.k3, env]))          # not the docs commit
+        self.assertEqual(st[self.k1]["kind"], "bot")
+        self.assertEqual(st[self.k1]["scope"]["series"], ["KXAA"])
+        self.assertAlmostEqual(st[self.k1]["live_at"], round(_ts(self.S, 10, 3), 1))
+        self.assertAlmostEqual(st[self.k3]["live_at"], round(_ts(DAY, 9, 2), 1))
+        self.assertIn("launcher commit " + self.k3, st[env]["skipped"])         # one change, measured once
+        self.assertEqual(rg["n_readouts"], 1)
+        r = rg["readouts"][0]
+        self.assertEqual((r["keys"], r["call"]), ([self.k1], "better"))
+        self.assertAlmostEqual(r["delta"]["net"], 20.0, places=1)
+        self.assertEqual((r["p"], r["q"], r["fdr_ok"]), (round(2 / 3432, 5), round(2 / 3432, 5), True))
+        self.assertIsNotNone(r["mde"])
+        self.assertFalse(r["expect_pre"])                                       # nothing was registered
+        self.assertEqual(sorted(w["key"] for w in rg["went_live"]), sorted([self.k3, env]))
+        self.assertEqual(rg["board"]["read_out"], 1)
+        self.assertEqual(rg["next_due"], [])
+        # an expectation written the day it went live is pre-registered; a second
+        # collect of the day recomputes and registers nothing new
+        rv.registry_ingest(self.S, [{"sha": self.k1, "expect": "KXAA net up with x2 size"}])
+        rg2 = self._sec()
+        self.assertEqual((rg2["sync"]["registered"], rg2["n_readouts"]), ([], 1))
+        self.assertTrue(rg2["readouts"][0]["expect_pre"])
+        # the next day: nothing due again
+        self.assertEqual(self._sec(DAY + timedelta(days=1), self.now + 86400)["n_readouts"], 0)
+        a = []
+        rv.render_registry(rg, a.append)
+        md = "\n".join(a)
+        self.assertIn("## 12. Change registry", md)
+        self.assertIn(self.k1, md)
+        self.assertIn("better", md)
+
+    def test_ingest_scopes_judges_and_extends(self):
+        self._seed()
+        self._sec()
+        d = os.path.join(self.review, DAY.isoformat())
+        rv._write_json(os.path.join(d, "findings.json"), {"findings": [], "changes": [
+            {"sha": self.k1, "verdict": "worked", "note": "x2 paid for itself"},
+            {"sha": self.k3, "scope": {"book": True}, "metric": "rew", "expect": "more rewards for the collateral"},
+            {"sha": "deadbee", "verdict": "worked"},
+            {"sha": self.k1, "verdict": "great"}]})
+        res = rv.ledger_ingest(DAY)["changes"]
+        self.assertEqual((res["judged"], res["scoped"], len(res["rejected"])), ([self.k1], [self.k3], 2))
+        n = len(list(rv._iter_jsonl(rv.registry_path())))
+        rv.ledger_ingest(DAY)                                     # idempotent
+        self.assertEqual(len(list(rv._iter_jsonl(rv.registry_path()))), n)
+        st = rv.registry_state()
+        self.assertEqual(st[self.k1]["verdict"], "worked")
+        self.assertEqual((st[self.k3]["metric"], st[self.k3]["scope_by"]), ("rew", "review"))
+        # a scope changed after its readout is read out again
+        nxt = DAY + timedelta(days=1)
+        self.assertFalse(rv._registry_due(st[self.k1], nxt))
+        rv.registry_ingest(nxt, [{"sha": self.k1, "scope": {"series": ["KXZZ"]}}])
+        self.assertTrue(rv._registry_due(rv.registry_state()[self.k1], nxt))
+        # extend: read again at 14 days
+        rv.registry_ingest(nxt, [{"sha": self.k1, "verdict": "extend", "note": "confounded"}])
+        it = rv.registry_state()[self.k1]
+        self.assertEqual(rv._horizon(it), rv.REGISTRY_EXTEND_DAYS)
+        self.assertFalse(rv._registry_due(it, self.S + timedelta(days=13)))
+        self.assertTrue(rv._registry_due(it, self.S + timedelta(days=14)))
+
+    def test_confounds_and_early_warning(self):
+        self._seed()
+        # a second change on KXAA three days after the first, and one that is crashing now
+        C4 = "e" * 40
+        ct4 = int(_ts(self.S + timedelta(days=3), 9))
+        self.log_out = f"\x1e{C4}\x1f{ct4}\x1fimm: KXAA asks x3\x1f\x1d\nincentive_mm.py\n" + self.log_out
+        # main: P - C1 - C2 - C4 - C3
+        self.rev_out = (f"{self.C3} {C4}\n{C4} {self.C2}\n{self.C2} {self.C1}\n{self.C1} {self.P}\n{self.P}\n")
+        self.reflog_out = f"{C4}\x1fmain@{{{ct4}}}\n" + self.reflog_out
+        self.jsonl(f"config_history_{(self.S + timedelta(days=3)).isoformat()}.jsonl",
+                   [{"ts": datetime.fromtimestamp(ct4 + 120, timezone.utc).isoformat(), "run_id": "r9",
+                     "git_sha": C4[:7], "source_mtime": ct4, "config": {"IMM_COLLATERAL_BUDGET": "100"}}])
+        rg = self._sec()
+        r = next(x for x in rg["readouts"] if x["keys"] == [self.k1])
+        self.assertEqual([c["key"] for c in r["confounds"]], [C4[:7]])
+        self.assertEqual(r["confounds"][0]["side"], "after")
+        self.assertEqual(r["clean_days"], 2)
+
+    def test_email_block(self):
+        self._seed()
+        rg = self._sec()
+        d = os.path.join(self.review, DAY.isoformat())
+        rv._write_json(os.path.join(d, "evidence.json"), {"day": DAY.isoformat(), "registry": rg})
+        rv._write_json(os.path.join(d, "findings.json"), {"verdict": "ok", "findings": [], "changes": [
+            {"sha": self.k1, "verdict": "worked", "note": "x2 paid for itself"}]})
+        with open(os.path.join(d, "review.md"), "w", encoding="utf-8") as fh:
+            fh.write("# V\n\n## What happened\n- fine\n")
+        rv.ledger_ingest(DAY)
+        _, page, text, _ = sr.build(DAY)
+        block = page[page.index("Changes measured at 7 days"):]
+        self.assertIn("KXAA quotes x2", block)
+        self.assertNotIn("Jack 2026-11-16", block[:2500])          # the quote is cut from the title
+        self.assertIn("Review: worked", block)
+        self.assertIn("none of 1 worse", page)                     # the health chip
+        self.assertIn("CHANGES MEASURED AT 7 DAYS (1)", text)
+        self.assertIn("review: worked - x2 paid for itself", text)
+        self.assertEqual(sr._change_title('imm waves: --cost-mult (Jack 2026-11-26: "5x only")'), "Waves: --cost-mult")
+        self.assertEqual(sr._change_title("imm fair lead: within 5c of the model"), "Fair lead: within 5c of the model")
+        self.assertEqual(sr._change_title("imm: the RCP weekly stands down (review R-261125-01)"),
+                         "The RCP weekly stands down")
+        self.assertEqual(sr._change_title("wave_fair: the weekday FX anchor"), "wave_fair: the weekday FX anchor")
+        self.assertEqual(sr._change_title("imm Trump mentions: both halved"), "Trump mentions: both halved")
+        self.assertEqual(sr._change_title("the Vercel bid-edge: 2c"), "The Vercel bid-edge: 2c")
+        self.assertEqual(sr._change_title("env IMM_A: 1 -> 2"), "Setting IMM_A: 1 -> 2")
+
+    def test_email_mixes_worse_and_better_when_crowded(self):
+        rows = ([{"call": "worse", "verdict": "", "n": i} for i in range(7)]
+                + [{"call": "better", "verdict": "", "n": 7 + i} for i in range(3)]
+                + [{"call": "no clear change", "verdict": "worked", "n": 10}])
+        got = [r["n"] for r in sr.pick_changes(rows)]
+        self.assertEqual(got, [0, 1, 2, 3, 4, 7, 8, 9])         # 5 worse, then 3 better, in order
+        self.assertEqual(len(sr.pick_changes(rows[:4])), 4)       # all of them when they fit
 
 
 if __name__ == "__main__":

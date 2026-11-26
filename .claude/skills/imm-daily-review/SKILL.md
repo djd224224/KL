@@ -14,6 +14,14 @@ Jack 2026-11-25: "create a skill that on a daily basis goes through IMM bot in i
 
 **And every run asks itself one question** (Jack 2026-11-26: "what else should this skill be doing daily to compound and improve itself? everyday it should ask itself this question and come with opportunities"): *What else should this review be doing, daily, to compound and improve itself?* Step 8 answers it from evidence section 11 (the review's own record, what landed without it, its run cost and repeated manual work). The answers go in findings.json `compound` and get their own block in the email.
 
+**And every change to the bot is measured** (Jack 2026-11-26: "Yes, build it", to a change registry "so every IMM commit gets measured at 7 days"). Evidence section 12 registers every commit that changes what the bot does, and every env change a bot run started with. It records when each went live and reads it out 7 full days later against the 7 days before, on the markets it names. Step 7 scopes what went live and judges each readout. A change that hurt becomes a revert finding. Most changes come from other sessions: 11 of the 12 commits that changed the bot's code or launcher on 11/25-26 did, and before the registry nothing measured them.
+
+**The bar is a top trading desk's** (Jack 2026-11-26: "remember you're building the next jane street of prediction markets"). Every claim says how sure it is:
+- a call survives false-discovery control across everything tested with it;
+- a "no effect" states the smallest move the test could have seen, so it reads "can't tell below $X/day" rather than "no effect";
+- expectations are written when a change goes live, before anyone sees its numbers;
+- where before/after can't settle a question that matters, the answer is a randomized holdout, not a longer stare at the same data.
+
 The pieces: `imm_review.py` collects the evidence and holds the ledger (no judgment, no model). This skill judges and writes. `send_imm_review.py` sends. `run_imm_daily_review.ps1` runs the three every morning. Jack's choices on 11/25: fixes go to him as plans that he approves with one text ("Plan + your yes"); the email lands around 06:30 ET beside the existing IMM emails; after two weeks (from 12/09) the review proposes which of those to retire.
 
 ## The moat: why this gets better as the markets get harder
@@ -24,7 +32,7 @@ Other makers can copy a quote. They cannot copy months of our own measured outco
 
 | Moat | What compounds | Where | How a run uses it |
 |---|---|---|---|
-| Data | One row per family per day, kept forever: rewards, trading, net, fills, $ resting, mark-outs, and our **share of the reward pool** (from the cycle log). Plus every prediction, finding, verdict, config version and error signature. | family_daily.csv, counterfactual.jsonl, ledger.jsonl, config_manifest.jsonl, error_signatures.json | The base for every measurement. Never delete; propose a durable backup if none exists |
+| Data | One row per family per day, kept forever: rewards, trading, net, fills, $ resting, mark-outs, and our **share of the reward pool** (from the cycle log). Plus every prediction, finding, verdict, config version and error signature, and every change to the bot with its scope, its 7-day readout and its verdict. | family_daily.csv, counterfactual.jsonl, ledger.jsonl, changes.jsonl, config_manifest.jsonl, error_signatures.json | The base for every measurement. Never delete; propose a durable backup if none exists |
 | Analysis | Family priors shrunk toward the book (rewards and net per $1k resting, trading tax, mark-out, share). The edge watch (7 days vs the 21 before). Missed-market estimates netted by family tax. The review's own calibration. | priors.json, evidence section 10 | Rank by net, not by modelled reward; discount claims by the review's calibration; see erosion early |
 | Process | Verified fixes become playbook rules. Every bug class becomes a collector check. Rejections stand. Lessons get promoted into this skill. | playbook.md, history.md, imm_review.py | Apply proven rules to new families and waves before they cost money |
 
@@ -154,7 +162,7 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 **Step 7. Did past changes work?** For each item `ledger due` lists (`why`: `shipped` = past its eval_after_days; `recheck` = a date you promised to look again, shipped or not):
 - Run its metric recipe (usually `python imm_review.py measure ...`).
 - Give a verdict:
-  - **verified:** the effect meets the item's success rule, the t-stat is not noise, and supply-normalised it still holds.
+  - **verified:** the effect meets the item's success rule, it is not noise (the registry readout's permutation p and q, or `measure`'s t), and supply-normalised it still holds.
   - **failed:** no effect or harmful. A harmful one becomes a decision to revert, with the exact revert.
   - **inconclusive:** too few days or confounded. Say why. You may set a new metric with `eval_after_days` in the item's next finding row.
 - Also close items the evidence shows are resolved: signature gone 3+ days, or a commit fixed it (closure "fixed-elsewhere" with the sha).
@@ -163,11 +171,41 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 - **Every "I'll look again" gets a date.** A finding that says "re-measure 12/02", "watch for a week" or "comes back as a size cut if ..." carries `recheck_on` (YYYY-MM-DD), so the ledger lists it on that day. A promise without a date is forgotten: the 11/25 rain finding promised 12/02 with nothing to enforce it.
 - **A finding that turned out wrong closes as `false-positive`** (closures), not `closed`, so precision is a number.
 
+**The change registry (evidence section 12): every IMM change, not only the review's own.** Write the answers in findings.json `changes` (section 4).
+- **Scope what went live** ("Went live on the day"). The registry guesses each change's scope from what its commit names: series in the subject, else a family or group the subject names, else series in the body, else the whole book. Accept a right guess silently. For a wrong one, write the right `scope` (series / events / waves / families / groups / pattern, or `book`). Add the `metric` the change is meant to move:
+  - `net` by default;
+  - `pnl` for a stand-down that gives up rewards to stop losses;
+  - `rew` for a size-up or an enrolment;
+  - `fills` and `rest` are directions, not money.
+
+  Add `expect`: one line on what should move, which way, and roughly how much ($/day). Write it now, when the change goes live: that is the pre-registration, and the readout shows whether it was written before the numbers. An expectation first written at the readout is marked as not pre-registered. Open the commit (`git show <sha> --stat`, then its body) only when the subject is unclear.
+- **Skip what cannot move P&L** (`skip`: the reason): emails, dashboards, logging, tests, docs. An env entry whose launcher commit went live in the same bot run is skipped already.
+- **Judge every readout listed** ("Read out today") with a `verdict` (worked / hurt / no-effect / inconclusive / extend) and a one-line `note` citing the numbers. The call column is a before/after, not causal.
+  - **better / worse** means p <= 0.05 by an exact permutation test, a q <= 0.10 after Benjamini-Hochberg across everything read out that day, and a move of at least $5/day and 15%.
+  - **A call that misses q** may still be real. It is not evidence on its own. Say so, and give the q.
+  - **"no clear change"** with a "can see" (the smallest move the test detects 80% of the time) above the expected move is can't-tell: `inconclusive`, never `no-effect`. If the change matters (the expected $/day is worth Jack's attention), file an `experiment` finding for a randomized holdout (hash-split series or a control arm: reference section 7) instead of waiting longer.
+  - `no-effect` needs a "can see" under the move that would have mattered.
+
+  Before you call one:
+  - **SAME MONEY:** readouts of changes live the same day on overlapping series measure the same days and the same money. They form one cluster that counts once; the others are marked SAME MONEY. Judge the cluster with one entry naming all its keys. The lead is its strongest called member, else its widest scope;
+  - **supply x** outside 0.67-1.5 means the program pool moved: judge rewards per supply, not rewards;
+  - **the outside column** moving like the scope means the whole book moved (a wave, an election, a holiday), not the change;
+  - **overlapping changes** in either window are measured together: `extend` (it reads again at 14 days) or `inconclusive`, unless one clearly dominates;
+  - **a wrong scope:** fix the scope and leave the verdict. The next collect reads it out again under the new scope.
+- **A change that hurt** (a `hurt` verdict with a mechanism you can name) becomes a finding (kind `loss`) whose plan is the revert: `git revert <sha>` or the change's kill switch, the $/day at stake (measured), and the readout as evidence. Put that finding's fingerprint in the verdict's `finding`. It competes for a decision card like any finding.
+- **Early warnings** (a change down hard after 2+ days): look now. When the mechanism is clear, file the revert finding today rather than on day 7.
+- **A change that names a ledger id** (the `ids` in its details): evaluate that item above with these numbers. The registry verdict and the ledger evaluation must agree.
+- **The first run** back-fills 30 days at once and lists 15: the calls first, then the most suggestive by p. Judge those; the rest keep their provisional call.
+  - On 11/25's data, 23 of 164 testable readouts passed |t| >= 2, where chance alone gives about 8.
+  - 11 survived the permutation test plus false-discovery control.
+  - Counted once per cluster, that is 6 better and 3 worse.
+
 **Step 8. Compound: what else should this review be doing?** Ask it in writing every run, and answer it: *What else should this review be doing, daily, to compound and improve itself?* (Jack 2026-11-26). Answer from evidence section 11 and from this run's own experience, never from a generic list: every answer cites a fact. Go through the lenses briefly; most days one or two produce something.
 1. **Misses.** "Landed on the day without a ledger id" and "Memory notes other sessions wrote" are what other sessions and Jack found, fixed or decided. For each one that fixed or diagnosed a defect or loss that existed before D:
    - Did the evidence pack show it? If it did, why didn't you raise it? That is a raise rule (a lesson).
    - If it didn't, what would have shown it: a watch, a collector section, a log line?
    - Count caught first, caught late and missed. "Caught first" is the review's real hit rate.
+   - A readout (section 12) that shows a change hurt, which no early warning or finding raised before day 7, is a miss too: what would have shown it on day 2?
 2. **Someone else acted on your item** ("Open items someone else acted on"). Decide which:
    - confirmed: close it as fixed-elsewhere with the sha;
    - superseded: close it, plus a lesson when their diagnosis beat yours;
@@ -304,7 +342,16 @@ Give each the finding or lesson it guards (`why`). A FIRING watch is evidence li
     {"type": "log", "title": "bot state saves failing", "contains": "state save failed", "max": 3, "severity": "P2",
      "why": "R-261124-06: the os.replace retry shipped 11/25; more than 3 a day means it regressed"}
   ],
-  "retire_watches": [{"id": "W-261127-01", "note": "why it is no longer needed"}]
+  "retire_watches": [{"id": "W-261127-01", "note": "why it is no longer needed"}],
+  "changes": [
+    {"sha": "d4d28c2", "scope": {"series": ["KXAPRPOTUS"]}, "metric": "pnl",
+     "expect": "the weekday-morning carry losses stop; rewards fall a little"},
+    {"sha": "3566232", "skip": "emails only: the pick-off block left the digest"},
+    {"keys": ["9b36932", "a01cb9e"], "verdict": "worked",
+     "note": "Vercel net -$12 -> +$31/day (t 2.6); supply x1.0; outside flat"},
+    {"sha": "797937b", "verdict": "hurt", "note": "weekend rain -$63/day (t -2.2) after the 5c fair-lead margin",
+     "finding": "loss:rain-wknd-fair-lead-5c"}
+  ]
 }
 ```
 
@@ -322,7 +369,16 @@ Finding-level extras: `"recheck_on": "2026-12-02"` on any finding that promises 
 
 At most 5 new watches a run and 60 active. A missing input fires (the file is gone or the key moved). `IMM_REVIEW_WATCHES=0` turns evaluation off. `python imm_review.py watch list` shows them; `watch retire W-... --note` retires one by hand.
 
-**The top of the email comes from this file:** your `verdict` under the big number, up to 3 "Needs your OK" cards from the decision_needed findings (most severe first), the "Making the review better" block from `compound` (with the review's score from evidence section 11), and the "Everything found today" table of all findings. A day with no `compound` entry shows an amber "did not answer its daily question" card. The rest of the body is review.md (section 5); the numbers, edge watch and health checks come from evidence.json.
+**`changes`** (the change registry, evidence section 12; step 7). Each entry names one or more registry keys in `sha`, `key`, `keys` or `shas`: a short sha, or `env:IMM_X@<run_id>` for an env change, exactly as the Key column shows it. Then any of these fields:
+- `scope`: an object of `series`, `events`, `waves`, `families`, `groups` (lists), `pattern` (a regex on series and events), or `"book": true`;
+- `metric`: net, rew, pnl, fills, cts or rest;
+- `expect`: one line;
+- `skip`: the reason it cannot move P&L;
+- `verdict`: worked, hurt, no-effect, inconclusive or extend, with a `note`, and `finding` (a fingerprint) for a revert proposal.
+
+Ingest rejects an unknown key or a bad verdict and says why. The same entry ingested twice is written once. By hand: `python imm_review.py changes list | show KEY | readout KEY | scope KEY --series A,B --metric pnl | verdict KEY worked --note "..." | skip KEY --note "..." | add SHA`.
+
+**The top of the email comes from this file:** your `verdict` under the big number, up to 3 "Needs your OK" cards from the decision_needed findings (most severe first), the "Changes measured at 7 days" block (evidence section 12's readouts with your `changes` verdicts and notes, so write each note for a phone: at most 220 characters), the "Making the review better" block from `compound` (with the review's score from evidence section 11), and the "Everything found today" table of all findings. A day with no `compound` entry shows an amber "did not answer its daily question" card. The rest of the body is review.md (section 5); the numbers, edge watch and health checks come from evidence.json.
 
 So write the short fields for a phone:
 - **`verdict`:** one or two plain sentences, at most 240 characters. How the day went in risk-adjusted terms, and the one thing that matters.
@@ -386,7 +442,7 @@ Two or three sentences: the risk-adjusted result against the 7d/30d norm, and th
 A small table: market, why not quoted, net $/day (modelled). Then one bullet on the pool nothing reads (`counterfactual.unmeasured`: the part not blocked on purpose).
 
 ## Did past changes work?
-One bullet per due item: verdict, before -> after, $/day.
+One bullet per due ledger item: verdict, before -> after, $/day. Then the registry's readouts that matter, worse first: one bullet each with the verdict and why (the email shows the readout list itself, so don't repeat every row).
 
 ## The moat
 What was added today (data, analysis, process); the edge watch in a sentence or two.
@@ -426,6 +482,10 @@ The email's numbers card comes from evidence.json, so don't paste the scorecard.
   - the run's cost and minutes over the week;
   - the watches: retire those that never fired in 30 days (`retire_watches`, listed in section 11), and tighten any that fire on noise.
   - The compound backlog is a decision list for Jack like any other. An item waiting 14 days gets one line in "Still waiting on you".
+- **The change registry's week** (evidence section 12's board):
+  - how many changes went live, how many were measured, and the verdicts;
+  - which kinds of change worked (size-ups, stand-downs, fair gates, enrolments, cutoffs), by family. A pattern that held on 3+ readouts becomes a playbook rule; one that failed on 3+ becomes a raise rule;
+  - changes still waiting for a verdict, and hurt verdicts without a revert decision: raise one.
 - **Experiments:** at most 2 proposals with a control arm and a pre-registered metric, aimed at the biggest uncertainty in this week's numbers.
 - **The moat review:**
   - **Asset growth:** family-days, share days, predictions, playbook rules, findings.
