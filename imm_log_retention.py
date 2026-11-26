@@ -94,12 +94,16 @@ ALLOW = {
     # imm_quote_gaps' scan archive (review R-261124-24, ~3 MB a day); its one
     # reader, imm_review.gap_scans_of_day, opens it through imm_logfiles
     "gap_scans": "jsonl",
+    # imm_fair_marks.py's model history (11/26); its reader, imm_fair_scorecard,
+    # opens it through imm_logfiles
+    "fair_marks": "jsonl", "fair_results": "jsonl",
 }
 NEVER = ("fills", "settlements", "realized", "book_depth")
 assert not set(ALLOW) & set(NEVER)
 # The tools that read days older than the cutoff; --apply refuses unless each
 # one opens day files through imm_logfiles.
-READERS = ("imm_reward_recon.py", "imm_saturday_tracker.py", "imm_dashboard.py", "imm_review.py")
+READERS = ("imm_reward_recon.py", "imm_saturday_tracker.py", "imm_dashboard.py", "imm_review.py",
+           "imm_fair_scorecard.py")
 
 _DAY_RX = re.compile(r"^([a-z][a-z_]*?)_(\d{4}-\d{2}-\d{2})\.(jsonl|csv)$")
 _BOT_RX = re.compile(r"^incentive-mm-(\d{4}-\d{2}-\d{2})\.log$")

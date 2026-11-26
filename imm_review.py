@@ -4708,6 +4708,10 @@ def collect(day: date, bootstrap_days: int = 14, only: Optional[List[str]] = Non
     # every IMM change, measured at 7 days (Jack 2026-11-26); IMM_REVIEW_REGISTRY=0 turns it off
     if want("registry") and os.environ.get("IMM_REVIEW_REGISTRY", "1") != "0":
         ev["registry"] = _section("registry", sec_registry, day)
+    # every fair model scored against the market (imm_fair_scorecard.py, Jack
+    # 2026-11-26); IMM_REVIEW_MODELS=0 turns it off
+    if want("models") and os.environ.get("IMM_REVIEW_MODELS", "1") != "0":
+        ev["models"] = _section("models", sec_models, day)
     if want("self"):          # last: it reads the other sections' times and the ledger
         ev["self"] = _section("self", sec_self, day, ev)
     ev["secs"] = round(time.time() - t0, 1)
@@ -5158,8 +5162,58 @@ def render_evidence(ev: dict) -> str:
                 a("- A failed or late backup leaves the moat on one unbacked disk: raise it as P1 (kind ops).")
     render_self(ev.get("self") or {}, a)
     render_registry(ev.get("registry") or {}, a)
+    render_models(ev.get("models") or {}, a)
     a("")
     return "\n".join(L)
+
+
+def sec_models(day: date) -> dict:
+    import imm_fair_scorecard  # here, not at the top: it imports this module
+    return imm_fair_scorecard.sec_models(day)
+
+
+def render_models(md: dict, a) -> None:
+    a("\n## 13. Model scorecard (every fair model against the market)")
+    if not md:
+        a("- not collected (IMM_REVIEW_MODELS=0 turns it off)")
+        return
+    if md.get("error"):
+        a(f"- ERROR: {md['error']}")
+        return
+    h = md.get("health") or {}
+    a("imm_fair_marks.py logs every model's fair beside the market every 15 min (task KL imm fair-marks); "
+      f"imm_fair_scorecard.py scores them. Snapshotter: {h.get('state')}"
+      + (f", last run {h.get('last_run')} ET ({h.get('age_min')} min ago)" if h.get("last_run") else "")
+      + f"; {h.get('markets')} markets with a fair, {h.get('books')} with a cycle-log book"
+      + (f"; errors: {'; '.join(h['errors'])}" if h.get("errors") else "") + ".")
+    if h.get("state") in ("stale", "never run"):
+        a("- The snapshotter is not running: no model history accrues. Raise it as P1 (kind ops).")
+    a(f"SETTLEMENT (the {md.get('window_days')} days to the day; MEASURED): Brier score of the model's fair "
+      "and of the market's mid at the same moment before the close (lower is better); skill = Brier(market) "
+      "- Brier(model), positive when the model knew more; the 90% interval resamples EVENTS. 'Disagree' = "
+      "the markets where model and mid were 5c+ apart, where following the model is a trade. CONVERGENCE "
+      "(the day): the mid's move against the model's gap at the start (slope; share toward the model). "
+      "FILLS (the day): our fills scored by the model then, in cents from our side; 'against' = contracts "
+      f"at -3c or worse. Scored today: {md.get('scored_today')} settled markets.")
+    rows = md.get("families") or []
+    if not rows:
+        a("- no model data yet")
+        return
+    a("| Family | Markets | Settled (events) | Brier model / market | Skill (90% CI) | Disagree n: skill | "
+      "Verdict | Converge n: slope, toward | Fills (cts): edge, against |")
+    a("|---|---:|---:|---:|---:|---:|---|---:|---:|")
+    for r in rows:
+        ci = ("" if r.get("skill_lo") is None else f" ({_fmt(r['skill_lo'], 4)} to {_fmt(r['skill_hi'], 4)})")
+        a(f"| {r['family']} | {r.get('markets') if r.get('markets') is not None else ''} | "
+          f"{r['settled']} ({r['events']}) | {_fmt(r.get('brier_model'), 4)} / {_fmt(r.get('brier_market'), 4)} | "
+          f"{_fmt(r.get('skill'), 4)}{ci} | {r['disagree_n']}: {_fmt(r.get('disagree_skill'), 4)} | {r['verdict']} | "
+          f"{r['conv_n']}: {_fmt(r.get('conv_slope'), 2)}, {_fmt(r.get('conv_toward'), 2)} | "
+          f"{r['fills']} ({_fmt(r.get('fill_cts'), 0)}): {_fmt(r.get('fill_edge_c'), 2)}c, "
+          f"{_fmt(r.get('against_share'), 2)} |")
+    bad = [r for r in rows if (r.get("against_share") or 0) >= 0.2 and r.get("fills", 0) >= 5]
+    for r in bad:
+        a(f"- {r['family']}: {r['against_share']:.0%} of today's filled contracts were 3c+ against its own model; "
+          "worst: " + ", ".join(f"{w['ticker']} ({w['cents_x_contracts']:+.0f} c x ct)" for w in r.get("worst_fills") or []))
 
 
 def render_self(se: dict, a) -> None:

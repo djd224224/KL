@@ -533,6 +533,18 @@ def health_checks(ev: dict) -> List[Tuple[str, str]]:
         out.append((f"Changes at {rv.REGISTRY_DAYS} days: {worse} of {tot} worse" if worse
                     else f"Changes at {rv.REGISTRY_DAYS} days: none of {tot} worse",
                     "amber" if worse else "green"))
+    mo = ev.get("models") or {}
+    if mo and not mo.get("error"):   # every fair model against the market (imm_fair_scorecard.py)
+        h = mo.get("health") or {}
+        c = mo.get("counts") or {}
+        if h.get("state") in ("stale", "never run"):
+            out.append((f"Model log {h['state']}", "red" if h["state"] == "stale" else "amber"))
+        elif c.get("loses to the market"):
+            out.append((f"Models: {c['loses to the market']} lose to the market", "amber"))
+        elif c.get("beats the market"):
+            out.append((f"Models: {c['beats the market']} beat the market", "green"))
+        else:
+            out.append(("Model scorecard accumulating", "gray"))
     bk = ((ev.get("moat") or {}).get("backup")) or {}
     if bk.get("state"):           # the moat's BigQuery copy (R-261124-20)
         s = bk["state"]

@@ -11,6 +11,16 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
 - **The moat (11/25):** "the skill's daily iterative process should lead to compounding and building a moat on data, analysis, and process that allows it to continually get better even as the markets get more competitive".
   - Built the same day: moat/family_daily.csv (with pool share from the cycle log), priors.json, the edge watch, missed markets netted by family tax, the review's self-calibration, and the playbook.
   - The durable backup (R-261124-20) was a decision for Jack. The wedged sync was fixed the same morning, then the review landed on main and the 04:30 task was registered.
+- **The fair-model scorecard (11/26):** Jack asked "is the data im logging improving my algorithm and trading strategy". The audit found:
+  - the bot reads back none of the 29 streams it logs;
+  - the monitors, the reward calibration and the review's priors reach it only through people;
+  - none of its 67 fair models had ever been scored, because the fair behind a quote was never logged and 30 of 31 fair files are overwritten on each refresh;
+  - a 7-day test sees about $73/day while the median change moves about $23/day.
+
+  To "Build the fair-model scorecard: log the fair behind each quote, score every model daily?" Jack said "Yes, build it".
+  - **Where the logging lives:** outside the bot (imm_fair_marks.py, every 15 min), not in it. On 11/26 the live bot file carried another session's 91 uncommitted lines, so a bot edit could not land cleanly. Each quote and fill is joined to the last mark before it instead.
+  - **The first live run (22:18Z, 12 s):** 4,852 marks across 15 families. 640 books came from the cycle log and 4,212 from Kalshi in 43 batched signed reads. 15 odd-shaped files were archived raw (216 KB gzipped).
+  - **What follows:** settlements accumulate from 11/27; daily families get verdicts within a week or two.
 - **The moat backup (11/26, R-261124-20):** Jack asked "how expensive is backing up the moat to bigquery?", heard "effectively free" (about 60 MB, +~1 GB a year, inside the free 10 GB the project barely uses), and said "Yes, build it".
   - **The dataset:** `imm_review` (northamerica-northeast1), created on purpose with no default expiration, and watched by bq_retention_guard.py beside Kalshi (the 5/8 and 7/7 expirations).
   - **The design:** no bad local file can damage the copy.

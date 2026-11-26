@@ -200,6 +200,15 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   - 11 survived the permutation test plus false-discovery control.
   - Counted once per cluster, that is 6 better and 3 worse.
 
+**The models (evidence section 13): does each fair model beat the market?** The bot quotes, gates, leads and closes off its fair models. Before 11/26 none of them was ever scored: the fair files were overwritten on every refresh. imm_fair_marks.py (task KL imm fair-marks, every 15 min) now logs each model's fair beside the market's book, and the scorecard reads it.
+- **A family that loses to the market** (its 90% interval wholly below zero, 8+ settled events): its fair costs money wherever the bot leads, gates or closes off it. File a finding (kind `strategy`): blend the fair toward the book's mid, as Vercel's was (a01cb9e), or turn its leads off. Cite the skill, its interval and the disagree-subset numbers.
+- **A family that beats the market,** above all on the "disagree" markets (5c+ apart): the model knows something the book does not. That is edge to lean on. Propose leading with it, tighter gates or more size there, and make it a playbook candidate.
+- **Fills against the model** (20%+ of a family's contracts at 3c+ against its own fair): the gate or lead tolerance lets the bot trade against what it believes. Raise it as a finding with the worst markets the section lists.
+- **Convergence** (the mid moving toward the model over the day) is the early signal while settlements accumulate. A slope near zero or negative for a week means the market ignores the model, or knows better.
+- **"accumulating" is the honest state for weeks.** Daily families (weekend rain, crypto and FX events) settle fastest; monthly ones take a month. Never call a model on fewer than 8 settled events.
+- **The other 15 fair files** (Vercel, Carbon Arc, OpenRouter, the temperature grids...) have shapes of their own. They are archived raw (`fair_raw_*.jsonl.gz`) until someone writes their extractor. Propose extractors in the order of the money those families trade (a `compound` answer).
+- **The snapshotter stale or never run** (the section's first line) is P1 (kind `ops`): no model history accrues while it is down.
+
 **Step 8. Compound: what else should this review be doing?** Ask it in writing every run, and answer it: *What else should this review be doing, daily, to compound and improve itself?* (Jack 2026-11-26). Answer from evidence section 11 and from this run's own experience, never from a generic list: every answer cites a fact. Go through the lenses briefly; most days one or two produce something.
 1. **Misses.** "Landed on the day without a ledger id" and "Memory notes other sessions wrote" are what other sessions and Jack found, fixed or decided. For each one that fixed or diagnosed a defect or loss that existed before D:
    - Did the evidence pack show it? If it did, why didn't you raise it? That is a raise rule (a lesson).

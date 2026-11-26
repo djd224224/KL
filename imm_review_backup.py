@@ -80,6 +80,8 @@ LINE_LOGS = (
     ("watch_results_lines", "review", "watch_results.jsonl"),
     ("config_manifest_lines", "review", "config_manifest.jsonl"),
     ("program_history_lines", "status", "program_history.jsonl"),
+    # every settled market a fair model was scored on (imm_fair_scorecard.py, 11/26)
+    ("model_scores_lines", "review", "moat/model_scores.jsonl"),
 )
 # under daily_review/, never copied: a cache the collect rebuilds, this file's
 # own state, other sessions' uncommitted-file copies, temp files
