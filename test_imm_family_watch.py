@@ -482,6 +482,129 @@ class TestGapAlert(unittest.TestCase):
         self.assertNotIn("title", due[2][1])            # a failed read: no line
 
 
+class TestWriterHold(unittest.TestCase):
+    """THE WRITERS' OWN READ (Jack 2026-11-26: "this should autoquote, fix
+    root issue"): KXSNOWNYE was sent as "a weather series no family takes"
+    at 16:51Z, 7 min before the weekend writer joined it."""
+    T0 = 1_795_710_039.0          # 16:20:39Z 11/26, KXSNOWNYE first seen
+    NOT_SCALAR = ("KXSNOWNYE-31DEC26-TTN: not a 'linear payout ... days with at "
+                  "least ... snowfall' scalar")
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix="fwhold_")
+        self.addCleanup(shutil.rmtree, d, True)
+        self.wk, self.sd = os.path.join(d, "rain_wknd.json"), os.path.join(d, "snow_days.json")
+        for name, path in (("RAIN_WKND_FILE", self.wk), ("SNOW_DAYS_FILE", self.sd)):
+            p = mock.patch.object(imm, name, path)
+            p.start()
+            self.addCleanup(p.stop)
+        self.files(wk_rej={}, sd_rej={})
+
+    def files(self, wk_rej, sd_rej, wk_joined=None):
+        for path, data in ((self.wk, {"day_series": wk_joined or {}, "day_rejected": wk_rej}),
+                           (self.sd, {"series": {}, "rejected": sd_rej})):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+
+    def items(self, series="KXSNOWNYE"):
+        return fw.gap_items(TestGapAlert.PROGS, {}, {series: 306.8}, set())
+
+    def test_held_until_the_weekend_writer_reads_it(self):
+        sd_rej = {"KXSNOWNYE": {"at": self.T0 + 424, "why": self.NOT_SCALAR}}
+        self.files(wk_rej={}, sd_rej=sd_rej)
+        _due, st = fw.due_alerts({}, self.items(), self.T0)
+        # 16:51Z: the old watch sent it here
+        items = self.items()
+        due, _ = fw.due_alerts(st, dict(items), self.T0 + 31 * 60)
+        self.assertEqual([k for k, _, _ in due], ["new:KXSNOWNYE"])
+        notes = fw.hold_for_writers(items, {"items": st}, self.T0 + 31 * 60)
+        self.assertTrue(items["new:KXSNOWNYE"]["hold"])
+        self.assertEqual(notes, ["held new:KXSNOWNYE: the weekend writer: unread (31 min)"])
+        due, st = fw.due_alerts(st, items, self.T0 + 31 * 60)
+        self.assertEqual(due, [])
+        # 16:58Z the writer joins: the bot allows it and the item is gone
+        due, st = fw.due_alerts(st, {}, self.T0 + 61 * 60)
+        self.assertEqual(due, [])
+
+    def test_sent_at_once_with_the_writers_reasons_when_both_pass(self):
+        self.files(wk_rej={"KXSNOWX": {"at": self.T0, "why": "KXSNOWX-26-0: not one market "
+                                                             "per city"}},
+                   sd_rej={"KXSNOWX": {"at": self.T0, "why": self.NOT_SCALAR}})
+        _due, st = fw.due_alerts({}, self.items("KXSNOWX"), self.T0)
+        items = self.items("KXSNOWX")
+        self.assertEqual(fw.hold_for_writers(items, {"items": st}, self.T0 + 31 * 60), [])
+        due, _ = fw.due_alerts(st, items, self.T0 + 31 * 60)
+        self.assertEqual([k for k, _, _ in due], ["new:KXSNOWX"])
+        fix = items["new:KXSNOWX"]["fix"]
+        self.assertTrue(fix.startswith(
+            "a weather series no family takes: the weekend writer passed on it (KXSNOWX-26-0: "
+            "not one market per city); the snow-day writer passed on it (KXSNOWNYE-31DEC26-TTN"),
+            fix)
+        self.assertTrue(fix.endswith(". Your call (enroll it into a weather family, or leave "
+                                     "it out)"), fix)
+        fix.encode("ascii")
+
+    def test_no_open_market_holds_while_fresh(self):
+        st = {"items": {"new:KXRAINX": {"first": self.T0}}}
+        now = self.T0 + 10 * 3600
+        self.files(wk_rej={"KXRAINX": {"at": now - 600, "why": "no open market"}}, sd_rej={})
+        items = self.items("KXRAINX")
+        self.assertEqual(fw.hold_for_writers(items, st, now),
+                         ["held new:KXRAINX: the weekend writer: no open market yet"])
+        # the writer stopped re-reading it (down): sent, saying so
+        self.files(wk_rej={"KXRAINX": {"at": now - 4 * 3600, "why": "no open market"}},
+                   sd_rej={})
+        items = self.items("KXRAINX")
+        self.assertEqual(fw.hold_for_writers(items, st, now), [])
+        self.assertNotIn("hold", items["new:KXRAINX"])
+        self.assertIn("the weekend writer has not read it in 600 min",
+                      items["new:KXRAINX"]["fix"])
+
+    def test_a_series_a_writer_never_reads_is_held_only_two_passes(self):
+        # its skip leaves it to another snow family, or the writer is down
+        st = {"items": {"new:KXRAINX": {"first": self.T0}}}
+        items = self.items("KXRAINX")
+        fw.hold_for_writers(items, st, self.T0 + (fw.WRITER_HOLD_MAX_MIN - 1) * 60)
+        self.assertTrue(items["new:KXRAINX"]["hold"])
+        items = self.items("KXRAINX")
+        fw.hold_for_writers(items, st, self.T0 + (fw.WRITER_HOLD_MAX_MIN + 1) * 60)
+        self.assertNotIn("hold", items["new:KXRAINX"])
+        self.assertIn(f"the weekend writer has not read it in "
+                      f"{fw.WRITER_HOLD_MAX_MIN + 1:.0f} min", items["new:KXRAINX"]["fix"])
+
+    def test_joined_but_not_allowed_is_held_then_sent_as_a_bug(self):
+        self.files(wk_rej={}, sd_rej={}, wk_joined={"KXRAINX": {"sample": "KXRAINX-26-NYC"}})
+        st = {"items": {"new:KXRAINX": {"first": self.T0}}}
+        items = self.items("KXRAINX")
+        fw.hold_for_writers(items, st, self.T0 + 31 * 60)
+        self.assertTrue(items["new:KXRAINX"]["hold"])
+        items = self.items("KXRAINX")
+        fw.hold_for_writers(items, st, self.T0 + 3 * 3600)
+        self.assertIn("the weekend writer took it, but the bot still reads it not allowlisted",
+                      items["new:KXRAINX"]["fix"])
+
+    def test_other_weather_series_are_untouched(self):
+        # no contract writer reads a TEMP / hurricane series: sent as before
+        for s in ("KXTEMPNYCH", "KXHURRCATX"):
+            items = self.items(s)
+            fix = items[f"new:{s}"]["fix"]
+            self.assertEqual(fw.hold_for_writers(items, {}, self.T0 + 31 * 60), [])
+            self.assertNotIn("hold", items[f"new:{s}"])
+            self.assertEqual(items[f"new:{s}"]["fix"], fix)
+        # nor any non-new item
+        items = fw.gap_items(TestGapAlert.PROGS, {"KXRAINX-26": {"msg": "no row"}}, {}, set())
+        self.assertEqual(fw.hold_for_writers(items, {}, self.T0), [])
+        self.assertNotIn("hold", items["gap:KXRAINX-26"])
+
+    def test_an_upcoming_weather_series_is_held_the_same_way(self):
+        # KXSNOWNYE's alert was an upcoming one (programs from Nov 27 12:01 PM ET)
+        items = {"new:KXSNOWNYE": {"est": 6.75, "what": "KXSNOWNYE: paying from ...",
+                                   "fix": "a weather series no family takes: your call",
+                                   "always": True, "upcoming_start": self.T0 + 86400}}
+        fw.hold_for_writers(items, {}, self.T0 + 31 * 60)
+        self.assertTrue(items["new:KXSNOWNYE"]["hold"])
+
+
 class TestEventKeys(unittest.TestCase):
 
     def test_one_market_event_is_keyed_by_its_own_ticker(self):

@@ -112,6 +112,27 @@ STATE_FILE = os.path.join(imm.STATUS_DIR, "family_watch_state.json")
 # or two; the 02:09Z run then dropped every record, and 02:20Z re-researched
 # two judgment calls and would have re-alerted them as new)
 STATE_GRACE_HOURS = float(os.environ.get("IMM_WATCH_STATE_GRACE_H", "6"))
+# THE WRITERS' OWN READ (Jack 2026-11-26: "this should autoquote, fix root
+# issue", on KXSNOWNYE's alert). Two weather fair writers enroll a series on
+# its contract, each listing Kalshi's weather category once an hour: the
+# weekend writer (rain_wknd_fair: AUTO DAY SERIES, SNOW DAYS) reads a RAIN or
+# SNOW series no family claims, the snow-day writer (snow_days_fair:
+# AUTO-ENROLL) a SNOW one. A series created between their passes reads "not
+# allowlisted" here until one has read it, and a weather series is sent on
+# first sight (GAP_ALERT_AFTER_MIN): KXSNOWNYE was first seen 16:20Z 11/26,
+# passed by the snow-day writer 16:27Z (not its contract), sent 16:51Z as "a
+# weather series no family takes", and joined the weekend family 16:58Z.
+# Such an item is now held (hold_for_writers) while a writer that reads the
+# series has not passed on it: no verdict yet, or it joined and the bot has
+# not reloaded (held WRITER_HOLD_MAX_MIN from first sight, two passes and
+# slack; one a writer never reads -- its skip leaves it to another of the
+# bot's snow families, or the writer is down -- is then sent, saying so), or
+# a fresh "no open market" (read again at every pass; nothing quotes a market
+# before it opens). Once every writer that reads it has passed, it is sent at
+# once, with their reasons.
+WRITER_HOLD_MAX_MIN = float(os.environ.get("IMM_WATCH_WRITER_HOLD_MAX_MIN", "150"))
+WRITER_FRESH_SECS = 3 * 3600         # a "no open market" verdict newer than this is live
+WRITER_NO_OPEN_MARKET = "no open market"   # both writers' verdict, read again every pass
 
 US_ELECTION_TAGS = frozenset({"US Elections", "Other US Elections"})
 # a weather series by name (gap_items: sent on first sight, whatever its
@@ -334,10 +355,12 @@ def gap_items(progs: Dict[str, dict], gaps: dict, not_allowed: Dict[str, float],
         if WEATHER_NAME_RE.search(s):
             # Jack 2026-10-31: "make sure new markets with 'RAIN', 'TEMP',
             # etc are always considered for auto-quoting as part of these
-            # families". A rain series of the weekend / election-day
+            # families". A rain / snow series of the weekend / election-day
             # contract joins by itself within the hour (the weekend writer's
-            # AUTO DAY SERIES); any other weather series no family takes is
-            # sent on first sight, whatever its estimate.
+            # AUTO DAY SERIES), and is held until a writer has read it
+            # (hold_for_writers: THE WRITERS' OWN READ); any other weather
+            # series no family takes is sent on first sight, whatever its
+            # estimate.
             items[f"new:{s}"].update(
                 always=True,
                 fix="a weather series no family takes: your call (enroll it into "
@@ -404,6 +427,98 @@ def hold_researched(items: Dict[str, dict], targets: Dict[str, dict], state: dic
         if r.get("status"):
             it["research"] = r["status"]
             it["fix"] = f"research ({n} tr{'y' if n == 1 else 'ies'}): {r['status']} -- {r.get('note', '')}"
+
+
+def _contract_writers() -> List[tuple]:
+    """(name, fair file, joined key, rejected key, reads(series)) for each fair
+    writer that enrolls a weather series on its contract (THE WRITERS' OWN
+    READ), reads() being its discovery's name filter; one whose module won't
+    import is left out."""
+    out: List[tuple] = []
+    try:
+        import rain_wknd_fair as rw
+        out.append(("the weekend writer", imm.RAIN_WKND_FILE, "day_series", "day_rejected",
+                    lambda s: bool(rw.AUTO_DAY_ENABLE
+                                   and ("RAIN" in s or (rw.SNOW_DAY_ENABLE and "SNOW" in s))
+                                   and s not in (rw.SERIES, "KXRAIN") + tuple(rw.DAY_SERIES))))
+    except Exception as e:
+        log(f"[WATCH] ! weekend writer unread ({e!r:.80}); its series are not held")
+    try:
+        import snow_days_fair as sd
+        out.append(("the snow-day writer", imm.SNOW_DAYS_FILE, "series", "rejected",
+                    lambda s: bool(sd.AUTO_ENABLE and "SNOW" in s and s not in sd.SERIES
+                                   and not sd._OTHER_SNOW_RE.fullmatch(s))))
+    except Exception as e:
+        log(f"[WATCH] ! snow-day writer unread ({e!r:.80}); its series are not held")
+    return out
+
+
+def writer_verdicts(series: str, now_ts: float,
+                    writers: Optional[List[tuple]] = None) -> List[Tuple[str, str, str]]:
+    """[(writer, verdict, why)] from each contract writer that reads `series`
+    (THE WRITERS' OWN READ): "joined", "passed" (with its why), "unopened" (a
+    fresh no-open-market verdict), or "unread" (none yet, or a stale
+    no-open-market one). [] when no such writer reads it."""
+    out: List[Tuple[str, str, str]] = []
+    for name, path, jkey, rkey, reads in (_contract_writers() if writers is None
+                                          else writers):
+        if not reads(series):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except (OSError, ValueError):
+            data = {}
+        rej = (data.get(rkey) or {}).get(series)
+        why = str(rej.get("why") or "") if isinstance(rej, dict) else ""
+        if series in (data.get(jkey) or {}):
+            out.append((name, "joined", ""))
+        elif why == WRITER_NO_OPEN_MARKET:
+            fresh = now_ts - float(rej.get("at") or 0.0) < WRITER_FRESH_SECS
+            out.append((name, "unopened" if fresh else "unread", ""))
+        elif why:
+            out.append((name, "passed", why))
+        else:
+            out.append((name, "unread", ""))
+    return out
+
+
+def hold_for_writers(items: Dict[str, dict], state: dict, now_ts: float,
+                     writers: Optional[List[tuple]] = None) -> List[str]:
+    """Hold each new:<series> item a contract writer has yet to pass on (THE
+    WRITERS' OWN READ); one sent gets the writers' word as its fix. Returns
+    a log line for each item held."""
+    seen = state.get("items") or {}
+    ws = _contract_writers() if writers is None else writers
+    notes: List[str] = []
+    for key, it in items.items():
+        if not key.startswith("new:"):
+            continue
+        vs = writer_verdicts(key[len("new:"):], now_ts, ws)
+        if not vs:
+            continue
+        first = float((seen.get(key) or {}).get("first") or now_ts)
+        dark_min = (now_ts - first) / 60.0
+        unopened = [n for n, v, _ in vs if v == "unopened"]
+        reading = [n for n, v, _ in vs if v in ("unread", "joined")]
+        if unopened or (reading and dark_min < WRITER_HOLD_MAX_MIN):
+            it["hold"] = True
+            said = ([f"{n}: no open market yet" for n in unopened]
+                    + [f"{n}: {v} ({dark_min:.0f} min)" for n, v, _ in vs if n in reading])
+            notes.append(f"held {key}: {'; '.join(said)}")
+            continue
+        said = []
+        for n, v, why in vs:
+            if v == "passed":
+                said.append(f"{n} passed on it ({why})")
+            elif v == "joined":
+                said.append(f"{n} took it, but the bot still reads it not allowlisted")
+            else:
+                said.append(f"{n} has not read it in {dark_min:.0f} min")
+        it["fix"] = ("a weather series no family takes: " + "; ".join(said)
+                     + ". Your call (enroll it into a weather family, or leave it out)"
+                     ).encode("ascii", "replace").decode("ascii")   # the console is cp1252
+    return notes
 
 
 def _fmt_end(iso: str) -> str:
@@ -2355,6 +2470,11 @@ def main(argv=None) -> int:
                         n_up += 1
             except Exception as e:
                 log(f"[WATCH] ! upcoming alert items failed ({e!r}); live items only")
+            try:
+                for n in hold_for_writers(items, state, time.time()):
+                    log(f"[WATCH] {n}")
+            except Exception as e:
+                log(f"[WATCH] ! writer hold failed ({e!r}); weather items unheld")
             try:
                 for n in real_estimates(client, items, progs, state, time.time(),
                                         make_bot=make_bot):
