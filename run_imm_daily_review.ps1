@@ -50,7 +50,11 @@ $Skill = Join-Path $CodeDir ".claude\skills\imm-daily-review\SKILL.md"
 $Python = "C:\Users\jackd\AppData\Local\Programs\Python\Python312\python.exe"
 $UserSite = "C:\Users\jackd\AppData\Roaming\Python\Python312\site-packages"
 $Model = "opus"
-$CollectTimeoutMin = 25
+# 35 min (was 25): the 11/26 collect took 1,181 s of 1,500, the moat's cycle-log
+# scan 1,050 s of that at BelowNormal priority beside the bot. The scan is now
+# one shared pass (imm_review._cycle_pass); this is the margin on top.
+# 35 + 100 + ingest 5 + send 15 = 155 min, inside the task's 2 h 45 min.
+$CollectTimeoutMin = 35
 $ClaudeTimeoutMin = 100
 $LoginError = 'failed to authenticate|oauth (session|token)|not logged in|run /login|invalid api key'
 
@@ -235,6 +239,7 @@ Edit and Write are switched off. Write your two outputs only with the put comman
   EOF
 then run: python imm_review.py ledger ingest --day $Day
 then write review.md the same way: python imm_review.py put review.md --day $Day <<'EOF' ... EOF
+Every run answers one question for itself (SKILL.md step 8, Jack 2026-11-26), in findings.json "compound": What else should this review be doing, daily, to compound and improve itself? Evidence section 11 is its input. At least one answer, every day.
 Do not send anything and do not run any send_*.py: this launcher sends the email when you finish.
 Finish with at most 5 lines: the verdict, the decisions, and anything that blocked you.
 "@

@@ -11,6 +11,29 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
 - **The moat (11/25):** "the skill's daily iterative process should lead to compounding and building a moat on data, analysis, and process that allows it to continually get better even as the markets get more competitive".
   - Built the same day: moat/family_daily.csv (with pool share from the cycle log), priors.json, the edge watch, missed markets netted by family tax, the review's self-calibration, and the playbook.
   - The durable backup (R-261124-20) is a decision for Jack. The wedged sync was fixed the same morning, then the review landed on main and the 04:30 task was registered.
+- **The daily self-question (11/26):** "what else should this skill be doing daily to compound and improve itself? everyday it should ask itself this question and come with opportunities".
+  - **Built the same day:**
+    - SKILL.md step 8, answered in findings.json `compound`, at least one answer a run;
+    - evidence section 11: the review's own record, what landed without it, overlaps, rechecks, run traces, repeated manual work, budget, backlog;
+    - watches: read-only checks the review adds itself, no approval;
+    - `recheck_on` dates for promises;
+    - the `false-positive` closure;
+    - the email's "Making the review better" block.
+  - Self-applied changes are limited to the review's own reading: watches, lessons and playbook rules. Anything in code or the bot stays "Plan + your yes".
+  - **What prompted it (the 11/26 state):**
+    - The collect used 1,181 s of a 1,500 s limit, 1,050 s of it in the moat's cycle-log scan. It is now one shared pass, and the limit is 35 min.
+    - Yesterday's run took 31 min, 78 turns and a reported $9.60. About 17 of its 65 Bash calls went to assembling findings.json and review.md in 4 kB chunks.
+    - Since 11/25, 11 of the 12 commits that changed the bot's code or launcher came from outside the review. Among them, the KXAPRPOTUS morning stand-down (d4d28c2) re-diagnosed R-261125-01, and the held-close bug (accb53f) was found without the review.
+    - The 11/25 rain finding's "re-measured 12/02" promise had nothing to enforce it.
+  - **The first headless run with step 8** (scratch copy, 11/26 13:00, D = 11/25): 15 min, 53 turns. It answered with three compound items:
+    - read IMM-WATCH's findings (family_watch_state.json), not only its crashes. R-261124-12 had been raised twice as a missing election date that IMM-WATCH had already researched; it closed as false-positive;
+    - a one-pass `put`;
+    - five watches on shipped fixes, added by itself.
+
+    It closed R-261125-01 fixed-elsewhere, with d4d28c2's better diagnosis as the lesson, and it put recheck dates on four findings.
+  - **Two latent bugs it exposed, both fixed before landing:**
+    - CRLF input to `put` was written as CR CR LF, which reads back as a blank line after every line and broke every table in the email;
+    - `[[fp:...]]` tags for earlier items rendered empty. The sender now resolves them through the ledger.
 
 ## 2026-11-25: what the survey found before the first run (the baseline)
 

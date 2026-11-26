@@ -368,9 +368,12 @@ def load_ctx(day: date) -> dict:
     except Exception:
         ledger = {}
     rows = []
-    for f in findings.get("findings") or []:
-        if not isinstance(f, dict):
-            continue
+    # findings, then the day's answers to "what else should this review be
+    # doing to compound?" (findings.json "compound", Jack 2026-11-26): those get
+    # their own block under the decision cards, never one of the 3 cards
+    raws = [(f, False) for f in findings.get("findings") or [] if isinstance(f, dict)]
+    raws += [(rv._clean_compound(c), True) for c in findings.get("compound") or [] if isinstance(c, dict)]
+    for f, comp in raws:
         fp = rv._slug(f.get("fingerprint") or "")
         iid = ids.get(fp) or (f.get("ledger_id") if f.get("ledger_id") in ledger else None) or ""
         sev = str(f.get("severity") or "P3").upper()
@@ -380,20 +383,35 @@ def load_ctx(day: date) -> dict:
                      "seen": len(it.get("seen_days") or []), "status": it.get("status") or "",
                      "usd": abs(rv._f((f.get("impact") or {}).get("usd_day")))
                      if isinstance(f.get("impact"), dict) else 0.0,
+                     "compound": comp, "self_apply": f.get("self_apply") if comp else None,
+                     "applied": _short(f.get("applied") or "", 160) if comp else "",
                      **email_fields(f)})
     order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
     rows.sort(key=lambda r: (order[r["sev"]], -r["usd"]))
-    decisions = [r for r in rows if r["decision"] and r["status"] not in rv.TERMINAL][:MAX_DECISIONS]
+    decisions = [r for r in rows if r["decision"] and not r["compound"]
+                 and r["status"] not in rv.TERMINAL][:MAX_DECISIONS]
+    compound = [r for r in rows if r["compound"]]
     today_ids = {r["id"] for r in rows}
     waiting = []
     for iid, it in sorted(ledger.items()):
+        if it.get("compound"):
+            continue          # the compound block lists its own backlog
         if it.get("status") == "proposed" and iid not in today_ids and (it.get("first_seen") or "") < day.isoformat():
             age = (day - date.fromisoformat(it["first_seen"])).days if it.get("first_seen") else 0
             head = (it.get("email") or {}).get("headline") if isinstance(it.get("email"), dict) else None
             waiting.append({"id": iid, "headline": _short(head or it.get("title"), 80), "age": age})
-    review_md = substitute_ids(_read(os.path.join(dd, "review.md")), ids).strip()
+    # [[fp:...]] for an item from an earlier day resolves through the ledger, not
+    # only today's ids.json (the 11/26 test run's lesson: those tags rendered empty)
+    fp_ids = {it.get("fingerprint"): iid for iid, it in sorted(ledger.items()) if it.get("fingerprint")}
+    review_md = substitute_ids(_read(os.path.join(dd, "review.md")), {**fp_ids, **ids}).strip()
     title, intro, sections = split_review(review_md)
+    backlog = [{"id": iid, "headline": _short(((it.get("email") or {}).get("headline") if isinstance(
+                    it.get("email"), dict) else None) or it.get("title"), 80),
+                "age": (day - date.fromisoformat(it["first_seen"])).days if it.get("first_seen") else 0}
+               for iid, it in sorted(ledger.items())
+               if it.get("compound") and it.get("status") == "proposed" and iid not in today_ids]
     return {"day": day, "ev": ev, "findings": findings, "rows": rows, "decisions": decisions,
+            "compound": compound, "compound_backlog": backlog[:6],
             "waiting": waiting[:8], "review": review_md, "title": title, "intro": intro,
             "sections": sections,
             "open": sum(1 for it in ledger.values() if it.get("status") not in rv.TERMINAL),
@@ -450,6 +468,16 @@ def health_checks(ev: dict) -> List[Tuple[str, str]]:
     if cr.get("age_days") is not None:
         a = int(rv._f(cr["age_days"]))
         out.append((f"Rewards statement {a}d old", "green" if a <= 4 else ("amber" if a <= 10 else "red")))
+    w = ((ev.get("self") or {}).get("watches")) or {}
+    if w.get("active"):
+        nf = len(w.get("firing") or []) + len(w.get("errors") or [])
+        hot = any((x.get("severity") or "") in ("P0", "P1") for x in w.get("firing") or [])
+        out.append((f"Review checks: {nf} of {w['active']} firing" if nf else f"Review checks: all {w['active']} OK",
+                    "green" if not nf else ("red" if hot else "amber")))
+    b = ((ev.get("self") or {}).get("budget")) or {}
+    if rv._f(b.get("collect_pct")) >= 0.6:
+        out.append((f"Review data gathering at {rv._f(b['collect_pct']) * 100:.0f}% of its limit",
+                    "red" if rv._f(b["collect_pct"]) >= 0.85 else "amber"))
     return out
 
 
@@ -518,6 +546,73 @@ def _standing(r: dict) -> Tuple[str, str]:
     return "open", AMBER
 
 
+def self_line(ev: dict) -> str:
+    """One line of the review's own score (evidence section 11)."""
+    se = ev.get("self") or {}
+    st = (se.get("record") or {}).get("stats") or {}
+    if not st:
+        return ""
+    parts = [f"{st.get('items')} findings so far", f"{st.get('approved')} approved",
+             f"{st.get('verified')} verified"]
+    if st.get("false_positives"):
+        parts.append(f"{st['false_positives']} false positive{'s' if st['false_positives'] != 1 else ''}")
+    runs = se.get("runs") or []
+    if runs and runs[0].get("minutes"):
+        cost = f", ${rv._f(runs[0]['cost_usd']):.2f}" if runs[0].get("cost_usd") is not None else ""
+        parts.append(f"last run {rv._f(runs[0]['minutes']):.0f} min{cost}")
+    b = se.get("budget") or {}
+    if rv._f(b.get("collect_pct")) >= 0.5:
+        parts.append(f"data gathering at {rv._f(b['collect_pct']) * 100:.0f}% of its time limit")
+    return "; ".join(parts) + "."
+
+
+def render_compound(ctx: dict) -> str:
+    """The block under the decision cards: what the review will do to get
+    better, asked and answered every day (Jack 2026-11-26)."""
+    comp = ctx.get("compound") or []
+    ev = ctx.get("ev") or {}
+    w = ((ev.get("self") or {}).get("watches")) or {}
+    added = ((rv._load_json(os.path.join(day_dir(ctx["day"]), "ingested.json"), {}) or {}).get("watches") or {}).get("added") or []
+    P = [_h2("Making the review better", len(comp))]
+    line = self_line(ev)
+    if line:
+        P.append(f'<div style="margin:0 0 8px;font-size:13px;color:{MUTED}">{esc(line)}</div>')
+    if not comp:
+        P.append(_card(f'<span style="color:{AMBER}">The review did not answer its daily question today '
+                       '(what else it should be doing to compound and improve itself).</span>', AMBER))
+    for r in comp:
+        inner = [f'<div style="font-size:15px;font-weight:700;margin-bottom:6px">{esc(r["headline"])}</div>']
+        if r["why"]:
+            inner.append(f'<div style="margin-bottom:6px">{inline(r["why"])}</div>')
+        if r["fix"]:
+            inner.append(f'<div style="margin-bottom:6px"><b>Change:</b> {inline(r["fix"])}</div>')
+        if r["value"]:
+            inner.append(f'<div style="margin-bottom:8px"><b>Worth:</b> {esc(r["value"])}</div>')
+        if r.get("self_apply") and not r["decision"]:
+            did = r.get("applied") or {"watch": "added a read-only check", "lesson": "filed a lesson",
+                                         "playbook": "added a playbook rule"}.get(r["self_apply"], "")
+            ids_ = f' ({", ".join(added)})' if r["self_apply"] == "watch" and added else ""
+            inner.append(f'<div style="font-size:14px;color:{GREEN}">Done by the review itself: {esc(did)}{esc(ids_)}'
+                         f'{" " + id_chip(r["id"]) if r["id"] else ""}</div>')
+        else:
+            idt = r["id"] or "(not filed)"
+            inner.append(f'<div style="font-size:14px;color:{BLUE}">Build it: text '
+                         f'<b style="white-space:nowrap">do {esc(idt)}</b></div>')
+        P.append(_card("".join(inner), GREEN if (r.get("self_apply") and not r["decision"]) else BLUE))
+    if w.get("firing") or w.get("errors"):
+        rows = [f'<div style="padding:3px 0">{_sev(x.get("severity") or "P2")} {esc(x.get("title"))} '
+                f'<span style="color:{MUTED};font-size:13px">({esc(x["id"])}: '
+                f'{esc(x.get("error") or ("value " + str(x.get("value"))))})</span></div>'
+                for x in (w.get("firing") or []) + (w.get("errors") or [])]
+        P.append(_card(f'<div style="font-weight:700;margin-bottom:4px">The review\'s own checks firing</div>'
+                       + "".join(rows), AMBER))
+    if ctx.get("compound_backlog"):
+        P.append(f'<div style="margin:0 0 8px;font-size:13px;color:{MUTED}">Earlier ideas still waiting: '
+                 + "; ".join(f'{esc(b["headline"])} ({esc(b["id"])}, {b["age"]}d)' for b in ctx["compound_backlog"])
+                 + '</div>')
+    return "".join(P)
+
+
 def render_html(ctx: dict, fallback_reason: str = "") -> str:
     day: date = ctx["day"]
     ev = ctx["ev"]
@@ -566,6 +661,8 @@ def render_html(ctx: dict, fallback_reason: str = "") -> str:
                          f'<span style="white-space:nowrap">no {esc(idt)}</span> to drop it '
                          f'&middot; details below</div>')
             a(_card("".join(inner), SEV_STYLE[r["sev"]][1]))
+        # 2b. the review's answer to its own daily question
+        a(render_compound(ctx))
         # 3. the full review, section by section
         for head, body in ctx["sections"]:
             if not body.strip():
@@ -689,6 +786,19 @@ def render_text(ctx: dict, fallback_reason: str = "") -> str:
             L.append(f"   Approve: text \"do {r['id']}\"")
         if not ctx["decisions"]:
             L.append("Nothing today.")
+        comp = ctx.get("compound") or []
+        L += ["", f"MAKING THE REVIEW BETTER ({len(comp)})"]
+        if self_line(ctx["ev"]):
+            L.append(self_line(ctx["ev"]))
+        for r in comp:
+            L.append(f"- {r['headline']}")
+            for k, lab in (("why", ""), ("fix", "Change: "), ("value", "Worth: ")):
+                if r[k]:
+                    L.append(f"   {lab}{r[k]}")
+            L.append("   Done by the review itself" if r.get("self_apply") and not r["decision"]
+                     else f"   Build it: text \"do {r['id']}\"")
+        if not comp:
+            L.append("The review did not answer its daily question today.")
         if ctx["review"]:
             L += ["", ctx["review"]]
     edge = edge_line(ctx["ev"])

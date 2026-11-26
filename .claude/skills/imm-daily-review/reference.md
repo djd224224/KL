@@ -37,6 +37,7 @@ The facts the runbook (`SKILL.md`) leans on. Sourced from the 11/25 survey of th
 | Data | sizes of each sink's UTC-day file vs its 14-day median | LOW < 0.3x, HIGH > 3x, MISSING when present 10+ of 14 days |
 | Changes | `git log` (local HEAD + origin/main), `config_manifest.jsonl` + `config_store/` (the reloadable files, versioned by the review since 11/25) | Commit subjects naming `R-YYMMDD-NN` mark that item shipped |
 | Moat (section 10) | `daily_review/moat/`:<br>- `family_daily.csv`: per day x family, from the day archive. `share` = sum(est_frac x pool_per_day) / sum(pool_per_day) over the cycle log's market-cycles, and `pool_cov` = the average pool $/day managed.<br>- `priors.json`: 30 days, shrunk with m = 5 days toward the book.<br>- `playbook.md`.<br>Plus the edge watch and the review's calibration from the ledger. | Share is our cut of the pool where we quote, the cleanest competition signal. The first run back-fills share for 7 days; older days carry none. |
+| The review itself (section 11, since 11/26) | the ledger; `git log` of the day (subjects, bodies, files); Claude Code's project memory (`~/.claude/projects/C--Users-jackd-Documents-KL/memory/*.md` by mtime, `IMM_REVIEW_MEMORY_DIR` overrides); each earlier run's `claude_stream.jsonl` + `run.log`; this collect's section times against `$CollectTimeoutMin` / `$ClaudeTimeoutMin` read from the launcher; `watches.json` + `watch_results.jsonl` | Step 8's input. "Reported cost" is what Claude Code prints for the run (API-equivalent), not a bill. Command kinds are a heuristic: the first word, the script, and the sinks a command names. |
 
 ## 3. Data map and reading recipes
 
@@ -196,8 +197,11 @@ Calibrate: each day's top predictions are logged, and when those events get quot
 | Machine | disk days-to-full; research-token age; memory; log retention's last run (mode, GB freed, failures, conflicts, STALE) |
 | Ops | failing scheduled tasks (new vs chronic); task-log errors |
 | Selection | config gaps (fail-closed); floor misses |
+| The review itself | collect time against its limit; the last runs' errors, denials and minutes; promised rechecks due; the review's own watches |
 
-To add one: propose it as a finding of kind `review` with the check spelled out. Once Jack approves, apply mode adds it to `imm_review.py` with a test.
+**Two ways to add one:**
+- **A watch** (since 11/26): a simple symptom the review can see by itself (a log line, a sink count, a stale file, a status number, a family's net). The review adds it unattended through findings.json `watches`, and it runs from the next collect. It needs no approval because it only reads run-logs.
+- **Anything with logic:** propose it as a finding of kind `review` with the check spelled out. Once Jack approves, apply mode adds it to `imm_review.py` with a test.
 
 ## 9. Known traps
 

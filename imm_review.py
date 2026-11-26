@@ -23,7 +23,9 @@ launcher (run_imm_daily_review.ps1) runs the three every morning.
     python imm_review.py ledger ingest --day D [--file F]   # the skill's findings.json
     python imm_review.py ledger decide ID approved|rejected|deferred --note "..." [--by jack]
     python imm_review.py ledger ship ID --ref <commit> [--note "..."]
-    python imm_review.py ledger close ID --status closed|fixed-elsewhere|wontfix|reverted --note "..."
+    python imm_review.py ledger close ID --status closed|fixed-elsewhere|wontfix|reverted|false-positive --note "..."
+    python imm_review.py ledger recheck ID --on YYYY-MM-DD [--note "..."]   # a promise to look again
+    python imm_review.py watch list [--all] | eval [--day D] | retire W-... --note "..."
     python imm_review.py measure (--pattern REGEX | --family NAME) --split YYYY-MM-DD[THH:MM]
                                  [--before 7] [--after 7]
     python imm_review.py put findings.json|review.md --day D  < content   # the unattended run's writes
@@ -40,6 +42,8 @@ untracked, so the 30-min sync never touches it):
     config_manifest.jsonl, config_store/   versions of the reloadable config files
     task_state.json                        the previous run's scheduled-task results
     lessons.md                             what the unattended runs learned (curated later)
+    watches.json, watch_results.jsonl      the review's own read-only checks and their history
+                                           (added by the skill through findings.json "watches")
 
 Basis tags: every number is MEASURED (Kalshi fills / marks / settlements, logs,
 files) or MODELLED (the bot's reward estimator, one-reading estimates).
@@ -93,10 +97,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LIVE_REPO = STATUS_DIR = REVIEW_DIR = DASH_DIR = CACHE_DIR = ARCHIVE_DIR = RUN_LOGS = MOAT_DIR = ""
 
 
+MEMORY_DIR = ""
+
+
 def configure(status_dir: Optional[str] = None, review_dir: Optional[str] = None,
-              repo: Optional[str] = None) -> None:
-    global LIVE_REPO, STATUS_DIR, REVIEW_DIR, DASH_DIR, CACHE_DIR, ARCHIVE_DIR, RUN_LOGS, MOAT_DIR
+              repo: Optional[str] = None, memory_dir: Optional[str] = None) -> None:
+    global LIVE_REPO, STATUS_DIR, REVIEW_DIR, DASH_DIR, CACHE_DIR, ARCHIVE_DIR, RUN_LOGS, MOAT_DIR, MEMORY_DIR
     LIVE_REPO = repo or os.environ.get("IMM_REVIEW_REPO") or r"C:\Users\jackd\Documents\KL"
+    # Claude Code's project memory for the repo: the notes other sessions write
+    # (section 11 lists the ones written on the review day)
+    MEMORY_DIR = memory_dir or os.environ.get("IMM_REVIEW_MEMORY_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", LIVE_REPO), "memory")
     STATUS_DIR = status_dir or os.environ.get("IMM_STATUS_DIR") or os.path.join(
         LIVE_REPO, "run-logs", "incentive-mm")
     REVIEW_DIR = review_dir or os.environ.get("IMM_REVIEW_DIR") or os.path.join(
@@ -183,8 +194,11 @@ OK_TASK_CODES = {0, 267009, 267011, 267045}
 LEDGER_ID = re.compile(r"\bR-\d{6}-\d{2}\b")
 
 STATUSES = ("open", "proposed", "approved", "rejected", "deferred", "shipped", "verified",
-            "failed", "inconclusive", "closed", "fixed-elsewhere", "wontfix", "reverted")
-TERMINAL = {"rejected", "verified", "closed", "fixed-elsewhere", "wontfix", "reverted"}
+            "failed", "inconclusive", "closed", "fixed-elsewhere", "wontfix", "reverted",
+            "false-positive")
+# false-positive (11/26): a finding the review got wrong, closed as such, so
+# its precision is a number rather than a lesson buried in a note
+TERMINAL = {"rejected", "verified", "closed", "fixed-elsewhere", "wontfix", "reverted", "false-positive"}
 KINDS = ("bug", "ops", "data", "missed", "loss", "strategy", "experiment", "review")
 
 
@@ -1219,29 +1233,112 @@ def _floor_miss_cost(day: date, under: List[Tuple[str, float]], last_row: Dict[s
 # 5. Coverage and uptime
 # ---------------------------------------------------------------------------
 
-def cycle_times(day: date) -> List[float]:
+def _zstamp(ts: float) -> bytes:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ").encode("ascii")
+
+
+def _fb(b: bytes) -> float:
+    try:
+        x = float(b)
+    except ValueError:
+        return 0.0
+    return x if math.isfinite(x) else 0.0
+
+
+# One pass over an ET day's cycle logs feeds both the coverage section (the
+# distinct cycle timestamps) and the moat's pool share. The 11/26 04:30 run
+# spent 1,050 of its collect's 1,181 s in the old text-mode share scan (it
+# decoded and split all 34 columns of every row, at BelowNormal priority beside
+# the bot), with the launcher's limit at 1,500 s. Now: bytes, timestamps
+# compared as text, rows outside the day skipped before any split, the split
+# stopped at the last column needed, and the read stopped an hour past the day.
+# Cached per file: a file last written more than 10 min past the day's stop
+# already holds all of the day (the bot only appends), so it keys as complete
+# and the live UTC file growing between the moat and coverage sections does
+# not force a second read; a file still inside the window keys by size and
+# mtime, and a .gz (a re-run for an old day) is another path.
+_CYCLE_PASS: Dict[tuple, dict] = {}
+
+
+def _cycle_pass(day: date) -> dict:
     s, e = et_bounds(day)
-    seen = set()
-    for u in utc_dates(day):
-        path = imm_logfiles.resolve(os.path.join(STATUS_DIR, f"cycle_log_{u}.csv"))
-        last = b""
+    stop_ts = e + 3600
+    paths = [imm_logfiles.resolve(os.path.join(STATUS_DIR, f"cycle_log_{u}.csv")) for u in utc_dates(day)]
+    ident, present = [], []
+    for p in paths:
         try:
-            with imm_logfiles.open_bin(path) as fh:
-                for line in fh:
-                    head = line[:20]
-                    if head == last or not head[:2].isdigit():
-                        continue
-                    last = head
-                    try:
-                        ts = datetime.strptime(head.decode("ascii"), "%Y-%m-%dT%H:%M:%SZ") \
-                            .replace(tzinfo=timezone.utc).timestamp()
-                    except ValueError:
-                        continue
-                    if s <= ts < e:
-                        seen.add(ts)
+            st = os.stat(p)
+        except OSError:
+            ident.append((p, None))
+            continue
+        present.append(p)
+        ident.append((p, "complete") if st.st_mtime > stop_ts + 600 else (p, st.st_size, st.st_mtime_ns))
+    key = (day.isoformat(), tuple(ident))
+    if key in _CYCLE_PASS:
+        return _CYCLE_PASS[key]
+    lo, hi, stop = _zstamp(s), _zstamp(e), _zstamp(stop_ts)
+    times = set()
+    num: Dict[str, float] = defaultdict(float)
+    den: Dict[str, float] = defaultdict(float)
+    cycles: Dict[str, set] = defaultdict(set)
+    fam_of: Dict[bytes, str] = {}
+    for path in present:
+        try:
+            fh = imm_logfiles.open_bin(path)
         except OSError:
             continue
-    return sorted(seen)
+        idx, need = None, 0
+        last_head, last_in = b"", False
+        with fh:
+            for line in fh:
+                if line.startswith(b"ts,"):
+                    cols = line.rstrip(b"\r\n").split(b",")
+                    try:
+                        idx = (cols.index(b"ticker"), cols.index(b"est_frac"), cols.index(b"pool_per_day"))
+                        need = max(idx)
+                    except ValueError:
+                        idx = None
+                    continue
+                head = line[:20]
+                if head != last_head:
+                    if not head[:2].isdigit():
+                        continue
+                    last_head = head
+                    last_in = lo <= head < hi
+                    if last_in:
+                        try:
+                            times.add(datetime.strptime(head.decode("ascii"), "%Y-%m-%dT%H:%M:%SZ")
+                                      .replace(tzinfo=timezone.utc).timestamp())
+                        except ValueError:
+                            last_in = False
+                    elif head >= stop:
+                        break       # rows are written in cycle order: the rest is a later day
+                if not last_in or idx is None:
+                    continue
+                parts = line.split(b",", need + 1)
+                if len(parts) <= need:
+                    continue
+                pool = _fb(parts[idx[2]])
+                if pool <= 0:
+                    continue
+                ser = parts[idx[0]].split(b"-", 1)[0]
+                fam = fam_of.get(ser)
+                if fam is None:
+                    fam = fam_of[ser] = family_of(ser.decode("ascii", "replace"))[0]
+                num[fam] += _fb(parts[idx[1]]) * pool
+                den[fam] += pool
+                cycles[fam].add(head)
+    out = {"times": sorted(times),
+           "share": {f: {"share": round(num[f] / den[f], 5), "pool_cov": round(den[f] / max(1, len(cycles[f])), 2)}
+                     for f in den if den[f] > 0}}
+    if len(_CYCLE_PASS) > 16:
+        _CYCLE_PASS.clear()
+    _CYCLE_PASS[key] = out
+    return out
+
+
+def cycle_times(day: date) -> List[float]:
+    return list(_cycle_pass(day)["times"])
 
 
 def sec_coverage(day: date) -> dict:
@@ -2001,10 +2098,28 @@ def parse_git_log(out: str) -> List[dict]:
             continue
         body = parts[3] if len(parts) > 3 else ""
         names = [l.strip() for l in files.splitlines() if l.strip()]
+        ids = subject_ids(parts[2])
         res.append({"sha": parts[0].strip(), "at": et_str(_f(parts[1])), "subject": parts[2][:160],
-                    "ids": sorted(set(LEDGER_ID.findall(parts[2] + " " + body))),
-                    "bot": "incentive_mm.py" in names, "files": len(names)})
+                    # only the SUBJECT ships an item (apply mode writes "(review R-...)"
+                    # there). A body that mentions one is context: d4d28c2 (11/26) opens
+                    # "On the daily review's R-261125-01 ..." and shipped something else
+                    "ids": ids, "mentions": sorted(set(LEDGER_ID.findall(body)) - set(ids)),
+                    "bot": "incentive_mm.py" in names, "files": len(names),
+                    # what section 11 matches against open items (a shared series or file)
+                    "names": names[:40], "body": body.strip()[:400]})
     return res
+
+
+_ID_TAIL = re.compile(r"\b(R-\d{6})-\d{2}((?:\s*(?:,|and|&)\s*-\d{2}\b)+)")
+
+
+def subject_ids(subject: str) -> List[str]:
+    """Ledger ids a commit subject names, with the shorthand "R-261124-05, -06"."""
+    ids = set(LEDGER_ID.findall(subject or ""))
+    for m in _ID_TAIL.finditer(subject or ""):
+        for n in re.findall(r"-(\d{2})\b", m.group(2)):
+            ids.add(f"{m.group(1)}-{n}")
+    return sorted(ids)
 
 
 def sec_changes(day: date) -> dict:
@@ -2062,7 +2177,8 @@ def ledger_state() -> Dict[str, dict]:
             if d and d not in it["seen_days"]:
                 it["seen_days"].append(d)
             it["last_seen"] = d
-            for k in ("severity", "title", "summary", "impact", "evidence", "ask", "plan", "metric", "email"):
+            for k in ("severity", "title", "summary", "impact", "evidence", "ask", "plan", "metric", "email",
+                      "recheck_on", "compound", "self_apply"):
                 if ev.get(k):
                     it[k] = ev[k]
             if ev.get("status"):
@@ -2100,6 +2216,16 @@ def next_id(day: date, items: Dict[str, dict]) -> str:
     return f"{pre}{n + 1:02d}"
 
 
+def _iso_day(v) -> Optional[str]:
+    try:
+        return date.fromisoformat(str(v).strip()[:10]).isoformat() if v else None
+    except ValueError:
+        return None
+
+
+SELF_APPLY = ("watch", "lesson", "playbook")
+
+
 def _clean_finding(f: dict) -> dict:
     kind = f.get("kind") if f.get("kind") in KINDS else "review"
     sev = str(f.get("severity") or "P3").upper()
@@ -2121,7 +2247,33 @@ def _clean_finding(f: dict) -> dict:
                 {"change": str(f["plan"])} if f.get("plan") else {}),
             "metric": f.get("metric") if isinstance(f.get("metric"), dict) else {},
             "email": {k: str(em.get(k))[:260] for k in ("headline", "why", "fix", "value") if em.get(k)},
+            # a promise to look again ("re-measured 12/02") gets a date the ledger
+            # enforces: ledger_due lists the item on that day, shipped or not
+            "recheck_on": _iso_day(f.get("recheck_on") or (
+                f["metric"].get("recheck_on") if isinstance(f.get("metric"), dict) else None)),
+            "compound": bool(f.get("compound")),
+            "self_apply": f.get("self_apply") if f.get("self_apply") in SELF_APPLY else None,
             "ledger_id": f.get("ledger_id")}
+
+
+def _clean_compound(c: dict) -> dict:
+    """findings.json "compound": the day's answer to "what else should this
+    review be doing to compound and improve itself?" (Jack 2026-11-26). Each
+    becomes a ledger item of kind review. One the review applies itself (a
+    watch, a lesson, a playbook rule) is open; anything else waits on Jack."""
+    c = dict(c)
+    c["kind"] = "review"
+    c["compound"] = True
+    fp = str(c.get("fingerprint") or "")
+    if not fp:
+        c["fingerprint"] = "review-" + str(c.get("title") or "untitled")
+    if not c.get("summary") and c.get("gap"):
+        c["summary"] = str(c["gap"])
+    if not c.get("plan") and c.get("change"):
+        c["plan"] = {"change": str(c["change"])}
+    if "decision_needed" not in c:
+        c["decision_needed"] = bool(c.get("needs_jack", c.get("self_apply") not in SELF_APPLY))
+    return c
 
 
 def ledger_ingest(day: date, path: Optional[str] = None) -> dict:
@@ -2132,17 +2284,23 @@ def ledger_ingest(day: date, path: Optional[str] = None) -> dict:
         raise SystemExit(f"findings file missing or not a JSON object: {path}")
     items = ledger_state()
     by_fp = {}
-    for iid, it in items.items():
-        if it.get("status") not in TERMINAL:
+    # an item this same file closes keeps its id on a second ingest of the day,
+    # instead of reopening as a new item (a closed fingerprint seen on a LATER
+    # day still reopens, as before)
+    closing = {c.get("id") for c in data.get("closures") or [] if isinstance(c, dict)}
+    for iid, it in sorted(items.items()):
+        if it.get("status") not in TERMINAL or iid in closing:
             by_fp[it.get("fingerprint")] = iid
     ids, created, seen = {}, [], []
-    for raw in data.get("findings") or []:
-        if not isinstance(raw, dict):
-            continue
+    raws = [r for r in data.get("findings") or [] if isinstance(r, dict)]
+    raws += [_clean_compound(c) for c in data.get("compound") or [] if isinstance(c, dict)]
+    for raw in raws:
         f = _clean_finding(raw)
         iid = f["ledger_id"] if f["ledger_id"] in items else by_fp.get(f["fingerprint"])
         body = {k: f[k] for k in ("kind", "severity", "fingerprint", "title", "summary",
-                                  "evidence", "impact", "ask", "plan", "metric", "email")}
+                                  "evidence", "impact", "ask", "plan", "metric", "email",
+                                  "recheck_on", "compound", "self_apply")
+                if f[k] not in (None, False) or k not in ("recheck_on", "compound", "self_apply")}
         if iid:
             it = items[iid]
             if iso not in (it.get("seen_days") or []):
@@ -2161,9 +2319,23 @@ def ledger_ingest(day: date, path: Optional[str] = None) -> dict:
             by_fp[f["fingerprint"]] = iid
             created.append(iid)
         ids[f["fingerprint"]] = iid
+    # a second ingest of the same day (a run that fixed a rejected watch and
+    # ingested again, or the launcher's catch-up) must not append the same
+    # evaluation, closure, lesson or playbook line twice
+    prev = _load_json(os.path.join(REVIEW_DIR, iso, "ingested.json"), {}) or {}
+    done = {k: set(v) for k, v in (prev.get("done") or {}).items() if isinstance(v, list)}
+
+    def first_time(kind: str, obj) -> bool:
+        h = hashlib.sha1(json.dumps(obj, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+        s = done.setdefault(kind, set())
+        if h in s:
+            return False
+        s.add(h)
+        return True
+
     evals = 0
     for e in data.get("evaluations") or []:
-        if isinstance(e, dict) and e.get("id") in items:
+        if isinstance(e, dict) and e.get("id") in items and first_time("evals", e):
             ledger_append({"op": "eval", "id": e["id"], "day": iso,
                            "verdict": e.get("verdict") if e.get("verdict") in (
                                "verified", "failed", "inconclusive") else "inconclusive",
@@ -2172,22 +2344,33 @@ def ledger_ingest(day: date, path: Optional[str] = None) -> dict:
             evals += 1
     closes = 0
     for c in data.get("closures") or []:
-        if isinstance(c, dict) and c.get("id") in items:
+        if isinstance(c, dict) and c.get("id") in items and first_time("closes", c):
             st = c.get("status") if c.get("status") in TERMINAL else "closed"
             ledger_append({"op": "close", "id": c["id"], "status": st,
                            "note": str(c.get("note") or "")[:600]})
             closes += 1
-    _write_json(os.path.join(REVIEW_DIR, iso, "ids.json"), ids)
-    _write_json(os.path.join(REVIEW_DIR, iso, "ingested.json"),
-                {"at": _now_iso(), "created": created, "seen": seen, "evals": evals, "closes": closes})
+    # the review's own read-only checks (findings.json "watches" / "retire_watches")
+    wres = watches_ingest(day, data.get("watches") or [], data.get("retire_watches") or [])
     lessons = [str(x).strip() for x in data.get("lessons") or [] if str(x).strip()]
+    lessons = [l for l in lessons[:5] if first_time("lessons", l)]
     if lessons:
         with open(os.path.join(REVIEW_DIR, "lessons.md"), "a", encoding="utf-8") as fh:
-            for l in lessons[:5]:
+            for l in lessons:
                 fh.write(f"- {iso}: {l[:400]}\n")
     # PROCESS MOAT: a verified fix becomes a reusable rule the next runs apply
     # to other families and new waves (moat/playbook.md, one line per rule)
     rules = [p for p in data.get("playbook") or [] if isinstance(p, dict) and str(p.get("rule") or "").strip()]
+    rules = [p for p in rules[:5] if first_time("playbook", p)]
+    pw = prev.get("watches") or {}
+    _write_json(os.path.join(REVIEW_DIR, iso, "ids.json"), {**(_load_json(os.path.join(REVIEW_DIR, iso, "ids.json"), {})
+                                                               if prev else {}), **ids})
+    _write_json(os.path.join(REVIEW_DIR, iso, "ingested.json"),
+                {"at": _now_iso(), "created": list(dict.fromkeys((prev.get("created") or []) + created)),
+                 "seen": seen, "evals": int(_f(prev.get("evals"))) + evals,
+                 "closes": int(_f(prev.get("closes"))) + closes,
+                 "watches": {k: list(dict.fromkeys((pw.get(k) or []) + wres[k])) if k != "rejected" else wres[k]
+                             for k in ("added", "updated", "retired", "rejected")},
+                 "done": {k: sorted(v) for k, v in done.items()}})
     if rules:
         os.makedirs(MOAT_DIR, exist_ok=True)
         path = os.path.join(MOAT_DIR, "playbook.md")
@@ -2198,12 +2381,23 @@ def ledger_ingest(day: date, path: Optional[str] = None) -> dict:
             for p in rules[:5]:
                 fh.write(f"- {iso} [{str(p.get('evidence') or '')[:40]}] "
                          f"{str(p.get('applies_to') or 'all')[:80]}: {str(p['rule']).strip()[:400]}\n")
-    return {"created": created, "seen": seen, "evals": evals, "closes": closes, "ids": ids}
+    return {"created": created, "seen": seen, "evals": evals, "closes": closes, "ids": ids,
+            "watches": wres}
 
 
 def ledger_due(day: date) -> List[dict]:
+    """Items to measure today: shipped ones past their eval_after_days, and any
+    open item whose recheck_on date has come (a promise to look again, shipped
+    or not: 11/25's "re-measured 12/02" had no mechanism until 11/26)."""
     out = []
     for iid, it in ledger_state().items():
+        last_eval = max((e.get("day") or "" for e in it.get("evals") or []), default="")
+        rc = it.get("recheck_on")
+        if rc and it.get("status") not in TERMINAL and it.get("status") != "shipped" \
+                and rc <= day.isoformat() and last_eval < rc:
+            out.append({"id": iid, "title": it.get("title"), "why": "recheck", "due": rc,
+                        "status": it.get("status"), "metric": it.get("metric")})
+            continue
         if it.get("status") != "shipped" or not it.get("ship"):
             continue
         at = _ts_of(it["ship"].get("at"))
@@ -2211,9 +2405,8 @@ def ledger_due(day: date) -> List[dict]:
             continue
         wait = _f((it.get("metric") or {}).get("eval_after_days"), 7)
         due_day = datetime.fromtimestamp(at, ET).date() + timedelta(days=int(wait))
-        last_eval = max((e.get("day") or "" for e in it.get("evals") or []), default="")
         if due_day <= day and last_eval < due_day.isoformat():
-            out.append({"id": iid, "title": it.get("title"), "shipped": et_str(at),
+            out.append({"id": iid, "title": it.get("title"), "why": "shipped", "shipped": et_str(at),
                         "due": due_day.isoformat(), "metric": it.get("metric")})
     return out
 
@@ -2226,9 +2419,28 @@ def ledger_stats() -> dict:
     gain = sum(_f((it.get("evals") or [{}])[-1].get("delta_usd_day")) for it in verified)
     decided = [it for it in items.values() if it.get("decisions")]
     approved = sum(1 for it in decided if any(d.get("status") == "approved" for d in it["decisions"]))
+    rejected = sum(1 for it in decided if any(d.get("status") == "rejected" for d in it["decisions"]))
+    fps = [iid for iid, it in items.items() if _is_false_positive(it)]
+    judged = by_status.get("verified", 0) + by_status.get("failed", 0)
     return {"items": len(items), "by_status": dict(by_status), "by_kind": dict(by_kind),
             "verified_delta_usd_day": round(gain, 2), "decided": len(decided), "approved": approved,
-            "failed": by_status.get("failed", 0)}
+            "rejected": rejected, "failed": by_status.get("failed", 0),
+            "verified": by_status.get("verified", 0),
+            "precision": round(by_status.get("verified", 0) / judged, 3) if judged else None,
+            "false_positives": len(fps), "false_positive_ids": sorted(fps),
+            "compound": sum(1 for it in items.values() if it.get("compound"))}
+
+
+_FP_NOTE = re.compile(r"false[ -]positive|was wrong|misread|not a (?:bug|defect)", re.I)
+
+
+def _is_false_positive(it: dict) -> bool:
+    """Closed as false-positive, or (before that status existed, 11/26) closed
+    with a note that says so (R-261124-01)."""
+    if it.get("status") == "false-positive":
+        return True
+    note = str((it.get("closed") or {}).get("note") or "")
+    return it.get("status") in TERMINAL and bool(_FP_NOTE.search(note))
 
 
 def sec_ledger(day: date, commits: List[dict]) -> dict:
@@ -2313,53 +2525,9 @@ def cycle_share(day: date) -> Dict[str, dict]:
     """{family: {"share", "pool_cov"}} for an ET day from the cycle log: our
     pool-weighted fraction of the reward pool (sum est_frac x pool / sum pool over
     every managed market-cycle) and the average pool $/day under management. A
-    share falling at a steady size is other makers crowding in."""
-    s, e = et_bounds(day)
-    num: Dict[str, float] = defaultdict(float)
-    den: Dict[str, float] = defaultdict(float)
-    cycles: Dict[str, set] = defaultdict(set)
-    for u in utc_dates(day):
-        try:
-            fh = imm_logfiles.open_text(imm_logfiles.resolve(os.path.join(STATUS_DIR, f"cycle_log_{u}.csv")),
-                                        encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        idx = None
-        last_s, last_ts = None, None
-        with fh:
-            for line in fh:
-                if line.startswith("ts,"):
-                    cols = line.rstrip("\r\n").split(",")
-                    try:
-                        idx = (cols.index("ts"), cols.index("ticker"), cols.index("est_frac"),
-                               cols.index("pool_per_day"))
-                    except ValueError:
-                        idx = None
-                    continue
-                if idx is None:
-                    continue
-                parts = line.split(",")
-                if len(parts) <= max(idx):
-                    continue
-                ts_s = parts[idx[0]]
-                if ts_s != last_s:
-                    last_s = ts_s
-                    try:
-                        last_ts = datetime.strptime(ts_s, "%Y-%m-%dT%H:%M:%SZ") \
-                            .replace(tzinfo=timezone.utc).timestamp()
-                    except ValueError:
-                        last_ts = None
-                if last_ts is None or not (s <= last_ts < e):
-                    continue
-                pool = _f(parts[idx[3]])
-                if pool <= 0:
-                    continue
-                fam = _fam_key(parts[idx[1]])
-                num[fam] += _f(parts[idx[2]]) * pool
-                den[fam] += pool
-                cycles[fam].add(ts_s)
-    return {f: {"share": round(num[f] / den[f], 5), "pool_cov": round(den[f] / max(1, len(cycles[f])), 2)}
-            for f in den if den[f] > 0}
+    share falling at a steady size is other makers crowding in. The scan is
+    shared with the coverage section (_cycle_pass)."""
+    return {f: dict(v) for f, v in _cycle_pass(day)["share"].items()}
 
 
 def _read_rows(path: str) -> List[dict]:
@@ -2541,6 +2709,670 @@ def sec_moat(day: date) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 11. The review itself: how it compounds. Jack 2026-11-26: "what else should
+# this skill be doing daily to compound and improve itself? everyday it should
+# ask itself this question and come with opportunities".
+#
+# The skill answers that question on every run (SKILL.md step 8, findings.json
+# "compound"). This section hands it facts instead of a blank page:
+#   record    its own score: precision, false positives, Jack's decisions,
+#             approved but never applied, verified $/day
+#   outside   what landed on the review day that the review did not raise:
+#             commits naming no ledger id, memory notes other sessions wrote
+#   overlaps  open items someone else acted on (a shared series, file or id)
+#   runs      the last runs' cost and friction, from their own tool traces
+#   repeated  analysis done by hand in two or more runs: belongs in collect
+#   budget    this collect's section times against the launcher's limits
+#   backlog   the open compound items, so a run never proposes one twice
+#   watches   the read-only checks the review added itself, evaluated now
+# ---------------------------------------------------------------------------
+
+SELF_QUESTION = "What else should this review be doing, daily, to compound and improve itself?"
+SELF_RUNS = 3                # tool traces read for repeated manual work
+WATCH_TYPES = ("log", "sink", "file_age", "json", "family")
+WATCH_MAX_NEW = 5            # per run
+WATCH_MAX_ACTIVE = 60
+WATCH_SINK_MAX_BYTES = 250 * 1024 * 1024
+WATCH_STALE_DAYS = 30        # never fired in this long: the weekly pass proposes retiring it
+FAMILY_METRICS = ("net", "rew", "pnl", "fills", "cts", "rest", "markets", "tax", "share")
+_GENERIC_FILES = {"incentive_mm.py", "test_incentive_mm.py", "imm_review.py", "send_imm_review.py",
+                  "test_imm_review.py", "run_incentive_mm.ps1"}
+_TOKEN_RX = re.compile(r"\bKX[A-Z0-9]{2,}\b|\b[A-Za-z][A-Za-z0-9_]*\.(?:py|ps1)\b")
+_SRC_NAMES = tuple(sorted(set(SINKS) | {"gap_scans", "day_archive", "family_daily", "priors", "program_history",
+                                        "evidence", "ledger", "markets_meta", "imm_dashboard_summary",
+                                        "status_incentive_mm", "claude_stream", "watch_results"},
+                          key=len, reverse=True))
+_SRC_RX = re.compile(r"(?<![A-Za-z0-9])(" + "|".join(re.escape(n) for n in _SRC_NAMES)
+                     + r")(?=[_.\-/\\$*{\s'\"]|$)|(incentive-mm-(?:\d|\*|\$))")
+# the runbook's own tools, repeated by design
+_INTENDED = ("imm_review ledger", "imm_review measure", "imm_review collect", "imm_review put",
+             "git log", "git show", "git diff", "ls", "wc", "head", "tail", "cat", "echo")
+
+
+def launcher_limits() -> dict:
+    """The launcher's time limits, read from the script beside this file."""
+    out = {"collect_min": 25.0, "claude_min": 100.0}
+    try:
+        with open(os.path.join(HERE, "run_imm_daily_review.ps1"), encoding="utf-8", errors="replace") as fh:
+            txt = fh.read()
+    except OSError:
+        return out
+    for k, var in (("collect_min", "CollectTimeoutMin"), ("claude_min", "ClaudeTimeoutMin")):
+        m = re.search(r"\$" + var + r"\s*=\s*(\d+(?:\.\d+)?)", txt)
+        if m:
+            out[k] = float(m.group(1))
+    return out
+
+
+def _one_line(s, n: int) -> str:
+    s = re.sub(r"\s+", " ", str(s or "")).strip()
+    return s if len(s) <= n else s[:n - 3] + "..."
+
+
+def _sources(cmd: str) -> List[str]:
+    out = set()
+    for a, b in _SRC_RX.findall(cmd or ""):
+        out.add("bot log" if b else a)
+    return sorted(out)
+
+
+def cmd_kind(cmd: str) -> str:
+    """A Bash command reduced to what it was for: 'python snippet on fills+marks',
+    'grep on orders', 'imm_review measure', 'assembling an output file'."""
+    c = re.sub(r"^(?:\s*cd\s+\S+\s*(?:&&|;)\s*)+", "", (cmd or "").strip())
+    words = c.split("\n", 1)[0].split()
+    if not words:
+        return "?"
+    src = "+".join(_sources(c)[:4])
+    on = f" on {src}" if src else ""
+    w0 = words[0]
+    if re.match(r"^[A-Za-z_]+=", w0) and re.search(r"cat\s*>>?|:\s*>", c):
+        return "assembling an output file in chunks"
+    if w0 in ("python", "python3", "py", "python.exe"):
+        rest = [w for w in words[1:] if not w.startswith("-I")]
+        if rest and rest[0].endswith(".py"):
+            script = os.path.basename(rest[0])[:-3]
+            sub = rest[1] if len(rest) > 1 and not rest[1].startswith(("-", "<", "|", ">")) else ""
+            return f"{script} {sub}".strip()
+        return "python snippet" + on
+    if w0 == "git":
+        return "git " + (words[1] if len(words) > 1 else "")
+    if w0 in ("for", "while", "if"):
+        return "shell loop" + on
+    return w0 + on
+
+
+def run_trace(day_iso: str) -> Optional[dict]:
+    """What one unattended run did, from its stream-json tool trace and run.log."""
+    d = os.path.join(REVIEW_DIR, day_iso)
+    path = os.path.join(d, "claude_stream.jsonl")
+    if not os.path.exists(path):
+        return None
+    tools: Counter = Counter()
+    kinds: Counter = Counter()
+    errors: List[dict] = []
+    calls: Dict[str, str] = {}
+    denials = 0
+    result: dict = {}
+    for r in _iter_jsonl(path):
+        t = r.get("type")
+        if t == "assistant":
+            for b in (r.get("message") or {}).get("content") or []:
+                if not isinstance(b, dict) or b.get("type") != "tool_use":
+                    continue
+                name = b.get("name") or "?"
+                tools[name] += 1
+                inp = b.get("input") or {}
+                if name == "Bash":
+                    cmd = str(inp.get("command") or "")
+                    kinds[cmd_kind(cmd)] += 1
+                    calls[b.get("id") or ""] = cmd
+                else:
+                    calls[b.get("id") or ""] = f"{name} {inp.get('file_path') or inp.get('pattern') or ''}"
+        elif t == "user":
+            for b in (r.get("message") or {}).get("content") or []:
+                if not (isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error")):
+                    continue
+                txt = b.get("content")
+                if isinstance(txt, list):
+                    txt = " ".join(str(x.get("text") or "") for x in txt if isinstance(x, dict))
+                txt = str(txt or "")
+                if "Permission to use" in txt or "has been denied" in txt:
+                    denials += 1
+                errors.append({"cmd": _one_line(calls.get(b.get("tool_use_id") or "", "?"), 140),
+                               "error": _one_line(txt, 200)})
+        elif t == "result":
+            result = r
+    usage = result.get("usage") or {}
+    out = {"day": day_iso, "turns": result.get("num_turns"),
+           "minutes": round(_f(result.get("duration_ms")) / 60000.0, 1) if result.get("duration_ms") else None,
+           "cost_usd": round(_f(result.get("total_cost_usd")), 2) if result.get("total_cost_usd") is not None else None,
+           "output_tokens": usage.get("output_tokens"), "is_error": result.get("is_error"),
+           "tools": dict(tools.most_common()), "bash": sum(kinds.values()),
+           "kinds": dict(kinds.most_common()), "errors": errors[:8], "n_errors": len(errors),
+           "denials": denials,
+           "output_calls": kinds.get("assembling an output file in chunks", 0) + kinds.get("imm_review put", 0)}
+    try:
+        with open(os.path.join(d, "run.log"), encoding="utf-8-sig", errors="replace") as fh:
+            log = fh.read()
+        m = re.search(r"collect exit=(\S+) timedout=(\S+): evidence for \S+ in ([\d.]+)s", log)
+        if m:
+            out["collect_secs"] = _f(m.group(3))
+            out["collect_timedout"] = m.group(2) == "True"
+        m = re.search(r"=== done in (\d+) min, exit=(\d+)", log)
+        if m:
+            out["total_min"], out["exit"] = int(m.group(1)), int(m.group(2))
+        out["fallback"] = "analysis did not run" in log      # the fallback email's subject
+        out["tripwire"] = "TRIPWIRE" in log
+    except OSError:
+        pass
+    return out
+
+
+def repeated_manual(traces: List[dict]) -> List[dict]:
+    """Command kinds done by hand in 2+ of the traced runs (3+ calls in all),
+    the runbook's own tools aside: analysis the collector should do instead."""
+    per: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
+    for tr in traces:
+        for k, n in (tr.get("kinds") or {}).items():
+            per[k].append((tr["day"], int(n)))
+    out = []
+    for k, lst in per.items():
+        if k.startswith(_INTENDED) or k == "?":
+            continue
+        tot = sum(n for _, n in lst)
+        if len(lst) >= 2 and tot >= 3:
+            out.append({"kind": k, "runs": len(lst), "calls": tot, "days": [d for d, _ in lst]})
+    out.sort(key=lambda x: (-x["calls"], x["kind"]))
+    return out[:12]
+
+
+def _frontmatter(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4000)
+    except OSError:
+        return {}
+    out = {}
+    if head.startswith("---"):
+        for line in head.split("\n")[1:40]:
+            if line.strip() == "---":
+                break
+            m = re.match(r"^(name|description):\s*(.*)$", line)
+            if m:
+                out[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return out
+
+
+def memory_notes(day: date) -> List[dict]:
+    """Project memory notes written or updated from the start of the ET day to
+    this run (at most 6 h past the day): what other sessions found, fixed or
+    decided with Jack. A note touched again after that drops out of the list."""
+    s, e = et_bounds(day)
+    e = min(time.time(), e + 6 * 3600)
+    out = []
+    try:
+        names = os.listdir(MEMORY_DIR)
+    except OSError:
+        return out
+    for n in names:
+        if not n.endswith(".md") or n == "MEMORY.md":
+            continue
+        p = os.path.join(MEMORY_DIR, n)
+        try:
+            m = os.path.getmtime(p)
+        except OSError:
+            continue
+        if s <= m < e:
+            fm = _frontmatter(p)
+            out.append({"file": n, "name": fm.get("name") or n[:-3], "at": et_str(m),
+                        "description": _one_line(fm.get("description"), 240)})
+    out.sort(key=lambda x: x["at"])
+    return out[:25]
+
+
+# merges and the nightly high-temp digest are bookkeeping, never a miss
+_NOT_A_CHANGE = re.compile(r"^(?:Merge |High-temp digest for )")
+
+
+def _item_tokens(it: dict) -> set:
+    text = " ".join(str(it.get(k) or "") for k in ("title", "summary", "fingerprint")) + " " + \
+        json.dumps(it.get("plan") or {}) + " " + " ".join(str(x) for x in it.get("evidence") or [])
+    return {t for t in _TOKEN_RX.findall(text) if t not in _GENERIC_FILES}
+
+
+def overlaps(items: Dict[str, dict], commits: List[dict], notes: List[dict]) -> List[dict]:
+    """Open items that a commit or a memory note of the day touched: the same
+    series or file, or the note names the id. Someone else acting on a finding
+    either confirms it, supersedes it or diagnoses it differently."""
+    out = []
+    srcs = []
+    for c in commits:
+        if _NOT_A_CHANGE.match(c.get("subject") or ""):
+            continue
+        toks = set(_TOKEN_RX.findall(c.get("subject", "") + " " + c.get("body", ""))) | \
+            {os.path.basename(n) for n in c.get("names") or []}
+        srcs.append((f"commit {c['sha']}", c.get("subject", ""), toks - _GENERIC_FILES,
+                     set(c.get("mentions") or []), set(c.get("ids") or [])))
+    for n in notes:
+        text = f"{n.get('name')} {n.get('description')}"
+        srcs.append((f"memory {n['file']}", n.get("description", ""), set(_TOKEN_RX.findall(text)) - _GENERIC_FILES,
+                     set(LEDGER_ID.findall(text)), set()))
+    for iid, it in sorted(items.items()):
+        if it.get("status") in TERMINAL:
+            continue
+        mine = _item_tokens(it)
+        hits = []
+        for label, text, toks, ids, shipped_by in srcs:
+            if iid in shipped_by:
+                continue        # the commit that shipped it: the ledger already knows
+            if iid in ids and it.get("status") == "shipped" and label.startswith("memory"):
+                continue        # a note recording its own ship
+            hit = sorted(mine & toks)
+            if iid in ids or hit:
+                hits.append({"id": iid, "title": _one_line(it.get("title"), 100), "by": label,
+                             "what": _one_line(text, 160),
+                             "match": "names the id" if iid in ids else ", ".join(hit[:4])})
+        # an item that names the id outranks a shared series; 3 leads an item at most
+        hits.sort(key=lambda h: h["match"] != "names the id")
+        out += hits[:3]
+    out.sort(key=lambda h: h["match"] != "names the id")
+    return out[:20]
+
+
+def self_record(day: date) -> dict:
+    items = ledger_state()
+    st = ledger_stats()
+    approved = []
+    lags = []
+    for iid, it in items.items():
+        decs = it.get("decisions") or []
+        if decs and it.get("first_seen"):
+            t0 = _ts_of(decs[0].get("ts"))
+            if t0:
+                lags.append((datetime.fromtimestamp(t0, ET).date() - date.fromisoformat(it["first_seen"])).days)
+        if it.get("status") == "approved":
+            at = _ts_of(decs[-1].get("ts")) if decs else None
+            approved.append({"id": iid, "title": _one_line(it.get("title"), 100),
+                             "days": (day - datetime.fromtimestamp(at, ET).date()).days if at else None})
+    proposed = [(day - date.fromisoformat(it["first_seen"])).days for it in items.values()
+                if it.get("status") == "proposed" and it.get("first_seen")]
+    by_kind: Dict[str, Counter] = defaultdict(Counter)
+    for it in items.values():
+        k = it.get("kind") or "?"
+        by_kind[k]["raised"] += 1
+        if any(d.get("status") == "approved" for d in it.get("decisions") or []):
+            by_kind[k]["approved"] += 1
+        if any(d.get("status") == "rejected" for d in it.get("decisions") or []):
+            by_kind[k]["rejected"] += 1
+        if it.get("status") in ("verified", "failed"):
+            by_kind[k][it["status"]] += 1
+        if _is_false_positive(it):
+            by_kind[k]["false_positive"] += 1
+    return {"stats": st, "approved_unapplied": approved,
+            "proposed": len(proposed), "oldest_proposed_days": max(proposed) if proposed else None,
+            "decision_lag_days": sorted(lags)[len(lags) // 2] if lags else None,
+            "by_kind": {k: dict(v) for k, v in sorted(by_kind.items())}}
+
+
+def self_budget(ev: dict, traces: List[dict]) -> dict:
+    lim = launcher_limits()
+    secs = {k: v.get("_secs") for k, v in ev.items() if isinstance(v, dict) and v.get("_secs") is not None}
+    elapsed = time.time() - _f(ev.get("generated"), time.time())
+    prev = [{"day": t["day"], "collect_secs": t.get("collect_secs"), "claude_min": t.get("minutes"),
+             "total_min": t.get("total_min")} for t in traces]
+    return {"collect_limit_s": lim["collect_min"] * 60, "claude_limit_min": lim["claude_min"],
+            "collect_so_far_s": round(elapsed, 1),
+            "collect_pct": round(elapsed / (lim["collect_min"] * 60), 3) if lim["collect_min"] else None,
+            "slowest": sorted(secs.items(), key=lambda kv: -_f(kv[1]))[:5], "previous": prev}
+
+
+# --- watches: the review's own read-only checks (findings.json "watches") ---
+
+def watches_path() -> str:
+    return os.path.join(REVIEW_DIR, "watches.json")
+
+
+def load_watches() -> List[dict]:
+    d = _load_json(watches_path(), {}) or {}
+    return [w for w in (d.get("watches") or []) if isinstance(w, dict) and w.get("id")]
+
+
+def _save_watches(ws: List[dict]) -> None:
+    _write_json(watches_path(), {"updated": _now_iso(), "watches": ws})
+
+
+def _safe_path(rel) -> Optional[str]:
+    """A watch reads only under run-logs: a relative path that stays inside."""
+    rel = str(rel or "").strip().replace("\\", "/")
+    if not rel or rel.startswith("/") or re.match(r"^[A-Za-z]:", rel) or ".." in rel.split("/"):
+        return None
+    root = os.path.normpath(RUN_LOGS)
+    full = os.path.normpath(os.path.join(root, rel))
+    return full if full.startswith(root + os.sep) else None
+
+
+def _num_or_none(v) -> Optional[float]:
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def clean_watch(w: dict) -> Tuple[Optional[dict], str]:
+    t = w.get("type")
+    if t not in WATCH_TYPES:
+        return None, f"type must be one of {', '.join(WATCH_TYPES)}"
+    title = _one_line(w.get("title"), 160)
+    if not title:
+        return None, "needs a title: what it guards against"
+    lo, hi = _num_or_none(w.get("min")), _num_or_none(w.get("max"))
+    if t == "file_age":
+        hi = _num_or_none(w.get("max_hours", w.get("max")))
+    if lo is None and hi is None:
+        return None, "needs min and/or max (file_age: max_hours)"
+    sev = str(w.get("severity") or "P2").upper()
+    out = {"type": t, "title": title, "why": _one_line(w.get("why"), 200),
+           "severity": sev if sev in ("P0", "P1", "P2", "P3") else "P2",
+           "min": lo, "max": hi, "expires": _iso_day(w.get("expires"))}
+    if t == "log":
+        c = str(w.get("contains") or "")
+        if not 3 <= len(c) <= 200:
+            return None, "log: 'contains' must be a literal of 3-200 characters (it prefilters every line)"
+        out["contains"] = c
+        if w.get("regex"):
+            rx = str(w["regex"])[:200]
+            try:
+                re.compile(rx)
+            except re.error as e:
+                return None, f"log: bad regex: {e}"
+            out["regex"] = rx
+    elif t == "sink":
+        name = str(w.get("sink") or "")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{1,40}", name):
+            return None, "sink: a sink name like fills, toxic_halts (files <sink>_<UTC date>.jsonl)"
+        out["sink"] = name
+        if w.get("contains"):
+            out["contains"] = str(w["contains"])[:200]
+        if w.get("field"):
+            out["field"] = str(w["field"])[:60]
+            out["equals"] = None if w.get("equals") is None else str(w.get("equals"))[:120]
+    elif t in ("file_age", "json"):
+        if not _safe_path(w.get("path")):
+            return None, f"{t}: 'path' must be relative to run-logs, e.g. incentive-mm/status_incentive_mm.json"
+        out["path"] = str(w["path"]).replace("\\", "/")
+        if t == "json":
+            key = str(w.get("key") or "")
+            if not re.fullmatch(r"[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+){0,6}", key):
+                return None, "json: 'key' is a dotted path, e.g. reward.paid_today"
+            out["key"] = key
+    elif t == "family":
+        fam, metric = str(w.get("family") or "").strip(), str(w.get("metric") or "")
+        if not fam or metric not in FAMILY_METRICS:
+            return None, f"family: needs 'family' and a metric in {', '.join(FAMILY_METRICS)}"
+        out.update({"family": fam[:80], "metric": metric,
+                    "days": int(min(30, max(1, _f(w.get("days"), 1))))})
+    return out, ""
+
+
+def _watch_spec(w: dict) -> str:
+    return json.dumps({k: w.get(k) for k in sorted(w) if k in (
+        "type", "contains", "regex", "sink", "field", "equals", "path", "key", "family", "metric", "days",
+        "min", "max")}, sort_keys=True)
+
+
+def watches_ingest(day: date, adds: list, retires: list) -> dict:
+    """Add, update or retire the review's own watches. They only read run-logs,
+    so the review may add them unattended; they never touch the bot."""
+    ws = load_watches()
+    by_id = {w["id"]: w for w in ws}
+    active = [w for w in ws if not w.get("retired")]
+    pre = "W-" + day.strftime("%y%m%d") + "-"
+    added, updated, retired, rejected = [], [], [], []
+    for raw in (adds or [])[:20]:
+        if not isinstance(raw, dict):
+            continue
+        cw, err = clean_watch(raw)
+        if cw is None:
+            rejected.append({"title": _one_line(raw.get("title"), 80), "why": err})
+            continue
+        spec = _watch_spec(cw)
+        if raw.get("id") in by_id:
+            by_id[raw["id"]].update(cw, spec=spec, updated=day.isoformat())
+            by_id[raw["id"]].pop("retired", None)
+            updated.append(raw["id"])
+            continue
+        dup = next((w for w in active if w.get("spec") == spec), None)
+        if dup:
+            dup.update({"title": cw["title"], "why": cw["why"] or dup.get("why"), "updated": day.isoformat()})
+            updated.append(dup["id"])
+            continue
+        if len(added) >= WATCH_MAX_NEW or len(active) >= WATCH_MAX_ACTIVE:
+            rejected.append({"title": cw["title"][:80], "why": f"limit: {WATCH_MAX_NEW} new a run, "
+                                                             f"{WATCH_MAX_ACTIVE} active"})
+            continue
+        n = sum(1 for k in by_id if k.startswith(pre)) + 1
+        w = dict(cw, id=f"{pre}{n:02d}", added=day.isoformat(), spec=spec)
+        ws.append(w)
+        active.append(w)
+        by_id[w["id"]] = w
+        added.append(w["id"])
+    for r in retires or []:
+        rid = r.get("id") if isinstance(r, dict) else r
+        if rid in by_id and not by_id[rid].get("retired"):
+            by_id[rid]["retired"] = day.isoformat()
+            by_id[rid]["retire_note"] = _one_line(r.get("note") if isinstance(r, dict) else "", 200)
+            retired.append(rid)
+    if added or updated or retired:
+        _save_watches(ws)
+    return {"added": added, "updated": updated, "retired": retired, "rejected": rejected}
+
+
+def _log_watch_counts(day: date, ws: List[dict]) -> Dict[str, int]:
+    s, e = et_bounds(day)
+    needles = [(w["id"], w["contains"].encode("utf-8"), re.compile(w["regex"].encode("utf-8")) if w.get("regex") else None)
+               for w in ws]
+    counts = {w["id"]: 0 for w in ws}
+    for p in _bot_log_files(day):
+        try:
+            fh = open(p, "rb")
+        except OSError:
+            continue
+        with fh:
+            for raw in fh:
+                hits = [(wid, rx) for wid, nd, rx in needles if nd in raw]
+                if not hits:
+                    continue
+                m = LOG_TS.match(raw)
+                if not m:
+                    continue
+                try:
+                    ts = datetime.strptime(m.group(1).decode() + " " + ":".join(g.decode() for g in m.groups()[1:]),
+                                           "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    continue
+                if not (s <= ts < e):
+                    continue
+                for wid, rx in hits:
+                    if rx is None or rx.search(raw):
+                        counts[wid] += 1
+    return counts
+
+
+def _sink_watch_count(day: date, w: dict) -> float:
+    s, e = et_bounds(day)
+    nd = (w.get("contains") or "").encode("utf-8")
+    n = 0
+    found = False
+    for u in utc_dates(day):
+        p = imm_logfiles.resolve(os.path.join(STATUS_DIR, f"{w['sink']}_{u}.jsonl"))
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            continue
+        found = True
+        if size > WATCH_SINK_MAX_BYTES:
+            raise ValueError(f"{os.path.basename(p)} is {size / 1e6:.0f} MB: too big for a watch "
+                             "(propose a collector check instead)")
+        with imm_logfiles.open_bin(p) as fh:
+            for raw in fh:
+                if nd and nd not in raw:
+                    continue
+                try:
+                    r = json.loads(raw)
+                except ValueError:
+                    continue
+                ts = _ts_of(r.get("ts") if isinstance(r, dict) else None)
+                if ts is None or not (s <= ts < e):
+                    continue
+                if w.get("field") and str(r.get(w["field"])) != str(w.get("equals")):
+                    continue
+                n += 1
+    if not found:
+        raise ValueError(f"no {w['sink']}_<UTC date>.jsonl file for the day")
+    return float(n)
+
+
+def _family_value(day: date, w: dict) -> Optional[float]:
+    lo = (day - timedelta(days=w.get("days", 1) - 1)).isoformat()
+    rows = [r for r in _read_rows(os.path.join(MOAT_DIR, "family_daily.csv"))
+            if lo <= r.get("day", "") <= day.isoformat() and r.get("family") == w["family"]]
+    if not rows:
+        return None
+    m = w["metric"]
+    if m == "tax":
+        rew = sum(_f(r.get("rew")) for r in rows)
+        return -sum(_f(r.get("pnl")) for r in rows) / rew if rew > 0 else None
+    if m == "share":
+        xs = [_f(r["share"]) for r in rows if r.get("share") not in (None, "")]
+        return sum(xs) / len(xs) if xs else None
+    return sum(_f(r.get(m)) for r in rows)
+
+
+def _json_value(w: dict) -> Optional[float]:
+    obj = _load_json(_safe_path(w["path"]))
+    for k in w["key"].split("."):
+        if isinstance(obj, dict):
+            obj = obj.get(k)
+        elif isinstance(obj, list) and k.isdigit() and int(k) < len(obj):
+            obj = obj[int(k)]
+        else:
+            return None
+    if isinstance(obj, bool):
+        return float(obj)
+    return _num_or_none(obj)
+
+
+def eval_watches(day: date, record: bool = True) -> dict:
+    """Evaluate every active watch for the ET day. FIRING = outside its bounds
+    (or its input is missing). Results append to watch_results.jsonl, the
+    history the weekly pass reads (never fired in 30 days -> retire)."""
+    if os.environ.get("IMM_REVIEW_WATCHES", "1") == "0":
+        return {"off": True, "results": [], "firing": [], "errors": []}
+    iso = day.isoformat()
+    all_ws = load_watches()
+    ws = [w for w in all_ws if not w.get("retired") and not (w.get("expires") and w["expires"] < iso)]
+    results = []
+    logw = [w for w in ws if w.get("type") == "log"]
+    counts: Dict[str, int] = {}
+    log_err = None
+    if logw:
+        try:
+            counts = _log_watch_counts(day, logw)
+        except Exception as e:   # pragma: no cover - a log read failure is reported, never fatal
+            log_err = f"{type(e).__name__}: {e}"
+    for w in ws:
+        res = {"id": w["id"], "title": w.get("title"), "type": w.get("type"), "min": w.get("min"),
+               "max": w.get("max"), "severity": w.get("severity"), "why": w.get("why"), "added": w.get("added")}
+        try:
+            t = w.get("type")
+            if t == "log":
+                if log_err:
+                    raise ValueError(log_err)
+                val = float(counts.get(w["id"], 0))
+            elif t == "sink":
+                val = _sink_watch_count(day, w)
+            elif t == "file_age":
+                p = _safe_path(w.get("path"))
+                val = (time.time() - os.path.getmtime(p)) / 3600.0 if p and os.path.exists(p) else None
+            elif t == "json":
+                val = _json_value(w)
+            elif t == "family":
+                val = _family_value(day, w)
+            else:
+                raise ValueError(f"unknown type {t}")
+            ok = val is not None and (w.get("min") is None or val >= w["min"]) and \
+                (w.get("max") is None or val <= w["max"])
+            res.update({"value": None if val is None else round(val, 4), "state": "ok" if ok else "FIRING"})
+            if val is None:
+                res["note"] = "input missing"
+        except Exception as e:
+            res.update({"value": None, "state": "error", "error": _one_line(f"{type(e).__name__}: {e}", 200)})
+        results.append(res)
+    hist_path = os.path.join(REVIEW_DIR, "watch_results.jsonl")
+    if record and results:
+        os.makedirs(REVIEW_DIR, exist_ok=True)
+        with open(hist_path, "a", encoding="utf-8") as fh:
+            for r in results:
+                fh.write(json.dumps({"day": iso, "id": r["id"], "state": r["state"], "value": r.get("value")}) + "\n")
+    last: Dict[Tuple[str, str], str] = {}
+    for r in _iter_jsonl(hist_path):
+        if r.get("day") and r.get("id"):
+            last[(r["day"], r["id"])] = r.get("state") or ""
+    fires: Counter = Counter()
+    evals: Counter = Counter()
+    for (d, wid), stt in last.items():
+        evals[wid] += 1
+        if stt == "FIRING":
+            fires[wid] += 1
+    stale = [w["id"] for w in ws if fires[w["id"]] == 0 and w.get("added")
+             and (day - date.fromisoformat(w["added"])).days >= WATCH_STALE_DAYS]
+    return {"active": len(ws), "retired": sum(1 for w in all_ws if w.get("retired")),
+            "results": results, "firing": [r for r in results if r["state"] == "FIRING"],
+            "errors": [r for r in results if r["state"] == "error"],
+            "fires": {k: fires[k] for k in sorted(fires)}, "evals": {k: evals[k] for k in sorted(evals)},
+            "stale": stale}
+
+
+def sec_self(day: date, ev: dict) -> dict:
+    iso = day.isoformat()
+    items = ledger_state()
+    commits = ((ev.get("changes") or {}).get("commits")) or []
+    if not commits and "changes" not in ev:
+        commits = sec_changes(day).get("commits") or []
+    notes = memory_notes(day)
+    # the runs before this one: D's own run has not happened yet when collect runs
+    traces = []
+    for back in range(0, SELF_RUNS + 4):
+        tr = run_trace((day - timedelta(days=back)).isoformat())
+        if tr:
+            traces.append(tr)
+        if len(traces) >= SELF_RUNS:
+            break
+    backlog = []
+    for iid, it in sorted(items.items()):
+        if it.get("status") in TERMINAL or not (it.get("compound") or it.get("kind") == "review"):
+            continue
+        backlog.append({"id": iid, "status": it.get("status"), "title": _one_line(it.get("title"), 110),
+                        "compound": bool(it.get("compound")), "self_apply": it.get("self_apply"),
+                        "age": (day - date.fromisoformat(it["first_seen"])).days if it.get("first_seen") else None,
+                        "seen": len(it.get("seen_days") or [])})
+    return {"question": SELF_QUESTION, "record": self_record(day),
+            "outside": {"commits": [{k: c.get(k) for k in ("sha", "at", "subject", "bot", "mentions")}
+                                    for c in commits if not c.get("ids")
+                                    and not _NOT_A_CHANGE.match(c.get("subject") or "")][:20],
+                        "memory": notes},
+            "overlaps": overlaps(items, commits, notes),
+            "rechecks": [d for d in ledger_due(day) if d.get("why") == "recheck"],
+            "runs": [{k: v for k, v in t.items() if k != "kinds"} for t in traces],
+            "repeated": repeated_manual(traces),
+            "budget": self_budget(ev, traces),
+            "backlog": backlog[:30],
+            "watches": eval_watches(day)}
+
+
+# ---------------------------------------------------------------------------
 # Before/after measurement for loop closure
 # ---------------------------------------------------------------------------
 
@@ -2659,6 +3491,8 @@ def collect(day: date, bootstrap_days: int = 14, only: Optional[List[str]] = Non
         ev["changes"] = _section("changes", sec_changes, day)
     commits = (ev.get("changes") or {}).get("commits") or []
     ev["ledger"] = _section("ledger", sec_ledger, day, commits)
+    if want("self"):          # last: it reads the other sections' times and the ledger
+        ev["self"] = _section("self", sec_self, day, ev)
     ev["secs"] = round(time.time() - t0, 1)
     ev["errors"] = {k: v.get("error") for k, v in ev.items() if isinstance(v, dict) and v.get("error")}
     if want("scorecard"):
@@ -3090,8 +3924,97 @@ def render_evidence(ev: dict) -> str:
                         f"tax {_fmt(p.get('tax'), 2)}, {p['days']}d" for p in mo["priors_top"][:12]))
         if mo.get("review_calibration"):
             a(f"The review's own calibration (realised / predicted $/day, by kind): {mo['review_calibration']}")
+    render_self(ev.get("self") or {}, a)
     a("")
     return "\n".join(L)
+
+
+def render_self(se: dict, a) -> None:
+    a("\n## 11. The review itself (how it compounds)")
+    if not se:
+        a("- not collected")
+        return
+    if se.get("error"):
+        a(f"- ERROR: {se['error']}")
+        return
+    a(f'The question every run answers (Jack 11/26), in findings.json "compound": "{se.get("question")}"')
+    rec = se.get("record") or {}
+    st = rec.get("stats") or {}
+    prec = st.get("precision")
+    a(f"**Record:** {st.get('items')} findings; {st.get('approved')} approved, {st.get('rejected')} rejected; "
+      f"{st.get('verified')} verified ({usd(st.get('verified_delta_usd_day'))}/day measured), {st.get('failed')} failed"
+      f"{'' if prec is None else f', precision {prec:.0%}'}; {st.get('false_positives')} false positive(s) "
+      f"{st.get('false_positive_ids') or ''}; {rec.get('proposed')} waiting on Jack"
+      f"{'' if rec.get('oldest_proposed_days') is None else ', oldest ' + str(rec['oldest_proposed_days']) + 'd'}"
+      f"{'' if rec.get('decision_lag_days') is None else '; median ' + str(rec['decision_lag_days']) + 'd to a decision'}.")
+    if rec.get("approved_unapplied"):
+        a("Approved but not applied: " + "; ".join(f"{x['id']} {x['title']} ({x['days']}d)" for x in rec["approved_unapplied"]))
+    if rec.get("by_kind"):
+        a("By kind: " + "; ".join(f"{k} " + ", ".join(f"{n} {s}" for s, n in v.items()) for k, v in rec["by_kind"].items()))
+    b = se.get("budget") or {}
+    if b:
+        pct = b.get("collect_pct")
+        a(f"**Budget:** this collect {b.get('collect_so_far_s')} s of the launcher's {b.get('collect_limit_s'):.0f} s"
+          f"{'' if pct is None else f' ({pct:.0%})'}; slowest sections: "
+          + ", ".join(f"{k} {v} s" for k, v in b.get("slowest") or []) + ".")
+        for p in b.get("previous") or []:
+            a(f"- run for {p['day']}: collect {p.get('collect_secs')} s, analysis {p.get('claude_min')} min "
+              f"of {b.get('claude_limit_min'):.0f}, whole run {p.get('total_min')} min")
+    runs = se.get("runs") or []
+    if runs:
+        a("**The last runs** (from their own tool traces):")
+        a("| Day | Minutes | Turns | Reported cost | Bash | Errors | Denied | Writing outputs | Exit |")
+        a("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for r in runs:
+            cost = "n/a" if r.get("cost_usd") is None else f"${r['cost_usd']:.2f}"
+            a(f"| {r['day']} | {_fmt(r.get('minutes'))} | {_fmt(r.get('turns'))} | {cost} | {r.get('bash')} | "
+              f"{r.get('n_errors')} | {r.get('denials')} | {r.get('output_calls')} | {_fmt(r.get('exit'))} |")
+        errs = runs[0].get("errors") or []
+        if errs:
+            a(f"Errors in the {runs[0]['day']} run:")
+            for x in errs[:6]:
+                a(f"- `{x['cmd']}` -> {x['error']}")
+    rep = se.get("repeated") or []
+    if rep:
+        a("**Done by hand in 2+ runs** (each one is work the collector could do):")
+        for x in rep:
+            a(f"- {x['kind']}: {x['calls']} calls in {x['runs']} runs ({', '.join(x['days'])})")
+    out = se.get("outside") or {}
+    if out.get("commits"):
+        a(f"**Landed on the day without a ledger id** ({len(out['commits'])}; did the review see any of it first?):")
+        for c in out["commits"]:
+            men = f" (mentions {', '.join(c['mentions'])})" if c.get("mentions") else ""
+            a(f"- {c['at']} {c['sha']}{' [bot]' if c.get('bot') else ''}: {c['subject']}{men}")
+    if out.get("memory"):
+        a(f"**Memory notes other sessions wrote** ({len(out['memory'])}):")
+        for n in out["memory"]:
+            a(f"- {n['at']} {n['name']}: {n['description']}")
+    if se.get("overlaps"):
+        a("**Open items someone else acted on:**")
+        for o in se["overlaps"]:
+            a(f"- {o['id']} ({o['title']}) <- {o['by']} [{o['match']}]: {o['what']}")
+    if se.get("rechecks"):
+        a("**Promised rechecks due:** " + "; ".join(f"{r['id']} {r['title']} (due {r['due']})" for r in se["rechecks"]))
+    bl = se.get("backlog") or []
+    if bl:
+        a(f"**Self-improvement backlog** ({len(bl)} open, kind review):")
+        for x in bl:
+            tag = " [compound]" if x.get("compound") else ""
+            a(f"- {x['id']} [{x['status']}]{tag} {x['title']} ({x.get('age')}d, seen {x.get('seen')}d)")
+    w = se.get("watches") or {}
+    if w.get("off"):
+        a("**Watches:** off (IMM_REVIEW_WATCHES=0).")
+    elif w:
+        a(f"**Watches** (the review's own read-only checks): {w.get('active')} active, {len(w.get('firing') or [])} "
+          f"firing, {len(w.get('errors') or [])} errors, {w.get('retired')} retired.")
+        for r in (w.get("firing") or []) + (w.get("errors") or []):
+            bound = " ".join(x for x in (f"min {r['min']}" if r.get("min") is not None else "",
+                                         f"max {r['max']}" if r.get("max") is not None else "") if x)
+            a(f"- {r['state']} {r['id']} [{r.get('severity')}] {r.get('title')}: value {r.get('value')} ({bound})"
+              f"{' ' + r['error'] if r.get('error') else ''}{' (' + r['note'] + ')' if r.get('note') else ''}"
+              f"{'; why: ' + r['why'] if r.get('why') else ''}")
+        if w.get("stale"):
+            a(f"Never fired in {WATCH_STALE_DAYS}+ days (retire?): {', '.join(w['stale'])}")
 
 
 # ---------------------------------------------------------------------------
@@ -3112,6 +4035,9 @@ def put(day: date, name: str, content: str) -> str:
         raise SystemExit(f"put: only {', '.join(PUT_NAMES)}")
     if not content.strip():
         raise SystemExit("put: empty content")
+    # CRLF in, text-mode write out = CR CR LF on Windows, which reads back as a
+    # blank line after every line and breaks every table (the 11/26 test run)
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
     path = os.path.join(REVIEW_DIR, day.isoformat(), name)
     if name.endswith(".json"):
         try:
@@ -3140,7 +4066,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     c.add_argument("--bootstrap-days", type=int, default=14)
     c.add_argument("--only", help="comma list of sections (debug)")
     l = sub.add_parser("ledger")
-    l.add_argument("action", choices=("list", "show", "due", "stats", "ingest", "decide", "ship", "close"))
+    l.add_argument("action", choices=("list", "show", "due", "stats", "ingest", "decide", "ship", "close",
+                                      "recheck"))
     l.add_argument("id", nargs="?")
     l.add_argument("status", nargs="?")
     l.add_argument("--day")
@@ -3148,8 +4075,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     l.add_argument("--note", default="")
     l.add_argument("--by", default="jack")
     l.add_argument("--ref")
+    l.add_argument("--on", help="recheck: the day to look again (YYYY-MM-DD)")
     l.add_argument("--status", dest="status_opt", help="same as the positional status")
     l.add_argument("--all", action="store_true")
+    w = sub.add_parser("watch", help="the review's own read-only checks (daily_review/watches.json)")
+    w.add_argument("action", choices=("list", "eval", "retire"))
+    w.add_argument("id", nargs="?")
+    w.add_argument("--day")
+    w.add_argument("--note", default="")
+    w.add_argument("--all", action="store_true")
     pp = sub.add_parser("put", help="write findings.json or review.md from stdin into the day's folder")
     pp.add_argument("name", choices=PUT_NAMES)
     pp.add_argument("--day")
@@ -3179,6 +4113,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             ap.error("measure needs --pattern or --family")
         print(json.dumps(measure(a.pattern, a.family, a.split, a.before, a.after), indent=1))
         return 0
+    if a.cmd == "watch":
+        if a.action == "list":
+            for x in load_watches():
+                if x.get("retired") and not a.all:
+                    continue
+                print(f"{x['id']} [{x.get('type')}/{x.get('severity')}{'/retired ' + x['retired'] if x.get('retired') else ''}] "
+                      f"{x.get('title')} (added {x.get('added')}; {_watch_spec(x)})")
+            return 0
+        if a.action == "eval":       # prints only; the daily collect records the history
+            print(json.dumps(eval_watches(_day_arg(a.day), record=False), indent=1, default=str))
+            return 0
+        if not a.id:
+            ap.error("watch retire needs an id")
+        res = watches_ingest(_day_arg(a.day), [], [{"id": a.id, "note": a.note}])
+        print(json.dumps(res))
+        return 0 if res["retired"] else 1
     # ledger
     if a.action == "list":
         for iid, it in sorted(ledger_state().items()):
@@ -3222,6 +4172,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif a.action == "close":
         st = a.status if a.status in TERMINAL else "closed"
         ledger_append({"op": "close", "id": a.id, "status": st, "note": a.note})
+    elif a.action == "recheck":
+        on = _iso_day(a.on)
+        if not on:
+            ap.error("recheck needs --on YYYY-MM-DD")
+        ledger_append({"op": "update", "id": a.id, "fields": {"recheck_on": on}, "note": a.note})
     _print_item(ledger_state()[a.id])
     return 0
 

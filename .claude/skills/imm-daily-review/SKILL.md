@@ -10,7 +10,9 @@ Jack 2026-11-25: "create a skill that on a daily basis goes through IMM bot in i
 
 **The objective** is risk-adjusted net: modelled rewards plus trading marked to market at the last trade, per dollar at risk, with drawdown and tail exposure counted against it (definitions: `reference.md` section 1). Every finding is judged by what it adds to that, net of what it costs, and by how much of Jack's time it needs.
 
-**How it compounds:** every finding goes into the ledger (`run-logs/incentive-mm/daily_review/ledger.jsonl`) with a fingerprint, an impact estimate, an executable plan and a metric. Shipped fixes are re-measured on their due date. Jack's rejections stand. Every bug class found becomes a check the next run makes. The review keeps score of itself.
+**How it compounds:** every finding goes into the ledger (`run-logs/incentive-mm/daily_review/ledger.jsonl`) with a fingerprint, an impact estimate, an executable plan and a metric. Shipped fixes are re-measured on their due date, and every promise to look again has a date the ledger enforces. Jack's rejections stand. Every bug class found becomes a check the next run makes, the same day where a read-only watch can express it. The review keeps score of itself.
+
+**And every run asks itself one question** (Jack 2026-11-26: "what else should this skill be doing daily to compound and improve itself? everyday it should ask itself this question and come with opportunities"): *What else should this review be doing, daily, to compound and improve itself?* Step 8 answers it from evidence section 11 (the review's own record, what landed without it, its run cost and repeated manual work). The answers go in findings.json `compound` and get their own block in the email.
 
 The pieces: `imm_review.py` collects the evidence and holds the ledger (no judgment, no model). This skill judges and writes. `send_imm_review.py` sends. `run_imm_daily_review.ps1` runs the three every morning. Jack's choices on 11/25: fixes go to him as plans that he approves with one text ("Plan + your yes"); the email lands around 06:30 ET beside the existing IMM emails; after two weeks (from 12/09) the review proposes which of those to retire.
 
@@ -57,7 +59,7 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 ## 1. Hard rules (every mode except apply)
 
 1. **Read-only on the bot and the live tree.** Never edit code, config, control files (HALT, UNWIND*), list files, launcher env, schedules or tasks. Never run a git command that changes anything (commit, push, checkout, switch, reset, stash, merge, rebase, pull, fetch, worktree, branch, add). Never restart, halt or unwind the bot, place or cancel orders, or run phone_actions.py, sms_*.py, wave_alert.py, pvd_*.py, imm_rows.py, imm_earnings_overrides.py or any send_*.py. The launcher sends the email.
-2. **Write only in DIR:** findings.json and review.md, and only through `python imm_review.py put <name> --day D` with the content on stdin. The scheduled run has Edit and Write switched off:
+2. **Write only in DIR:** findings.json and review.md, and only through `python imm_review.py put <name> --day D` with the content on stdin. Lessons, playbook rules and watches travel inside findings.json, and ingest files them. The scheduled run has Edit and Write switched off:
    ```
    python imm_review.py put findings.json --day D <<'EOF'
    {...}
@@ -147,8 +149,9 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   - a mirrored block left out of sync (imm_quote_gaps keep-in-sync comments);
   - missing tests.
   15 minutes at most; one finding per real defect, with the line.
+- **(i)** The review's own watches (evidence section 11). Treat each FIRING watch like a NEW signature: read what it guards (`why`), confirm it in the sinks, then raise, re-confirm or close the finding it belongs to. A watch in `error` (missing file, moved key, a sink too big) is a defect in the watch: fix it in `watches` with its id, or retire it.
 
-**Step 7. Did past changes work?** For each item `ledger due` lists:
+**Step 7. Did past changes work?** For each item `ledger due` lists (`why`: `shipped` = past its eval_after_days; `recheck` = a date you promised to look again, shipped or not):
 - Run its metric recipe (usually `python imm_review.py measure ...`).
 - Give a verdict:
   - **verified:** the effect meets the item's success rule, the t-stat is not noise, and supply-normalised it still holds.
@@ -157,16 +160,65 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 - Also close items the evidence shows are resolved: signature gone 3+ days, or a commit fixed it (closure "fixed-elsewhere" with the sha).
 - **A verified item becomes a playbook rule** (findings.json "playbook"): the general lesson, which families it applies to, and the evidence id. Example: "a new event-ladder family starts at x1 with the sweep breaker on; size up only after 7 days with 4h mark-outs above -2c (R-261201-03)". The next runs apply it without re-learning it.
 - **Calibrate yourself:** evidence section 10 shows the review's realised / predicted ratio by kind. Scale today's impact estimates by it, and say so.
+- **Every "I'll look again" gets a date.** A finding that says "re-measure 12/02", "watch for a week" or "comes back as a size cut if ..." carries `recheck_on` (YYYY-MM-DD), so the ledger lists it on that day. A promise without a date is forgotten: the 11/25 rain finding promised 12/02 with nothing to enforce it.
+- **A finding that turned out wrong closes as `false-positive`** (closures), not `closed`, so precision is a number.
 
-**Step 8. Prioritise.**
+**Step 8. Compound: what else should this review be doing?** Ask it in writing every run, and answer it: *What else should this review be doing, daily, to compound and improve itself?* (Jack 2026-11-26). Answer from evidence section 11 and from this run's own experience, never from a generic list: every answer cites a fact. Go through the lenses briefly; most days one or two produce something.
+1. **Misses.** "Landed on the day without a ledger id" and "Memory notes other sessions wrote" are what other sessions and Jack found, fixed or decided. For each one that fixed or diagnosed a defect or loss that existed before D:
+   - Did the evidence pack show it? If it did, why didn't you raise it? That is a raise rule (a lesson).
+   - If it didn't, what would have shown it: a watch, a collector section, a log line?
+   - Count caught first, caught late and missed. "Caught first" is the review's real hit rate.
+2. **Someone else acted on your item** ("Open items someone else acted on"). Decide which:
+   - confirmed: close it as fixed-elsewhere with the sha;
+   - superseded: close it, plus a lesson when their diagnosis beat yours;
+   - still open: say why.
+
+   A different diagnosis is the most valuable lesson there is. On 11/26, R-261125-01 blamed the weekly approval ladder's x5 size. Jack asked "any adjustments i can make besides size?", and the session that shipped d4d28c2 measured more carefully:
+   - the loss was carry to settlement built on weekday mornings (08-12 ET, -$308), while 5-minute mark-outs barely moved;
+   - the review's "fills fell 8.3 to 2.7 a day" was one election-week event leaving the window.
+
+   It stood the mornings down instead.
+3. **Wrong calls.** False positives, Jack's rejections in his own words, and estimates far off once measured. Each becomes a tighter rule for raising that kind.
+4. **Promises.** Rechecks that are due. Any promise in an open item without a `recheck_on` is itself a finding.
+5. **Your own run.** Read "The last runs", "Done by hand in 2+ runs" and the budget line:
+   - minutes, turns and reported cost; errors and denials; calls spent writing outputs;
+   - analysis done by hand in two runs belongs in the collector, so the next run starts where this one ended;
+   - data gathering over 60% of its time limit is P1. On 11/26 it reached 79%, which would have sent the evidence-only email.
+6. **Blind areas.**
+   - What could you not answer today for lack of data? That is a logging or collector proposal.
+   - Which sinks, monitors, families or tasks does no section and no watch read?
+7. **Value.** Precision, false positives, verified $/day, approved but never applied, the oldest waiting decision. What would raise verified $/day per minute of Jack's time?
+
+**The answer:** findings.json `compound`, 1 to 3 entries, at least one every run (section 4 has the shape). Each entry is one of two kinds:
+- **The review applies it itself** (`self_apply`: `watch`, `lesson` or `playbook`). These change what the review reads, never the bot, so they need no approval and take effect on the next run:
+  - a read-only check goes in findings.json `watches` (section 4);
+  - a lesson goes in `lessons`, a verified rule in `playbook`.
+
+  Say what you did in `applied`.
+- **Needs Jack:** anything in code (imm_review.py, send_imm_review.py, the bot), the skill files, the launcher, logging or a task.
+  - It carries a `plan` a fresh session can execute, like any finding.
+  - The email shows it under "Making the review better" with "do R-...". It never takes one of the 3 decision cards.
+
+**Dedupe:** section 11's backlog lists the open compound items. Re-raise one with its own fingerprint and new evidence rather than filing a near-copy; an item seen on more days rises. When nothing new is warranted, the slot goes to the most valuable unbuilt backlog item, with today's evidence for it.
+
+**Watches are how a lesson becomes a check today**, not after a code change. Add one whenever a miss, a fix or a lesson has a symptom a watch can see:
+- a log line that should stay rare;
+- a sink count;
+- a file that must stay fresh;
+- a status number;
+- a family's net or tax over N days.
+
+Give each the finding or lesson it guards (`why`). A FIRING watch is evidence like any other: investigate it in step 6, then raise or close. Watches cover simple symptoms only; anything needing logic is a collector change (needs Jack).
+
+**Step 9. Prioritise.**
 - Score = expected $/day (risk-adjusted, after the realisation factor) x confidence. P0/P1 ops go first.
-- **Decisions for Jack: 3 at most.** Only what needs him: code or config changes, pushes, policy, money.
+- **Decisions for Jack: 3 at most.** Only what needs him: code or config changes, pushes, policy, money. Step 8's `compound` answers sit outside the 3, in their own block.
 - A finding already in the ledger does not get repeated in the body. It reappears only if its severity rose, or as one line in "Still waiting on you" once it has waited 3+ days.
 - Everything else goes in the ledger only.
 
-**Step 9. Write and ingest.**
-1. Write findings.json (section 4) with `python imm_review.py put findings.json --day D` (a heredoc on stdin; it refuses anything that is not a JSON object). Every finding you raised or re-confirmed today goes in, decisions and FYIs alike.
-2. Run `python imm_review.py ledger ingest --day D`. It prints `ids: {fingerprint: id}`.
+**Step 10. Write and ingest.**
+1. Write findings.json (section 4) with `python imm_review.py put findings.json --day D` (a heredoc on stdin; it refuses anything that is not a JSON object). Every finding you raised or re-confirmed today goes in, decisions and FYIs alike, and so do the step 8 answers (`compound`) and any watches.
+2. Run `python imm_review.py ledger ingest --day D`. It prints `ids: {fingerprint: id}` and the watches it added, updated, retired or rejected. A rejected watch says why: fix it and ingest again (ingest is idempotent per fingerprint and per watch spec).
 3. Write review.md (section 5) with `python imm_review.py put review.md --day D`. Put `[[fp:<fingerprint>]]` wherever an id belongs; the sender substitutes it.
 4. Scheduled mode stops here, with a final message of 5 lines at most: verdict, decisions, files.
 
@@ -221,13 +273,56 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
     }
   ],
   "evaluations": [{"id": "R-261118-03", "verdict": "verified", "before": "...", "after": "...", "delta_usd_day": 42.0, "note": "..."}],
-  "closures": [{"id": "R-261120-01", "status": "fixed-elsewhere", "note": "f748498 shipped the guard 11/21"}],
+  "closures": [{"id": "R-261120-01", "status": "fixed-elsewhere", "note": "f748498 shipped the guard 11/21"},
+               {"id": "R-261124-01", "status": "false-positive", "note": "the live bot quoted all 13; the sweep imported incentive_mm offline"}],
   "playbook": [{"rule": "the general rule a verified item taught", "applies_to": "families / waves it covers", "evidence": "R-261118-03"}],
-  "lessons": ["one durable lesson about running this review, if any"]
+  "lessons": ["one durable lesson about running this review, if any"],
+  "compound": [
+    {
+      "fingerprint": "review:per-market-trace-tool",
+      "title": "Every run greps fills, marks and orders by hand for its 3 worst markets",
+      "gap": "Section 11: 'python snippet on fills+marks' 14 calls in 3 of 3 runs; 'grep on orders' 9 calls in 2",
+      "change": "imm_review.py trace --ticker T --day D: one timeline of fills, marks, orders and guard skips for a market",
+      "value": "about 8 turns a run; deeper loss dives",
+      "self_apply": null,
+      "plan": {"change": "...", "files": ["imm_review.py", "test_imm_review.py"], "tests": "python -m unittest test_imm_review (rc 0)",
+               "kill_switch": "none needed (read-only CLI)", "revert": "git revert <sha>", "rollout": "branch, Jack pushes; no bot restart"},
+      "metric": {"name": "hand-run fills/marks snippets per run", "recipe": "evidence section 11 'Done by hand'", "baseline": "14 in 3 runs",
+                 "eval_after_days": 7, "success": "under 3 a run"},
+      "email": {"headline": "Give the review a one-command market timeline", "why": "...", "fix": "...", "value": "~8 turns a run"}
+    },
+    {
+      "fingerprint": "review:watch-state-save-failures",
+      "title": "Watch the state-save failures the 11/25 retry fixed",
+      "gap": "R-261124-06 shipped a retry; nothing tells the review if WinError 5 saves come back",
+      "self_apply": "watch",
+      "applied": "added watch: state saves failing (max 3 a day)",
+      "email": {"headline": "The review now watches for state-save failures itself", "why": "...", "fix": "...", "value": "regressions seen next day"}
+    }
+  ],
+  "watches": [
+    {"type": "log", "title": "bot state saves failing", "contains": "state save failed", "max": 3, "severity": "P2",
+     "why": "R-261124-06: the os.replace retry shipped 11/25; more than 3 a day means it regressed"}
+  ],
+  "retire_watches": [{"id": "W-261127-01", "note": "why it is no longer needed"}]
 }
 ```
 
-**The top of the email comes from this file:** your `verdict` under the big number, up to 3 "Needs your OK" cards from the decision_needed findings (most severe first), and the "Everything found today" table of all findings. The rest of the body is review.md (section 5); the numbers, edge watch and health checks come from evidence.json.
+Finding-level extras: `"recheck_on": "2026-12-02"` on any finding that promises to look again (step 7); `"compound": true` is set for you on `compound` entries.
+
+**Watch types** (all read-only; paths are relative to `run-logs`; bounds are `min` and/or `max`; one watch looks at one ET day):
+
+| type | fields | value |
+|---|---|---|
+| `log` | `contains` (a literal, 3-200 chars), optional `regex` | bot-log lines of the day containing it (and matching the regex) |
+| `sink` | `sink` (e.g. `toxic_halts`, `fills`), optional `contains`, `field` + `equals` | rows of `<sink>_<UTC date>.jsonl` in the day; files over 250 MB are refused |
+| `file_age` | `path`, `max_hours` | hours since the file changed, at collect time |
+| `json` | `path`, `key` (dotted, e.g. `errors_today`) | the number there |
+| `family` | `family`, `metric` (net, rew, pnl, fills, cts, rest, markets, tax, share), `days` (1-30) | from moat/family_daily.csv over the last `days` days |
+
+At most 5 new watches a run and 60 active. A missing input fires (the file is gone or the key moved). `IMM_REVIEW_WATCHES=0` turns evaluation off. `python imm_review.py watch list` shows them; `watch retire W-... --note` retires one by hand.
+
+**The top of the email comes from this file:** your `verdict` under the big number, up to 3 "Needs your OK" cards from the decision_needed findings (most severe first), the "Making the review better" block from `compound` (with the review's score from evidence section 11), and the "Everything found today" table of all findings. A day with no `compound` entry shows an amber "did not answer its daily question" card. The rest of the body is review.md (section 5); the numbers, edge watch and health checks come from evidence.json.
 
 So write the short fields for a phone:
 - **`verdict`:** one or two plain sentences, at most 240 characters. How the day went in risk-adjusted terms, and the one thing that matters.
@@ -238,7 +333,9 @@ So write the short fields for a phone:
 
 Round to whole dollars. Write "modelled" or "measured" once per number, not per sentence.
 
-Fingerprints are stable keys, `kind:short-slug`, the same every day for the same problem. That is how the ledger knows it has seen something before. `kind`: bug / ops / data / missed / loss / strategy / experiment / review. `severity`: P0 to P3 (section 6). `impact.basis`: measured / modelled / n/a. To update an existing item, reuse its fingerprint, or set `ledger_id`.
+Fingerprints are stable keys, `kind:short-slug`, the same every day for the same problem. That is how the ledger knows it has seen something before. `kind`: bug / ops / data / missed / loss / strategy / experiment / review. `severity`: P0 to P3 (section 6). `impact.basis`: measured / modelled / n/a. To update an existing item, reuse its fingerprint, or set `ledger_id`. Closure statuses: closed / fixed-elsewhere / wontfix / reverted / false-positive.
+
+The `compound` entries take the same fields as a finding plus `gap` (the fact that prompted it), `change`, `self_apply` (watch / lesson / playbook, or null when it needs Jack) and `applied` (what you did, for a self-applied one). Their email block reads under "Making the review better".
 
 The `plan` must be executable by a fresh Claude with no other context:
 - files and functions;
@@ -294,6 +391,9 @@ One bullet per due item: verdict, before -> after, $/day.
 ## The moat
 What was added today (data, analysis, process); the edge watch in a sentence or two.
 
+## How the review gets better
+Step 8, in 3-6 bullets: what the lenses turned up (misses caught first / late / missed, a superseded diagnosis, the run's own friction), the review's score in one line, and why today's `compound` answers were chosen. Don't restate each answer: the email shows them as cards under the decisions.
+
 ## Data and logging
 One bullet per gap and what to log.
 
@@ -320,6 +420,12 @@ The email's numbers card comes from evidence.json, so don't paste the scorecard.
   - failed items without a revert decision: raise one;
   - open items whose fingerprint has not been seen for 7 days: close as `closed` with the reason.
 - **The review's own score** (`python imm_review.py ledger stats`): items raised, approved, verified, and verified $/day. Note false positives in `lessons`. If a kind keeps failing verification, say so and tighten the rule for raising it.
+- **Compounding, the week's version of step 8:**
+  - what the week's `compound` answers built, and what each bought (turns saved, misses caught first, $ verified);
+  - misses over the week, caught first / late / missed, against the week before;
+  - the run's cost and minutes over the week;
+  - the watches: retire those that never fired in 30 days (`retire_watches`, listed in section 11), and tighten any that fire on noise.
+  - The compound backlog is a decision list for Jack like any other. An item waiting 14 days gets one line in "Still waiting on you".
 - **Experiments:** at most 2 proposals with a control arm and a pre-registered metric, aimed at the biggest uncertainty in this week's numbers.
 - **The moat review:**
   - **Asset growth:** family-days, share days, predictions, playbook rules, findings.

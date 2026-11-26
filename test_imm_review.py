@@ -162,6 +162,21 @@ class AttributionTests(Base):
         self.assertFalse(rows[1]["bot"])
         self.assertEqual(rows[1]["files"], 1)
 
+    def test_only_the_subject_ships_an_item(self):
+        # d4d28c2 (11/26): the body opens "On the daily review's R-261125-01 ..." and
+        # shipped something else; reading the body would have marked R-261125-01 shipped
+        out = ("\x1ed4d28c2\x1f1795600000\x1fimm: the RCP weekly stands down mornings (Jack: \"Yes, build it\")\x1f"
+               "On the daily review's R-261125-01 and Jack's question\n\x1d\n\nincentive_mm.py\n"
+               "\x1e205a966\x1f1795600100\x1fimm: state save retry (review R-261124-05, -06 and -07; Jack)\x1f\x1d\n\nx.py\n")
+        rows = rv.parse_git_log(out)
+        self.assertEqual((rows[0]["ids"], rows[0]["mentions"]), ([], ["R-261125-01"]))
+        self.assertEqual(rows[1]["ids"], ["R-261124-05", "R-261124-06", "R-261124-07"])
+        rv.ledger_append({"op": "create", "id": "R-261125-01", "day": "2026-11-25", "first_seen": "2026-11-25",
+                          "status": "proposed", "kind": "strategy", "fingerprint": "s", "title": "x5 size"})
+        led = rv.sec_ledger(DAY, rows)
+        self.assertEqual(led["shipped_detected"], [])
+        self.assertEqual(rv.ledger_state()["R-261125-01"]["status"], "proposed")
+
     def test_env_diff_ignores_set_order(self):
         iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
         rows = [{"ts": iso(_ts(DAY - timedelta(days=1), 22)), "run_id": "a", "config": {
@@ -937,6 +952,383 @@ class CollectAndSendTests(Base):
             self.assertEqual(sr.main(["--day", DAY.isoformat(), "--dry", "--fallback"]), 0)
         snd.assert_not_called()
         self.assertTrue(os.path.exists(os.path.join(self.review, DAY.isoformat(), "email.html")))
+
+
+class CompoundTests(Base):
+    """The daily self-question (Jack 2026-11-26: "what else should this skill be
+    doing daily to compound and improve itself? everyday it should ask itself
+    this question and come with opportunities")."""
+
+    def _findings(self, extra=None):
+        d = os.path.join(self.review, DAY.isoformat())
+        os.makedirs(d, exist_ok=True)
+        data = {"findings": [{"fingerprint": "ops:x", "kind": "ops", "severity": "P2", "title": "x",
+                              "decision_needed": True}],
+                "compound": [
+                    {"fingerprint": "review:trace-tool", "title": "a market timeline tool",
+                     "gap": "fills+marks grepped by hand in 3 runs", "change": "imm_review.py trace",
+                     "email": {"headline": "Give the review a market timeline", "fix": "one command"}},
+                    {"fingerprint": "review:watch-saves", "title": "watch state saves", "self_apply": "watch",
+                     "applied": "added a watch"}],
+                "watches": [{"type": "log", "title": "state saves failing", "contains": "state save failed",
+                             "max": 3, "why": "R-261124-06"}],
+                "lessons": ["one lesson"],
+                "playbook": [{"rule": "a rule", "applies_to": "all", "evidence": "R-1"}]}
+        data.update(extra or {})
+        with open(os.path.join(d, "findings.json"), "w") as fh:
+            json.dump(data, fh)
+        return d
+
+    def test_compound_answers_become_review_items_and_reingest_is_idempotent(self):
+        d = self._findings()
+        res = rv.ledger_ingest(DAY)
+        items = rv.ledger_state()
+        self.assertEqual(len(items), 3)
+        by_fp = {it["fingerprint"]: it for it in items.values()}
+        tool, watch = by_fp["review-trace-tool"], by_fp["review-watch-saves"]
+        self.assertEqual((tool["kind"], tool["compound"], tool["status"]), ("review", True, "proposed"))
+        self.assertEqual(tool["summary"], "fills+marks grepped by hand in 3 runs")      # gap -> summary
+        self.assertEqual(tool["plan"], {"change": "imm_review.py trace"})
+        self.assertEqual((watch["status"], watch["self_apply"]), ("open", "watch"))    # needs no one
+        self.assertEqual(res["watches"]["added"], ["W-261124-01"])
+        self.assertEqual(rv.ledger_stats()["compound"], 2)
+        # a second ingest of the same day doubles nothing
+        rv.ledger_ingest(DAY)
+        self.assertEqual(len(rv.ledger_state()), 3)
+        with open(os.path.join(self.review, "lessons.md"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read().count("one lesson"), 1)
+        with open(os.path.join(rv.MOAT_DIR, "playbook.md"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read().count("a rule"), 1)
+        self.assertEqual(len(rv.load_watches()), 1)
+        ing = rv._load_json(os.path.join(d, "ingested.json"))
+        self.assertEqual(len(ing["created"]), 3)                  # "new today" survives the re-ingest
+        self.assertEqual(ing["watches"]["added"], ["W-261124-01"])
+
+    def test_put_normalises_crlf_so_tables_survive(self):
+        md = "# T\r\n\r\n## S\r\n| A | B |\r\n|---|---:|\r\n| x | 1 |\r\n"
+        p = rv.put(DAY, "review.md", md)
+        with open(p, "rb") as fh:
+            self.assertEqual(fh.read().count(b"\r\r\n"), 0)
+        _t, _i, secs = sr.split_review(sr._read(p))
+        self.assertIn("<table", sr.md_html(secs[0][1]))
+
+    def test_reingest_keeps_the_day_counts(self):
+        self._findings({"findings": [{"fingerprint": "bug:a", "kind": "bug", "title": "a"}],
+                        "compound": [], "watches": []})
+        iid = rv.ledger_ingest(DAY)["ids"]["bug-a"]
+        d = self._findings({"findings": [{"fingerprint": "bug:a", "kind": "bug", "title": "a"}], "compound": [],
+                            "watches": [], "closures": [{"id": iid, "status": "false-positive", "note": "x"}]})
+        rv.ledger_ingest(DAY)
+        rv.ledger_ingest(DAY)                                         # the launcher's catch-up, say
+        ing = rv._load_json(os.path.join(d, "ingested.json"))
+        self.assertEqual((ing["closes"], ing["created"]), (1, [iid]))
+        closes = [e for e in rv._iter_jsonl(rv.ledger_path()) if e.get("op") == "close"]
+        self.assertEqual(len(closes), 1)
+
+    def test_recheck_on_comes_due_shipped_or_not(self):
+        self._findings({"findings": [{"fingerprint": "loss:rain", "kind": "loss", "title": "rain books",
+                                      "recheck_on": "2026-11-30"}], "compound": [], "watches": []})
+        rv.ledger_ingest(DAY)
+        iid = next(iter(rv.ledger_state()))
+        self.assertEqual(rv.ledger_due(date(2026, 11, 29)), [])
+        due = rv.ledger_due(date(2026, 11, 30))
+        self.assertEqual([(x["id"], x["why"], x["due"]) for x in due], [(iid, "recheck", "2026-11-30")])
+        rv.ledger_append({"op": "eval", "id": iid, "day": "2026-11-30", "verdict": "inconclusive"})
+        self.assertEqual(rv.ledger_due(date(2026, 12, 1)), [])
+        # the CLI sets a new date on an existing item
+        with mock.patch("sys.stdout"):
+            self.assertEqual(rv.main(["ledger", "recheck", iid, "--on", "2026-12-04"]), 0)
+        self.assertEqual(rv.ledger_state()[iid]["recheck_on"], "2026-12-04")
+        self.assertEqual([x["why"] for x in rv.ledger_due(date(2026, 12, 4))], ["recheck"])
+
+    def test_false_positive_closure_counts_in_precision(self):
+        self._findings({"compound": [], "watches": [], "findings": [
+            {"fingerprint": "bug:a", "kind": "bug", "title": "a"}, {"fingerprint": "bug:b", "kind": "bug", "title": "b"},
+            {"fingerprint": "bug:c", "kind": "bug", "title": "c"}]})
+        ids = rv.ledger_ingest(DAY)["ids"]
+        rv.ledger_append({"op": "close", "id": ids["bug-a"], "status": "false-positive", "note": "wrong"})
+        rv.ledger_append({"op": "close", "id": ids["bug-b"], "status": "closed",
+                          "note": "FALSE POSITIVE: the live bot quoted all 13"})       # the 11/25 way
+        rv.ledger_append({"op": "eval", "id": ids["bug-c"], "day": "2026-11-30", "verdict": "verified",
+                          "delta_usd_day": 5})
+        st = rv.ledger_stats()
+        self.assertEqual(st["false_positives"], 2)
+        self.assertEqual(st["precision"], 1.0)
+        self.assertEqual(rv.ledger_state()[ids["bug-a"]]["status"], "false-positive")
+
+    def test_watches_evaluate_each_type(self):
+        s, _e = rv.et_bounds(DAY)
+        stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        self.write("incentive-mm-2026-11-24.log", "".join(
+            f"{stamp(s + 60 * i)} [IMM] ! state save failed: WinError 5\n" for i in range(4))
+            + f"{stamp(s - 600)} [IMM] ! state save failed: before the day\n"
+            + f"{stamp(s + 900)} [IMM] fine line\n")
+        self.jsonl("toxic_halts_2026-11-24.jsonl", [{"kind": "pickoff", "ts": s + 10}, {"kind": "pickoff", "ts": s + 20},
+                                                    {"kind": "event", "ts": s + 30}, {"kind": "pickoff", "ts": s - 99}])
+        self.write("status_incentive_mm.json", json.dumps({"errors_today": 7, "reward": {"paid": 2}}))
+        old = self.write("rain_day_fair.json", "{}")
+        os.utime(old, (time_now() - 5 * 3600, time_now() - 5 * 3600))
+        rv._write_rows(os.path.join(rv.MOAT_DIR, "family_daily.csv"),
+                       [{"day": "2026-11-23", "family": "Weather", "rew": 10, "pnl": -30, "net": -20},
+                        {"day": "2026-11-24", "family": "Weather", "rew": 10, "pnl": -5, "net": 5}],
+                       rv.FAMILY_DAILY_COLS)
+        res = rv.watches_ingest(DAY, [
+            {"type": "log", "title": "saves", "contains": "state save failed", "max": 3},
+            {"type": "sink", "title": "pickoffs", "sink": "toxic_halts", "field": "kind", "equals": "pickoff", "max": 5},
+            {"type": "file_age", "title": "rain fair fresh", "path": "incentive-mm/rain_day_fair.json", "max_hours": 3},
+            {"type": "json", "title": "errors", "path": "incentive-mm/status_incentive_mm.json", "key": "errors_today",
+             "max": 10},
+            {"type": "json", "title": "a moved key", "path": "incentive-mm/status_incentive_mm.json",
+             "key": "reward.gone", "max": 10},
+            {"type": "family", "title": "weather net", "family": "Weather", "metric": "net", "days": 2, "min": -10},
+        ], [])
+        self.assertEqual(len(res["added"]), 5)                    # 5 new a run at most
+        self.assertEqual(res["rejected"][0]["why"][:5], "limit")
+        res2 = rv.watches_ingest(DAY + timedelta(days=1), [
+            {"type": "family", "title": "weather net", "family": "Weather", "metric": "net", "days": 2, "min": -10}], [])
+        self.assertEqual(len(res2["added"]), 1)
+        ev = rv.eval_watches(DAY)
+        st = {r["title"]: (r["state"], r.get("value")) for r in ev["results"]}
+        self.assertEqual(st["saves"], ("FIRING", 4.0))            # the line before the day is not counted
+        self.assertEqual(st["pickoffs"], ("ok", 2.0))
+        self.assertEqual(st["rain fair fresh"][0], "FIRING")
+        self.assertGreater(st["rain fair fresh"][1], 4.9)
+        self.assertEqual(st["errors"], ("ok", 7.0))
+        self.assertEqual(st["a moved key"], ("FIRING", None))     # a missing input fires
+        self.assertEqual(st["weather net"], ("FIRING", -15.0))
+        with open(os.path.join(self.review, "watch_results.jsonl")) as fh:
+            n = len(fh.readlines())
+        self.assertEqual(n, 6)
+        rv.eval_watches(DAY, record=False)
+        with open(os.path.join(self.review, "watch_results.jsonl")) as fh:
+            self.assertEqual(len(fh.readlines()), n)
+        self.assertEqual(rv.eval_watches(DAY)["fires"]["W-261124-01"], 1)   # a re-run day counts once
+        with mock.patch.dict(os.environ, {"IMM_REVIEW_WATCHES": "0"}):
+            self.assertTrue(rv.eval_watches(DAY)["off"])
+
+    def test_watch_validation_retire_and_stale(self):
+        bad = [{"type": "file_age", "title": "t", "path": "../secrets.txt", "max_hours": 1},
+               {"type": "file_age", "title": "t", "path": "C:/Windows/x", "max_hours": 1},
+               {"type": "log", "title": "t", "contains": "abc", "regex": "(", "max": 1},
+               {"type": "log", "title": "t", "contains": "ab", "max": 1},
+               {"type": "log", "title": "t", "contains": "abcd"},
+               {"type": "shell", "title": "t", "max": 1},
+               {"type": "json", "title": "t", "path": "incentive-mm/x.json", "key": "a;b", "max": 1}]
+        res = rv.watches_ingest(DAY, bad, [])
+        self.assertEqual(res["added"], [])
+        self.assertEqual(len(res["rejected"]), len(bad))
+        w = {"type": "log", "title": "saves", "contains": "state save failed", "max": 3}
+        first = rv.watches_ingest(DAY - timedelta(days=40), [w], [])["added"][0]
+        again = rv.watches_ingest(DAY, [dict(w, title="saves, renamed")], [])
+        self.assertEqual((again["added"], again["updated"]), ([], [first]))   # same spec: no copy
+        self.assertEqual(rv.eval_watches(DAY)["stale"], [first])             # 40 days, never fired
+        rv.watches_ingest(DAY, [], [{"id": first, "note": "not needed"}])
+        self.assertEqual(rv.eval_watches(DAY)["active"], 0)
+        with mock.patch("sys.stdout"):
+            self.assertEqual(rv.main(["watch", "list", "--all"]), 0)
+
+    def _stream(self, day_iso, cmds, error=None, turns=40, ms=1_200_000, cost=5.5):
+        d = os.path.join(self.review, day_iso)
+        os.makedirs(d, exist_ok=True)
+        rows = [{"type": "system", "subtype": "init"}]
+        for i, c in enumerate(cmds):
+            rows.append({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {"command": c}}]}})
+        rows.append({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "x"}}]}})
+        if error:
+            rows.append({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t0", "is_error": True, "content": error}]}})
+        rows.append({"type": "result", "subtype": "success", "num_turns": turns, "duration_ms": ms,
+                     "total_cost_usd": cost, "is_error": False, "usage": {"output_tokens": 900}})
+        with open(os.path.join(d, "claude_stream.jsonl"), "w") as fh:
+            fh.write("".join(json.dumps(r) + "\n" for r in rows))
+        with open(os.path.join(d, "run.log"), "w", encoding="utf-8-sig") as fh:
+            fh.write(f"x collect exit=0 timedout=False: evidence for {day_iso} in 1181.1s -> y\n"
+                     "x === done in 52 min, exit=0 ===\n")
+
+    def test_run_traces_and_work_done_by_hand(self):
+        grep = "grep -h 'KXA' run-logs/incentive-mm/fills_2026-11-23.jsonl | python -c 'import sys'"
+        snip = "python - <<'EOF'\nimport json\nopen('run-logs/incentive-mm/marks_2026-11-23.jsonl')\nEOF"
+        chunk = 'F="$TEMP/f.json" && cat >> "$F" <<\'EOF\'\n{"a": 1}\nEOF'
+        self._stream("2026-11-23", [grep, grep, snip, chunk, "python imm_review.py ledger list"],
+                     error="Permission to use Bash with command rm -f x has been denied.")
+        self._stream("2026-11-24", [grep, snip, "python imm_review.py ledger due --day 2026-11-24",
+                                    "cd /c/x && git show abc --stat"])
+        self.assertEqual(rv.cmd_kind(grep), "grep on fills")
+        self.assertEqual(rv.cmd_kind(snip), "python snippet on marks")
+        self.assertEqual(rv.cmd_kind(chunk), "assembling an output file in chunks")
+        self.assertEqual(rv.cmd_kind("python imm_review.py measure --pattern x"), "imm_review measure")
+        self.assertEqual(rv.cmd_kind("cd /c/x && git show abc"), "git show")
+        self.assertEqual(rv.cmd_kind("grep -h x run-logs/incentive-mm/incentive-mm-2026-11-24.log"), "grep on bot log")
+        tr = rv.run_trace("2026-11-23")
+        self.assertEqual((tr["turns"], tr["minutes"], tr["cost_usd"]), (40, 20.0, 5.5))
+        self.assertEqual((tr["bash"], tr["n_errors"], tr["denials"], tr["output_calls"]), (5, 1, 1, 1))
+        self.assertEqual((tr["collect_secs"], tr["total_min"], tr["exit"]), (1181.1, 52, 0))
+        self.assertEqual(tr["tools"]["Read"], 1)
+        rep = rv.repeated_manual([rv.run_trace("2026-11-24"), tr])
+        self.assertEqual([(x["kind"], x["runs"], x["calls"]) for x in rep],
+                         [("grep on fills", 2, 3)])               # the snippet: 2 calls; ledger + git: by design
+        self.assertIsNone(rv.run_trace("2026-11-20"))
+
+    def test_self_section_outside_overlaps_memory_and_budget(self):
+        # an open item about KXFOO and one about imm_health_alert.py
+        rv.ledger_append({"op": "create", "id": "R-261120-01", "day": "2026-11-20", "first_seen": "2026-11-20",
+                          "status": "proposed", "kind": "strategy", "fingerprint": "strategy-foo",
+                          "title": "KXFOO at x5 loses money"})
+        rv.ledger_append({"op": "create", "id": "R-261120-02", "day": "2026-11-20", "first_seen": "2026-11-20",
+                          "status": "open", "kind": "review", "compound": True, "fingerprint": "review-alert",
+                          "title": "alerts", "plan": {"files": ["imm_health_alert.py"]}})
+        rv.ledger_append({"op": "decide", "id": "R-261120-01", "status": "approved", "note": "yes"})
+        commits = [{"sha": "abc1234", "at": "11-24 10:00", "subject": "imm: KXFOO stands down mornings (Jack: \"yes\")",
+                    "ids": [], "bot": True, "names": ["incentive_mm.py"], "body": ""},
+                   {"sha": "def5678", "at": "11-24 11:00", "subject": "imm: grace", "ids": [], "bot": False,
+                    "names": ["imm_health_alert.py"], "body": ""},
+                   {"sha": "aaa0000", "at": "11-24 12:00", "subject": "imm: R-261120-09 done", "ids": ["R-261120-09"],
+                    "bot": False, "names": [], "body": ""},
+                   # bookkeeping, never a miss; and the commit that shipped R-261120-02 is no "overlap"
+                   {"sha": "bbb1111", "at": "11-24 13:00", "subject": "Merge GitHub main into the box's main",
+                    "ids": [], "bot": True, "names": ["incentive_mm.py", "imm_health_alert.py"], "body": ""},
+                   {"sha": "ccc2222", "at": "11-24 14:00", "subject": "High-temp digest for 2026-11-23", "ids": [],
+                    "bot": False, "names": [], "body": ""},
+                   {"sha": "ddd3333", "at": "11-24 15:00", "subject": "imm: alert grace (review R-261120-02)",
+                    "ids": ["R-261120-02"], "bot": False, "names": ["imm_health_alert.py"], "body": ""}]
+        mem = os.path.join(self.root, "memory")
+        os.makedirs(mem)
+        s, _e = rv.et_bounds(DAY)
+        for name, desc, t in (("note_a.md", "R-261120-01 re-measured: it is morning carry", s + 3600),
+                              ("note_old.md", "old news", s - 86400)):
+            p = os.path.join(mem, name)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(f"---\nname: {name[:-3]}\ndescription: \"{desc}\"\n---\n\nbody\n")
+            os.utime(p, (t, t))
+        rv.configure(status_dir=self.status, review_dir=self.review, repo=self.root, memory_dir=mem)
+        self._stream("2026-11-23", ["grep x run-logs/incentive-mm/fills_2026-11-23.jsonl"])
+        launcher = os.path.join(self.root, "run_imm_daily_review.ps1")
+        with open(launcher, "w") as fh:
+            fh.write("$CollectTimeoutMin = 35\n$ClaudeTimeoutMin = 100\n")
+        ev = {"generated": time_now() - 30, "changes": {"commits": commits},
+              "moat": {"_secs": 12.5}, "system": {"_secs": 40.0}}
+        with mock.patch.object(rv, "HERE", self.root):
+            se = rv.sec_self(DAY, ev)
+        self.assertIn("compound", se["question"])
+        self.assertEqual([c["sha"] for c in se["outside"]["commits"]], ["abc1234", "def5678"])
+        self.assertEqual([n["file"] for n in se["outside"]["memory"]], ["note_a.md"])
+        ov = {(o["id"], o["by"], o["match"]) for o in se["overlaps"]}
+        self.assertIn(("R-261120-01", "commit abc1234", "KXFOO"), ov)
+        self.assertIn(("R-261120-02", "commit def5678", "imm_health_alert.py"), ov)
+        self.assertIn(("R-261120-01", "memory note_a.md", "names the id"), ov)
+        self.assertFalse({o["by"] for o in se["overlaps"]} & {"commit bbb1111", "commit ccc2222", "commit ddd3333"})
+        self.assertEqual(se["overlaps"][0]["match"], "names the id")      # a named item leads
+        self.assertEqual([b["id"] for b in se["backlog"]], ["R-261120-02"])
+        self.assertEqual(se["record"]["approved_unapplied"][0]["id"], "R-261120-01")
+        b = se["budget"]
+        self.assertEqual((b["collect_limit_s"], b["claude_limit_min"]), (2100.0, 100.0))
+        self.assertEqual(b["slowest"][0], ("system", 40.0))
+        self.assertGreaterEqual(b["collect_so_far_s"], 30)
+        self.assertEqual(se["runs"][0]["day"], "2026-11-23")
+        md = []
+        rv.render_self(se, md.append)
+        text = "\n".join(md)
+        self.assertIn("## 11. The review itself", text)
+        self.assertIn("KXFOO stands down mornings", text)
+        text.encode("cp1252", errors="strict")
+
+    def test_cycle_pass_handles_mid_file_headers_junk_and_growth(self):
+        z = lambda hh, mm: datetime.fromtimestamp(_ts(DAY, hh, mm), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        u, u2 = rv.utc_dates(DAY)
+        lines = ["ts,ticker,est_frac,pool_per_day",
+                 f"{z(9, 0)},KXAAA-1-T1,0.10,100", "garbage line", f"{z(9, 0)},KXAAA-2-T1,0.30,nan",
+                 "ts,ticker,x,pool_per_day,est_frac",                      # a restart wrote a new header
+                 f"{z(9, 5)},KXAAA-1-T1,zz,100,0.50"]
+        self.write(f"cycle_log_{u}.csv", "\n".join(lines) + "\n")
+        nxt = self.write(f"cycle_log_{u2}.csv", "ts,ticker,est_frac,pool_per_day\n")
+        self.assertEqual(len(rv.cycle_times(DAY)), 2)
+        self.assertAlmostEqual(rv.cycle_share(DAY)["Fam KXAA"]["share"], (0.1 * 100 + 0.5 * 100) / 200)
+        # the next UTC file keeps growing during the collect (the live bot): it was
+        # written long past this day's window, so the second section reuses the scan
+        with open(nxt, "a") as fh:
+            fh.write(f"{z(23, 30)},KXAAA-1-T1,0.10,100\n")              # 23:30 ET: past the day
+        with mock.patch.object(rv.imm_logfiles, "open_bin", side_effect=AssertionError("re-read")):
+            self.assertEqual(len(rv.cycle_times(DAY)), 2)
+
+    def test_cycle_pass_rereads_a_file_still_inside_the_window(self):
+        now = time_now()
+        day = datetime.fromtimestamp(now, rv.ET).date()                    # today: the window is open
+        s, _e = rv.et_bounds(day)
+        t1, t2 = max(now - 600, s + 1), max(now - 300, s + 2)
+        z = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        u = datetime.fromtimestamp(t1, timezone.utc).date().isoformat()
+        p = self.write(f"cycle_log_{u}.csv", f"ts,ticker,est_frac,pool_per_day\n{z(t1)},KXAAA-1-T1,0.1,100\n")
+        self.assertEqual(len(rv.cycle_times(day)), 1)
+        with open(p, "a") as fh:
+            fh.write(f"{z(t2)},KXAAA-1-T1,0.1,100\n")
+        self.assertEqual(len(rv.cycle_times(day)), 2)
+
+
+def time_now() -> float:
+    import time as _t
+    return _t.time()
+
+
+class CompoundEmailTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.archive(DAY, {"KXAAA-1-T1": _row(rew=50, pnl=-10)})
+        self.write("status_incentive_mm.json", json.dumps({"updated_at": "2026-11-25T09:00:00Z"}))
+
+    def _build(self, findings):
+        with mock.patch.object(rv, "_ps_json", return_value=[]), mock.patch.object(rv, "_run", return_value=(0, "")):
+            rv.collect(DAY, bootstrap_days=0)
+        d = os.path.join(self.review, DAY.isoformat())
+        with open(os.path.join(d, "review.md"), "w", encoding="utf-8") as fh:
+            fh.write("# V\n\n## How the review gets better\n- two misses\n")
+        with open(os.path.join(d, "findings.json"), "w") as fh:
+            json.dump(findings, fh)
+        rv.ledger_ingest(DAY)
+        return sr.build(DAY)
+
+    def test_compound_block_sits_outside_the_decision_cards(self):
+        subject, page, text, _ = self._build({"verdict": "ok", "findings": [
+            {"fingerprint": "ops:a", "kind": "ops", "severity": "P1", "title": "a", "decision_needed": True,
+             "email": {"headline": "The sync is stuck"}}],
+            "compound": [{"fingerprint": "review:trace", "title": "trace tool", "severity": "P1",
+                          "email": {"headline": "Give the review a market timeline", "why": "hand greps",
+                                    "fix": "one command", "value": "~8 turns a run"}},
+                         {"fingerprint": "review:w", "title": "watch saves", "self_apply": "watch",
+                          "applied": "added a state-save watch",
+                          "email": {"headline": "The review watches state saves itself"}}],
+            "watches": [{"type": "json", "title": "errors today", "path": "incentive-mm/status_incentive_mm.json",
+                         "key": "errors_today", "max": 5}]})
+        self.assertIn("1 needs your OK", subject)                        # the compound item is not a card
+        self.assertIn("Making the review better", page)
+        self.assertIn("Give the review a market timeline", page)
+        self.assertIn("Build it: text", page)
+        self.assertIn("Done by the review itself: added a state-save watch (W-261124-01)", page)
+        self.assertIn("findings so far", page)
+        self.assertIn("MAKING THE REVIEW BETTER (2)", text)
+        self.assertIn("How the review gets better", page)                # review.md's narrative section
+        self.assertLess(page.index("The sync is stuck"), page.index("Making the review better"))
+
+    def test_tags_for_earlier_items_resolve_through_the_ledger(self):
+        rv.ledger_append({"op": "create", "id": "R-261120-04", "day": "2026-11-20", "first_seen": "2026-11-20",
+                          "status": "proposed", "kind": "data", "fingerprint": "data-moat-durable-backup",
+                          "title": "backup"})
+        _, page, text, _ = self._build({"verdict": "ok", "findings": []})
+        d = os.path.join(self.review, DAY.isoformat())
+        with open(os.path.join(d, "review.md"), "w", encoding="utf-8") as fh:
+            fh.write("# V\n\n## Still waiting on you\n- the backup [[fp:data:moat-durable-backup]] waits\n")
+        _, page, text, _ = sr.build(DAY)
+        self.assertIn("the backup R-261120-04 waits", text)
+
+    def test_a_day_without_an_answer_says_so(self):
+        _, page, text, _ = self._build({"verdict": "ok", "findings": []})
+        self.assertIn("did not answer its daily question", page)
+        self.assertIn("did not answer its daily question", text)
+        evj = rv._load_json(os.path.join(self.review, DAY.isoformat(), "evidence.json"))
+        self.assertIn("self", evj)
+        with open(os.path.join(self.review, DAY.isoformat(), "evidence.md"), encoding="utf-8") as fh:
+            self.assertIn("## 11. The review itself", fh.read())
 
 
 if __name__ == "__main__":
