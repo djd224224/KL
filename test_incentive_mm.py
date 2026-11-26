@@ -51592,3 +51592,88 @@ class TestListedComboFair(unittest.TestCase):
             bot.run_cycle()
         self.assertTrue(any(f"listed-combo resume {self.T}" in s_ for s_ in lines))
 
+
+class TestNamedEvents(unittest.TestCase):
+    """NAMED EVENTS (Jack 2026-11-26: "quote KX30YMORTW-26DEC03 at 3x", "stop
+    2 days before end (so 12/1)", then "same for
+    KXNBAFRANCHISECOST-31DEC26LV")."""
+    EV = "KX30YMORTW-26DEC03"
+    T = "KX30YMORTW-26DEC03-T7.10"
+    EV2 = "KXNBAFRANCHISECOST-31DEC26LV"
+    T2 = "KXNBAFRANCHISECOST-31DEC26LV-B10"
+
+    def test_they_quote_past_the_weekly_block_and_the_allowlist_and_no_other(self):
+        B = IncentiveMarketMaker
+        self.assertTrue(imm.series_pattern_blocked("KX30YMORTW"))
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            for t, ev in ((self.T, self.EV), (self.EV, self.EV), (self.T2, self.EV2)):
+                self.assertEqual(imm.named_event_of(t), ev, t)
+                self.assertFalse(B._blocked(t), t)
+                self.assertTrue(B._allowed(t), t)
+            # the next week's event and the series' family probe stay blocked
+            for t in ("KX30YMORTW-26DEC10-T7.10", "KX30YMORTW-26DEC10", "KX30YMORTW-X"):
+                self.assertIsNone(imm.named_event_of(t), t)
+                self.assertTrue(B._blocked(t), t)
+                self.assertFalse(B._allowed(t), t)
+            # another franchise event is not on the allowlist
+            self.assertFalse(B._allowed("KXNBAFRANCHISECOST-31DEC26SEA-B10"))
+            # a prefix entry on the blocklist still wins
+            with mock.patch.object(imm, "SERIES_BLOCKLIST_PREFIXES",
+                                   tuple(imm.SERIES_BLOCKLIST_PREFIXES)
+                                   + ("KX30YMORTW", "KXNBAFRANCHISECOST")):
+                self.assertTrue(B._blocked(self.T))
+                self.assertTrue(B._blocked(self.T2))
+            # the kill switch: blocked / off the allowlist again
+            with mock.patch.object(imm, "NAMED_EVENTS_ENABLE", False):
+                self.assertTrue(B._blocked(self.T))
+                self.assertFalse(B._allowed(self.T))
+                self.assertFalse(B._allowed(self.T2))
+        for k in ("NAMED_EVENTS_ENABLE", "NAMED_EVENTS"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def test_x3_to_each_stop(self):
+        self.assertEqual(imm.SERIES_OVERRIDES["KX30YMORTW"].size_mult, 3.0)
+        self.assertEqual(imm.SERIES_OVERRIDES["KXNBAFRANCHISECOST"].size_mult, 3.0)
+        utc = timezone.utc
+        # the weekly: two days before its 12/03 16:59Z close, ahead of the
+        # ticker date's 00:00 ET 12/03
+        close = datetime(2026, 12, 3, 16, 59, tzinfo=utc)
+        tdate = datetime(2026, 12, 3, 5, 0, tzinfo=utc)
+        f = imm.apply_series_cutoff_adjustments
+        self.assertEqual(f("KX30YMORTW", self.EV, tdate, close_time=close),
+                         datetime(2026, 12, 1, 16, 59, tzinfo=utc))
+        self.assertEqual(f("KX30YMORTW", self.EV, None, close_time=close),
+                         datetime(2026, 12, 1, 16, 59, tzinfo=utc))
+        # the franchise: 00:00 ET 12/30, two days before its window's 12/31
+        # end, over the ticker date's 2031-12-26 and the 01/07 close
+        close2 = datetime(2027, 1, 7, 15, 0, tzinfo=utc)
+        self.assertEqual(imm.parse_event_date(self.EV2).year, 2031)
+        self.assertEqual(f("KXNBAFRANCHISECOST", self.EV2, close2, close_time=close2),
+                         datetime(2026, 12, 30, 5, 0, tzinfo=utc))
+        self.assertEqual(imm.named_event_stop(self.EV2).astimezone(imm.ET).strftime(
+            "%m/%d %H:%M"), "12/30 00:00")
+        # an earlier cutoff still wins; the switch off leaves the ticker's own
+        early = datetime(2026, 11, 30, 5, 0, tzinfo=utc)
+        self.assertEqual(f("KX30YMORTW", self.EV, early, close_time=close), early)
+        with mock.patch.object(imm, "NAMED_EVENTS_ENABLE", False):
+            self.assertEqual(f("KX30YMORTW", self.EV, tdate, close_time=close), tdate)
+
+    def test_they_lead_of_neither_kind(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        for ev, t, series, sibs in (
+                (self.EV, self.T, "KX30YMORTW", ("T7.09", "T7.11")),
+                (self.EV2, self.T2, "KXNBAFRANCHISECOST", ("B9", "B11"))):
+            lad = (f"{ev}-{sibs[0]}", t, f"{ev}-{sibs[1]}")
+            bot._ladders = {x: lad for x in lad}
+            meta = imm.MarketMeta(ticker=t, event_ticker=ev, series=series,
+                                  dollars_per_day=26.0, program_end=None, target_size=1000.0,
+                                  discount_factor=0.5, cutoff=None,
+                                  close_time=datetime(2068, 12, 5, 4, 0, tzinfo=timezone.utc),
+                                  mid_cents=57.0, spread_cents=10, volume=0.0)
+            # (the live LADDER_MODE: the complement / ladder leads exist only at-ref)
+            with mock.patch.object(imm, "LADDER_MODE", "atref"):
+                self.assertIsNone(bot._lead_source(meta), t)
+                self.assertEqual(bot._comp_lead(meta, [[52, 200]], [[38, 200]]),
+                                 (None, None))
+                with mock.patch.object(imm, "NAMED_EVENTS_ENABLE", False):
+                    self.assertEqual(bot._lead_source(meta), "comp", t)   # (unnamed: its ladder)

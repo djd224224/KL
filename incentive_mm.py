@@ -6408,7 +6408,8 @@ def _series_block_default(gb_state_gas_live: bool) -> str:
             # (Kalshi's series page names the NY Fed SOFR page as the source,
             # so the live-source keyword screen never saw Freddie Mac):
             # -$55.90 on 242 contracts in two weeks. The long-dated mortgage
-            # families are quoted only through the MORT_* gate.
+            # families are quoted only through the MORT_* gate. An event in
+            # NAMED_EVENTS quotes anyway (2026-11-26: KX30YMORTW-26DEC03).
             "KX30YMORTW")
 
 
@@ -10338,6 +10339,58 @@ NO_NEW_SERIES = frozenset(
 FORCE_EVENTS = frozenset(
     e.strip() for e in os.environ.get("IMM_FORCE_EVENTS", "").split(",")
     if e.strip())
+
+# NAMED EVENTS (Jack 2026-11-26: "quote KX30YMORTW-26DEC03 at 3x", "stop 2
+# days before end (so 12/1)", then "same for KXNBAFRANCHISECOST-31DEC26LV").
+# An event named here quotes at its size multiple until its stop:
+#   - past the series PATTERN block and the allowlist (_blocked / _allowed;
+#     a prefix entry on the blocklist still wins). The weekly 30Y mortgage
+#     rate stays pattern-blocked (2026-09-28: the daily lock index pins
+#     Freddie's Thursday print days before it lands): only its named event
+#     quotes, and the series' family probe ("KX30YMORTW-X") stays blocked.
+#   - at its multiple on the size_mult wire (rungs, caps, skew knees, the
+#     floor projection). The wire is per SERIES, so another event of the
+#     series that the open scan admits would rest at it too.
+#   - out at its stop, positions riding to settlement: the cutoff
+#     (apply_series_cutoff_adjustments, the earlier one winning).
+#     KX30YMORTW-26DEC03 closes 12/03 16:59Z on Freddie's print: out 12/01
+#     16:59Z, two days before. KXNBAFRANCHISECOST-31DEC26LV counts a sale
+#     announced by 12/31 (the market closes 01/07): out 00:00 ET 12/30, two
+#     days before that window ends. (Its "31DEC26" reads as 2031-12-26 by
+#     the ticker-date rule; the stop makes that moot.)
+#   - no lead of either kind (_lead_source): both are threshold ladders, and
+#     the ask was the plain quote, not 200-lot leads off the neighbours'
+#     books.
+# IMM_NAMED_EVENTS=0 takes them all out (an env change = task-level restart).
+NAMED_EVENTS_ENABLE = os.environ.get("IMM_NAMED_EVENTS", "1") == "1"
+NAMED_EVENTS: Dict[str, Tuple[float, datetime]] = {
+    # event ticker: (size multiple, stop UTC)
+    "KX30YMORTW-26DEC03": (3.0, datetime(2026, 12, 1, 16, 59, tzinfo=timezone.utc)),
+    "KXNBAFRANCHISECOST-31DEC26LV": (3.0, datetime(2026, 12, 30, 5, 0, tzinfo=timezone.utc)),
+}
+if NAMED_EVENTS_ENABLE:
+    for _nev, (_nmult, _nstop) in NAMED_EVENTS.items():
+        _nser = _nev.split("-")[0]
+        SERIES_OVERRIDES[_nser] = replace(
+            SERIES_OVERRIDES.get(_nser) or SeriesOverride(), size_mult=_nmult)
+
+
+def named_event_of(ticker: str) -> Optional[str]:
+    """The NAMED_EVENTS entry a market or event ticker belongs to, else None
+    (read at call time; None with the switch off)."""
+    if not NAMED_EVENTS_ENABLE:
+        return None
+    t = (ticker or "").upper()
+    if t in NAMED_EVENTS:
+        return t
+    ev = t.rsplit("-", 1)[0]
+    return ev if ev in NAMED_EVENTS else None
+
+
+def named_event_stop(event_ticker: str) -> Optional[datetime]:
+    """A NAMED EVENT's stop (UTC), else None."""
+    ev = named_event_of(event_ticker)
+    return None if ev is None else NAMED_EVENTS[ev][1]
 
 # FULL FREEZE by EXACT series (Jack 2026-07-29 am: "stop quoting COMPANY
 # events" — escalates the 7/28 run-off to zero orders; positions ride to
@@ -15689,6 +15742,8 @@ _CONFIG_CODE_KNOBS = (
     # ride in its status file's "model" block
     "MORT_ENABLE", "MORT_SERIES", "MORT_FAIR_TOL_CENTS", "MORT_FAIR_TTL_MIN",
     "MORT_FAIR_REFRESH_SECS", "MORT_CUTOFF_BUFFER_DAYS", "MORT_SIZE_MULT",
+    # hand-named events (2026-11-26)
+    "NAMED_EVENTS_ENABLE", "NAMED_EVENTS",
     # Zillow home value gate (2026-11-12); zillow_home_fair's model knobs
     # ride in its status file's "model" block
     "HOME_ENABLE", "HOME_SERIES", "HOME_FAIR_TOL_CENTS", "HOME_FAIR_TTL_MIN",
@@ -26655,6 +26710,10 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
     _say_stop = TWK_SAY_EVENT_STOPS.get(event_ticker)
     if _say_stop is not None:
         cutoff = _say_stop if cutoff is None else min(cutoff, _say_stop)
+    # a NAMED EVENT's stop (NAMED_EVENTS, 2026-11-26), the earlier one winning
+    _named_stop = named_event_stop(event_ticker)
+    if _named_stop is not None:
+        cutoff = _named_stop if cutoff is None else min(cutoff, _named_stop)
     if series == POWERSLAP_SERIES:
         start = EVENT_START_OVERRIDES.get(event_ticker)
         if start is not None:
@@ -37726,7 +37785,8 @@ class IncentiveMarketMaker:
         # pick's event (2026-10-27, astest_pick_gas_ticker)
         astest = astest_gas_series(series_of(ticker)) or astest_pick_gas_ticker(ticker)
         if any(ticker.startswith(p) for p in prefixes) \
-                or (series_pattern_blocked(series_of(ticker)) and not astest) \
+                or (series_pattern_blocked(series_of(ticker)) and not astest
+                    and named_event_of(ticker) is None) \
                 or event_pattern_blocked(ticker) \
                 or company_kpi_series(series_of(ticker)) \
                 or ca_family_blocked(series_of(ticker)):
@@ -37771,6 +37831,8 @@ class IncentiveMarketMaker:
         (Jack 2026-11-05: "Yes, close the gaps" -- the market-wave playbook)."""
         if cls._blocked(ticker):
             return False
+        if named_event_of(ticker) is not None:
+            return True                   # NAMED EVENTS (2026-11-26)
         if not ALLOWLIST_ONLY:
             return True
         if pvd_entry(ticker) is not None:
@@ -40337,7 +40399,8 @@ class IncentiveMarketMaker:
         decision (LEAD STOP; the quote loop asks with stop=False so that it
         logs the leads it stands down). Each mode's own switch applies
         (lead_mode)."""
-        if meta.series.startswith(LEAD_OFF_SERIES) or home_lead_off(meta.series):
+        if meta.series.startswith(LEAD_OFF_SERIES) or home_lead_off(meta.series) \
+                or named_event_of(meta.ticker) is not None:     # (NAMED EVENTS: no leads)
             return None
         if stop and lead_stop_due(meta, time.time()):
             return None
@@ -50931,6 +50994,11 @@ class IncentiveMarketMaker:
                 f"{7 + MORT_CUTOFF_BUFFER_DAYS}d before the first print that "
                 f"can settle, ttl {MORT_FAIR_TTL_MIN}m, refresh "
                 f"{MORT_FAIR_REFRESH_SECS}s, status {MORT_STATUS_FILE}")
+        if NAMED_EVENTS_ENABLE and NAMED_EVENTS:
+            log("named events (2026-11-26): " + "; ".join(
+                f"{ev} x{m:g} to {stop:%m/%d %H:%M}Z"
+                for ev, (m, stop) in sorted(NAMED_EVENTS.items()))
+                + " -- past the pattern block and the allowlist, no leads")
         if SNOW_DAYS_ENABLE:
             log(f"snow-day counts (2026-11-14): {','.join(sorted(SNOW_DAYS_SERIES))}"
                 + (" + any SNOW series on its contract" if SNOW_DAYS_AUTO else "")
