@@ -208,5 +208,28 @@ class TestRun(unittest.TestCase):
         self.assertNotIn("src:a", st)
 
 
+class TestUserAgent(unittest.TestCase):
+    """Only bls.gov gets a contact, and only the one Jack set (2026-11-26)."""
+
+    def test_bls_gets_the_contact_the_variable_holds(self):
+        ua = irc.user_agent("https://www.bls.gov/schedule/news_release/laus.htm",
+                            contact="someone@example.test")
+        self.assertEqual(ua, "Mozilla/5.0 (KL release-calendar check; contact someone@example.test)")
+
+    def test_other_agencies_get_the_plain_name(self):
+        for url in ("https://www.eia.gov/electricity/monthly/", irc.NASS_URL.format(y=2027, m=1),
+                    "https://www.census.gov/construction/bps/schedule.html",
+                    "https://www.fhfa.gov/data/hpi", "https://notbls.gov.example/x"):
+            self.assertEqual(irc.user_agent(url, contact="someone@example.test"), irc.UA, url)
+
+    def test_no_contact_set_sends_the_plain_name_to_bls_too(self):
+        self.assertEqual(irc.user_agent("https://www.bls.gov/x", contact=""), irc.UA)
+
+    def test_the_contact_is_read_from_the_environment_at_fetch_time(self):
+        with mock.patch.dict(os.environ, {irc.UA_CONTACT_VAR: "later@example.test"}):
+            self.assertIn("contact later@example.test", irc.user_agent("https://www.bls.gov/x"))
+        self.assertNotIn("@", irc.UA)
+
+
 if __name__ == "__main__":
     unittest.main()

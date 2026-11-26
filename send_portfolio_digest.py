@@ -86,7 +86,7 @@ Idempotent via a sent-marker in run-logs\portfolio-digest\. Same
 Modern-Standby retry loops as send_daily_digest.py (task can fire mid-sleep
 with the radio off). Credentials: ALERT_EMAIL_FROM / ALERT_EMAIL_PASSWORD
 (env, falling back to HKCU\Environment); Kalshi key per load_private_key.
-Recipient: PF_DIGEST_TO (default jackdu224@gmail.com) — email only, no SMS.
+Recipient: PF_DIGEST_TO (default the sending Gmail, ALERT_EMAIL_FROM) — email only, no SMS.
 """
 
 import argparse
@@ -137,7 +137,7 @@ HISTORY_CSV = os.path.join(DATA_DIR, "balance_history.csv")
 # flagged; already-baselined settlements diff to ~0 and drop out anyway.
 LOOKBACK_H = float(os.environ.get("PF_LOOKBACK_H", "50"))
 RECIPIENTS = [r.strip() for r in os.environ.get(
-    "PF_DIGEST_TO", "jackdu224@gmail.com").split(",") if r.strip()]
+    "PF_DIGEST_TO", os.environ.get("ALERT_EMAIL_FROM", "")).split(",") if r.strip()]
 
 # Chart + table colors (dataviz reference palette, light mode fixed for email).
 C_EQUITY = "#2a78d6"     # series 1 blue — realized profit

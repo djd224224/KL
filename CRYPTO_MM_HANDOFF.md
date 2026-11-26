@@ -1,6 +1,6 @@
 # Kalshi Crypto One-Touch Market-Maker Fleet — Handoff
 
-*Current as of 2026-08-05. Self-contained context for a new session. Owner: Jack (jackdu224@gmail.com).*
+*Current as of 2026-08-05. Self-contained context for a new session. Owner: Jack.*
 *Repo: `C:\Users\jackd\Documents\KL` (github.com/djd224224/KL). Bot version v2.5.*
 
 ## What this is
@@ -351,7 +351,7 @@ updown gen 2 was minted).
 
 ## Alerts & digest
 
-- **Email only, to jackdu224@gmail.com** (Gmail push on phone). T-Mobile's email-to-SMS gateway
+- **Email only, to the sending Gmail (ALERT_EMAIL_FROM)** (Gmail push on phone). T-Mobile's email-to-SMS gateway
   is dead since 2026-06-29 — all repo bots were rerouted (`bcc4bee`). App passwords expire
   periodically; symptom is SMTP 535 in `digest-task.log`.
 - **Only `divergence` emails immediately.** Everything else is digest-only. Removed by request

@@ -28,7 +28,7 @@ Windows task "KL sms-inbox" runs this every minute:
      out exactly that plan and texts the result. Money (deposits, withdrawals,
      transfers, subaccount funding) and credentials are never done by text.
   6. Every answer goes back as a text (sms_alert.py --reply: its own caps) and
-     in full by email to jackdu224@gmail.com.
+     in full by email to his inbox (the sending Gmail).
 
 Replies always go to Jack's number, never to an address from the message.
 
@@ -77,7 +77,7 @@ FOLDERS = ('"[Gmail]/All Mail"', '"[Gmail]/Spam"')
 MAX_AGE_MIN = float(os.environ.get("SMS_INBOX_MAX_AGE_MIN", "60"))
 REPLY_CHARS = 600            # Claude's own words in a text
 TEXT_CHARS = 880             # the whole text, with a plan / code line (sms_alert --reply keeps 900)
-ALERT_TO = "jackdu224@gmail.com"
+ALERT_TO = sms_alert.setting("ALERT_EMAIL_FROM")   # his inbox is the sending Gmail; no address in the code
 # the answering run may look at anything but changes nothing: these are denied outright
 # (deny rules hold in bypass mode); anything else it would change is ruled out by its instructions
 ASK_DENY = ["Edit", "Write", "NotebookEdit", "PowerShell",

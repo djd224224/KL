@@ -23,7 +23,7 @@ def tmo(text="stop wave w1108-x", frm="+19729713381@tmomail.net", ar=GOOD_AR, ex
     """A message shaped like T-Mobile's: html part + the words in text_0.txt."""
     m = MIMEMultipart("related")
     m["From"] = frm
-    m["To"] = "jackdu224@gmail.com"
+    m["To"] = "owner@example.test"
     if ar is not None:
         m["Authentication-Results"] = ar            # the top one, as Gmail writes it
     if extra_ar:

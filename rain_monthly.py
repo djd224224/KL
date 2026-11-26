@@ -56,7 +56,7 @@ from typing import Dict, List, Optional, Tuple
 import pytz
 import requests
 
-UA = {"User-Agent": "KL rain monthly model (jackdu224@gmail.com)"}
+UA = {"User-Agent": "KL rain monthly model"}   # a plain name: NWS, IEM, ACIS ask for none (11/26)
 
 
 def _env_int(name, default):

@@ -3,7 +3,7 @@
 
 Why the cap (Jack 2026-11-07: "how to fix the text gateway"): from ~2026-06-29
 T-Mobile's gateway filter (tmo-*.mx.a.cloudfilter.net) answered every message
-from jackdu224@gmail.com with "452 4.1.0 <jackdu224@gmail.com> server
+from the bots' Gmail with "452 4.1.0 <that address> server
 temporarily unavailable AUP#MXRT" -- an acceptable-use block on the SENDER,
 after the bots sent 200+ texts in the 9 days before. bcc4bee (7/3) moved every
 bot's alerts to the Gmail inbox. This sends texts again, but:

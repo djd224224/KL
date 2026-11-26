@@ -62,7 +62,7 @@ SERIES_PREFIX = "KXLOWT"
 SERIES_CATEGORY = "Climate and Weather"
 KALSHI_API = os.environ.get("LOWT_FAIR_KALSHI_API",
                             "https://api.elections.kalshi.com/trade-api/v2")
-UA = {"User-Agent": "KL lowt_fair (jackdu224@gmail.com)"}
+UA = {"User-Agent": "KL lowt_fair"}   # a plain name (no address in the code, 11/26)
 TIMEOUT = 20
 DISCOVER_SECS = float(os.environ.get("LOWT_FAIR_DISCOVER_SECS", str(6 * 3600)))
 # The Weather Company's 5-day daily forecast, read only when WU_API_KEY is

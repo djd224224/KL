@@ -57,8 +57,9 @@ foreach ($n in 'KALSHI_PRIVATE_KEY_PATH', 'ALERT_EMAIL_FROM', 'ALERT_EMAIL_PASSW
         try { Set-Item "env:$n" (Get-ItemProperty -Path "HKCU:\Environment" -Name $n -ErrorAction Stop).$n } catch {}
     }
 }
-# Alert emails go to the inbox (tmomail SMS gateway dead since 2026-06-29).
-if (-not $env:ALERT_EMAIL_TO) { $env:ALERT_EMAIL_TO = "jackdu224@gmail.com" }
+# Alert emails go to the inbox, which is the sending Gmail (tmomail SMS gateway
+# dead since 2026-06-29; no address in the code, 2026-11-26).
+if (-not $env:ALERT_EMAIL_TO) { $env:ALERT_EMAIL_TO = $env:ALERT_EMAIL_FROM }
 
 "=== $(Get-Date -Format 'u') low-temp run start ===" | Add-Content -Path $LogPath -Encoding utf8
 

@@ -1032,22 +1032,22 @@ class TestAlerter(unittest.TestCase):
             self.assertIn("Subject: \n", headers + "\n")
 
     def test_email_recipient_full_body_with_subject(self):
-        with self.creds(recipients=["jackdu224@gmail.com"]), self.smtp() as s:
+        with self.creds(recipients=["owner@example.test"]), self.smtp() as s:
             a = mm.Alerter("SOL-MAX", live=False)
             a.send_message("x" * 1000, subject="daily summary")
             payload = self.sends(s)[0][0][2]
             headers, body = payload.split("\n\n", 1)
             self.assertGreater(len(body.strip()), mm.SMS_MAX_CHARS)
             self.assertIn("Subject: daily summary", headers)
-            self.assertEqual(self.sends(s)[0][0][1], ["jackdu224@gmail.com"])
+            self.assertEqual(self.sends(s)[0][0][1], ["owner@example.test"])
 
     def test_html_multipart_for_email_plain_for_sms(self):
-        with self.creds(recipients=["jackdu224@gmail.com", "9729713381@tmomail.net"]), \
+        with self.creds(recipients=["owner@example.test", "9729713381@tmomail.net"]), \
                 self.smtp() as s:
             a = mm.Alerter("FLEET", live=True)
             a.send_message("plain body", subject="digest", html="<table><tr><td>x</td></tr></table>")
             payloads = {call[0][1][0]: call[0][2] for call in self.sends(s)}
-            email_payload = payloads["jackdu224@gmail.com"]
+            email_payload = payloads["owner@example.test"]
             self.assertIn("multipart/alternative", email_payload)
             self.assertIn("text/html", email_payload)
             self.assertIn("plain body", email_payload)
@@ -1055,7 +1055,7 @@ class TestAlerter(unittest.TestCase):
             self.assertNotIn("text/html", sms_payload)
 
     def test_multiple_recipients_mixed(self):
-        with self.creds(recipients=["9729713381@tmomail.net", "jackdu224@gmail.com"]), \
+        with self.creds(recipients=["9729713381@tmomail.net", "owner@example.test"]), \
                 self.smtp() as s:
             a = mm.Alerter("SOL-MAX", live=False)
             self.assertTrue(a.send_message("hello"))
@@ -1063,7 +1063,7 @@ class TestAlerter(unittest.TestCase):
 
     def test_is_sms_gateway(self):
         self.assertTrue(mm.Alerter._is_sms_gateway("9729713381@tmomail.net"))
-        self.assertFalse(mm.Alerter._is_sms_gateway("jackdu224@gmail.com"))
+        self.assertFalse(mm.Alerter._is_sms_gateway("owner@example.test"))
         self.assertFalse(mm.Alerter._is_sms_gateway("bot123@x.com"))
 
     def test_send_failure_never_raises(self):

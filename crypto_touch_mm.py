@@ -267,16 +267,17 @@ BALANCE_CACHE_SECS = 30          # fleet-shared shard-balance read (see shard_ca
 # Alerting (same Gmail-SMTP convention as the other bots). Recipients are a
 # comma list; a recipient with an all-digit local part (1234567890@carrier) is
 # treated as an SMS gateway: body truncated to 300 chars, no subject line.
-# Default is the user's own inbox — T-Mobile's email-to-SMS gateway
+# Default is the user's own inbox, which is the sending Gmail (no address
+# lives in the code, Jack 2026-11-26) — T-Mobile's email-to-SMS gateway
 # (9729713381@tmomail.net) has refused all mail from this account since
 # ~2026-06-29 (452 greylisting, then permanent bounces after 48h of retries;
-# see the mailer-daemon threads in jackdu224@gmail.com), so Gmail-app push
+# see the mailer-daemon threads in that inbox), so Gmail-app push
 # notifications on the phone are the delivery mechanism.
 # Without FROM/PASSWORD set, alerts are log-only.
 ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "")
 ALERT_EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD", "")
 ALERT_RECIPIENTS = [r.strip() for r in os.environ.get(
-    "CMM_ALERT_TO", "jackdu224@gmail.com").split(",") if r.strip()]
+    "CMM_ALERT_TO", ALERT_EMAIL_FROM).split(",") if r.strip()]
 ALERT_DEDUPE_SECS = 6 * 3600     # one urgent alert per (category, market) per 6h
 SMS_MAX_CHARS = 300              # carrier gateways silently drop longer bodies
 # Bots roll their daily counters/summaries at 5am CT (6am ET) — one hour

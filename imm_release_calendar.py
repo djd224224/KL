@@ -39,7 +39,15 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import incentive_mm as imm
 from incentive_mm import log
 
-UA = "Mozilla/5.0 (KL release-calendar check; contact jackdu224@gmail.com)"
+# The User-Agent is a plain name. bls.gov alone refuses one with no contact in
+# it (403, checked 2026-11-26; EIA, Census, FHFA and NASS take the plain name),
+# so a bls.gov read adds KL_UA_CONTACT -- which Jack sets himself in his user
+# environment; no address lives in the code. It is read on every fetch, from
+# the process or else HKCU\Environment, since a scheduled task does not
+# reliably inherit a user variable set after it started.
+UA = "Mozilla/5.0 (KL release-calendar check)"
+UA_CONTACT_VAR = "KL_UA_CONTACT"
+UA_CONTACT_HOSTS = ("bls.gov",)
 FETCH_TIMEOUT_SECS = 30
 FETCH_GAP_SECS = 0.5                       # between two pages of one lookup
 LOOKUP_DAYS = float(os.environ.get("IMM_RELEASE_CAL_LOOKUP_DAYS", "60"))
@@ -54,8 +62,29 @@ _DATE_RE = re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]
 _CLOCK_RE = re.compile(r"(\d{1,2}):(\d\d)\s*([ap])\.?m", re.I)
 
 
+def _ua_contact() -> str:
+    v = os.environ.get(UA_CONTACT_VAR, "").strip()
+    if v:
+        return v
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
+            return str(winreg.QueryValueEx(k, UA_CONTACT_VAR)[0] or "").strip()
+    except (OSError, ImportError):
+        return ""
+
+
+def user_agent(url: str, contact: Optional[str] = None) -> str:
+    """UA, plus "; contact ..." for a host that refuses a request without one."""
+    host = _host(url).lower()
+    if not any(host == h or host.endswith("." + h) for h in UA_CONTACT_HOSTS):
+        return UA
+    c = _ua_contact() if contact is None else contact.strip()
+    return f"{UA[:-1]}; contact {c})" if c else UA
+
+
 def fetch(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent(url)})
     with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_SECS) as r:
         return r.read().decode("utf-8", "replace")
 

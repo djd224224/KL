@@ -105,7 +105,7 @@ STATIONS: Dict[str, dict] = {
 
 HOURLY_EXP = float(os.environ.get("RAIN_FAIR_HOURLY_EXP", "0.5"))
 P_FLOOR, P_CAP = 0.02, 0.98
-UA = {"User-Agent": "KL rain_fair (jackdu224@gmail.com)"}
+UA = {"User-Agent": "KL rain_fair"}   # a plain name: NWS asks for none (no address in the code, 11/26)
 TIMEOUT = 20
 # auto-discovery of the cities Kalshi lists (see the module docstring)
 SERIES = "KXRAIN"

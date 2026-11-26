@@ -370,7 +370,7 @@ def setUpModule():
     # resting_pages fires alerter.alert(..., urgent=True) with no stub, so on
     # any shell with ALERT_EMAIL_FROM/PASSWORD set (the trading box has them)
     # every `python -m unittest test_incentive_mm` sent a real watchdog page to
-    # jackdu224@gmail.com. Nothing about the alert LOGIC is stubbed here —
+    # the user's inbox. Nothing about the alert LOGIC is stubbed here —
     # alerter.today still records every alert, which is what tests assert on.
     imm.ALERT_RECIPIENTS = []
 

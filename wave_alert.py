@@ -30,7 +30,7 @@ Without --send it prints TEXT, PUSH, SUBJECT and BODY. With --send it texts
 (sms_alert.py, capped; only for a live / not-live wave, a NEW shape held for your
 call -- Jack 2026-11-14: "for upcoming new shapes, notify me and it's my call so dont
 default to turning it on" -- or a relight of 100+ markets or a 1,000+ program jump),
-emails jackdu224@gmail.com (send_alert_email.py) and prints the PUSH line for the
+emails your inbox, the sending Gmail (send_alert_email.py), and prints the PUSH line for the
 task's PushNotification. Read-only otherwise (a relight's names take one /markets read).
 """
 from __future__ import annotations
@@ -45,7 +45,7 @@ from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIST = os.path.join(HERE, "run-logs", "incentive-mm", "post_vote_dead_books.json")
-ALERT_TO = "jackdu224@gmail.com"
+ALERT_TO = os.environ.get("ALERT_EMAIL_FROM", "")   # the inbox is the sending Gmail; no address in the code
 N_NAMES = 10
 NAME_CHARS = 60          # one name in the text
 TEXT_CHARS = 900         # sms_alert.py --long (T-Mobile delivers a long one as MMS)

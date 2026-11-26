@@ -151,8 +151,8 @@ HALT_PATH = os.path.join(gas_data.DATA_DIR, "HALT")
 
 ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "")
 ALERT_EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD", "")
-ALERT_RECIPIENTS = [r.strip() for r in os.environ.get(
-    "GAS_ALERT_RECIPIENTS", "jackdu224@gmail.com").split(",") if r.strip()]
+ALERT_RECIPIENTS = [r.strip() for r in os.environ.get(       # default: the sending Gmail
+    "GAS_ALERT_RECIPIENTS", ALERT_EMAIL_FROM).split(",") if r.strip()]
 
 
 def log(msg: str) -> None:

@@ -15863,8 +15863,10 @@ def code_change_exit_due(selected, now_utc: datetime,
 
 ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "")
 ALERT_EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD", "")
+# Alerts go to the sending Gmail, which is Jack's inbox, unless IMM_ALERT_TO
+# names others. No address lives in the code (Jack 2026-11-26).
 ALERT_RECIPIENTS = [r.strip() for r in os.environ.get(
-    "IMM_ALERT_TO", "jackdu224@gmail.com").split(",") if r.strip()]
+    "IMM_ALERT_TO", ALERT_EMAIL_FROM).split(",") if r.strip()]
 ALERT_DEDUPE_SECS = 6 * 3600
 SMS_MAX_CHARS = 300
 SUMMARY_HOUR_CT = _env_int("IMM_SUMMARY_HOUR_CT", 5)   # counters roll 6am ET

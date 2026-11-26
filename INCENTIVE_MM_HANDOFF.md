@@ -1,6 +1,6 @@
 # Kalshi Incentive-Rewards Market Maker — Handoff
 
-*Written 2026-07-10. Self-contained context for a new session. Owner: Jack (jackdu224@gmail.com).*
+*Written 2026-07-10. Self-contained context for a new session. Owner: Jack.*
 *STATUS: built, tested, dry-run verified against the live API — **NOT turned on** (no scheduled task registered, never run with --live).*
 
 ## What this is
