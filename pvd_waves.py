@@ -167,6 +167,7 @@ ARG_NOTES = {
     "--size-mult": "every size x this (tiers multiply it)",
     "--cheap-tiers": "C:X -- a side tying up <= C c a contract rests X x the size (first fit)",
     "--series-tier": "SERIES:SIDE:C:X -- a series' own tier list (restate the low tiers!)",
+    "--cost-mult": "SERIES:SIDE:C:M -- that side, while its touch costs <= C c, rests as if its market's multiple were M",
     "--side-cap": "SERIES or ALL:C:N -- a side tying up >= C c a contract rests N (0 = off: only a closing order)",
     "--twin-block": "N -- in a D/R pair, when one leg holds >= N, the other leg's same-bet side is off (0)",
     "--pin": "TICKER:N[:flat] -- flat N a side, no multipliers",
@@ -197,6 +198,7 @@ LEVERS = [
     ("--hold-max", False, "off", "you"),
     ("--cheap-tiers", True, "none: every side at the base size", "you to 5c; above 5c your yes"),
     ("--series-tier", True, "none", "your yes"),
+    ("--cost-mult", True, "none: a side rests its market's own multiple at every price", "your yes"),
     ("--size-mult", True, "x1", "your yes"),
     ("--side-cap", True, "none: sides tying up 90c+ quote like any other", "you"),
     ("--twin-block", True, "off: both legs of a D/R pair may hold the same bet", "you"),
@@ -205,7 +207,7 @@ LEVERS = [
     ("--pause-at", True, "none", "you"),
     ("--no-halts", False, "off: sweep breaker, tape trigger and toxic halts on", "your yes"),
 ]
-REPEATABLE = {"--series-tier", "--side-cap", "--pin", "--pin-series", "--pause-at"}
+REPEATABLE = {"--series-tier", "--cost-mult", "--side-cap", "--pin", "--pin-series", "--pause-at"}
 # the bot's own guards on every wave market, read live from its startup lines
 BOT_PARAM_LINES = [
     ("close clamp", "close clamp (2026-11-08):"),
@@ -1156,7 +1158,7 @@ def _setarg(a) -> int:
     if a.unset:     # with a VALUE, only that pair (one --pin of several); without, every one
         pairs = [(f, v) for f, v in pairs if not (f == a.flag and (a.value is None or v == a.value))]
     if not a.unset:
-        repeatable = a.flag in ("--series-tier", "--pin", "--pin-series", "--side-cap", "--pause-at")
+        repeatable = a.flag in REPEATABLE
         if not repeatable:
             pairs = [(f, v) for f, v in pairs if f != a.flag]
         pairs.append((a.flag, a.value if a.value is not None else "on"))
@@ -1350,7 +1352,7 @@ MIN_EVENTS = 5                      # Jack 11/08: a wave = 5+ events in one fami
 # cash pause holds a shard's dearer new orders 5 min when Kalshi refuses one for cash
 MIN_CASH0 = float(os.environ.get("PVD_MIN_CASH0", "1000"))
 AUTO_BUDGET_MAX = 50000.0
-AUTO_FORBIDDEN = ("--no-halts", "--size-mult", "--series-tier")
+AUTO_FORBIDDEN = ("--no-halts", "--size-mult", "--series-tier", "--cost-mult")
 PROBE_LOT = 10              # a 90c+ side capped at 1-9 contracts is a probe (11/07)
 # switch files in run-logs/incentive-mm: Jack's alone to create or remove
 SWITCHES = [

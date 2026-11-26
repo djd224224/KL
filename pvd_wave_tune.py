@@ -51,6 +51,12 @@ after --since, series in --series), idempotently:
                      that series' SIDE costing <= C c rests X x the size, ahead of the
                      general tiers (Jack 2026-11-07, "yes" to 10x on the 2028 Democratic
                      primaries' 1-2c bids: KXDPRESPRIMARY:bid:2:10)
+  --cost-mult SERIES:SIDE:C:M  (repeatable)
+                     that series' SIDE whose touch costs <= C c rests as if its market's own
+                     multiple were M (x M / its multiple on its tier; never lower); back to
+                     its own size once the touch leaves C (Jack 2026-11-26, the 2028 R-primary
+                     bids at a 1c wall after Kalshi's Thursday pause: "5x only on 1c though"
+                     = KXRPRESPRIMARY:bid:1:5). PVD_COST_MULT=0 turns it off
   --follow-book      set "follow_book": the bot keeps the listed limits even with a last
                      trade, and --reanchor re-anchors traded entries too (Jack 2026-11-07:
                      "Yes, fix it" -- a stale last trade held a side out of the book)
@@ -245,6 +251,10 @@ def main() -> int:
     ap.add_argument("--cheap-px", type=float, default=5.0, help="cheap = a bid touch <= this c / an ask touch >= 100 - this c")
     ap.add_argument("--series-tier", action="append", default=[],
                     help="SERIES:SIDE:C:X -- for that series a SIDE (bid/ask) costing <= C c rests X x the size, ahead of --cheap-tiers")
+    ap.add_argument("--cost-mult", action="append", default=[],
+                    help="SERIES:SIDE:C:M -- a SIDE (bid/ask) of SERIES whose touch costs <= C c rests as if its "
+                         "market's own multiple were M (never below it); back to its own once the touch leaves C "
+                         "(Jack 2026-11-26: \"5x only on 1c though\"). PVD_COST_MULT=0 turns every one off")
     ap.add_argument("--cheap-tiers", default="", help="C:X,... -- a side costing <= C c a contract rests X x the size (first tier that fits)")
     ap.add_argument("--follow-book", action="store_true",
                     help='set "follow_book" (the bot keeps the listed limits with a last trade too) and re-anchor traded entries as well')
@@ -285,7 +295,18 @@ def main() -> int:
         stiers.setdefault((ss, sd + "_size"), []).append((float(cc), float(mm)))
     for v in stiers.values():
         v.sort()
-    exclude = {s.strip() for s in (a.exclude_series or "").split(",") if s.strip()}
+    # COST MULTIPLE (--cost-mult SERIES:SIDE:C:M, Jack 2026-11-26 on the 2028 R-primary long
+    # shots, their YES bids at a 1c wall after Kalshi's Thursday pause: "5x only on 1c though"):
+    # that side, while its touch costs <= C c, rests as if the market's own multiple were M --
+    # x M / its multiple on top of its tier, never less than it would rest anyway. Price-bound:
+    # a bid back at 3-5c rests its usual size again.
+    cmults = {}                         # {(series, 'bid_size'/'ask_size'): (C, M)}
+    if os.environ.get("PVD_COST_MULT", "1").strip().lower() not in ("0", "off", "false", "no"):
+        for x in a.cost_mult:
+            ss, sd, cc, mm = (p.strip() for p in x.split(":"))
+            cmults[(ss, sd + "_size")] = (float(cc), float(mm))
+    n_cmult_sides, cmult_mk = 0, set()
+    exclude ={s.strip() for s in (a.exclude_series or "").split(",") if s.strip()}
     if a.exclude_registry:
         # the registry's waves (pvd_waves.py) tune themselves in pass 7; a catch-all pass
         # (--series ALL) must leave them alone or the two passes fight every run
@@ -740,7 +761,7 @@ def main() -> int:
                             n_up += 1
                         else:
                             n_down += 1
-            if (tiers or stiers or side_caps or a.twin_block) and t in touch:
+            if (tiers or stiers or side_caps or a.twin_block or cmults) and t in touch:
                 # CHEAP SIDES by tier (--cheap-tiers C:X,...): a side whose fill ties up c
                 # a contract -- a bid at its touch, an ask at 100 - its touch -- rests X x
                 # the market's size for the first tier with c <= C (Jack 2026-11-07:
@@ -767,6 +788,16 @@ def main() -> int:
                 if reach:
                     reach_mk.add(t)
                     n_reach_sides += len(reach)
+                # ...then the cost multiple (--cost-mult): as if this market's own multiple were M
+                cm_by = {}
+                for k, c in cost.items():
+                    cm = cmults.get((t.split("-")[0], k))
+                    if c is not None and cm and c <= cm[0] and sm > 0 and cm[1] > sm:
+                        mult[k] = mult.get(k, 1.0) * cm[1] / sm
+                        cm_by[k] = cm
+                if cm_by:
+                    cmult_mk.add(t)
+                    n_cmult_sides += len(cm_by)
                 # SIDE CAP (--side-cap SERIES:C:N, Jack 2026-11-07 on the House sweep: "its ok to
                 # quote if it's 5c of cash held but not if its 95c of cash held"): a side of SERIES
                 # whose fill ties up >= C c a contract rests N (0 = off since 1b58188). With
@@ -799,6 +830,7 @@ def main() -> int:
                                                + ((f"(cap: {capwhy[k]})" if k in capwhy else f"(cap: {cost[k]:g}c a contract)")
                                                   if k in capk else
                                                   f"(x{mult[k]:g}" + (f", tier to {tier_ext[t]:g}c" if k in reach else "")
+                                                  + (f", <= {cm_by[k][0]:g}c as x{cm_by[k][1]:g}" if k in cm_by else "")
                                                   + ")")
                                                for k in sorted(now_c)) or "none cheap")
                                   + f" {a.note}").strip()
@@ -898,6 +930,11 @@ def main() -> int:
                     f"{a.reanchor_step}c a run, held on a {a.reanchor_jump}c+ jump): {n_anch} re-anchored, "
                     f"{n_capped} capped or held, "
                     f"{n_traded} traded (guard follows the trade), {missed} missed by the read")
+        if a.cost_mult:
+            msg += ("; cost multiple (--cost-mult "
+                    + ", ".join(f"{s_}:{k_.split('_')[0]}:<={c_:g}c:x{m_:g}" for (s_, k_), (c_, m_) in sorted(cmults.items()))
+                    + f"): {n_cmult_sides} side(s) of {len(cmult_mk)} markets"
+                    if cmults else "; cost multiple: off (PVD_COST_MULT=0)")
         if abs(a.size_mult - 1.0) > 1e-9 or n_scaled or tmult:
             msg += f"; sizes x{a.size_mult:g}" + (f" ({len(tmult)} markets with their own multiple)" if tmult else "") \
                 + f": {n_scaled} re-scaled" + tmult_why

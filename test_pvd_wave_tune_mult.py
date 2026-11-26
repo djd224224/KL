@@ -179,6 +179,93 @@ class TierReachTests(unittest.TestCase):
         self.assertIn("tier file unreadable", out)
 
 
+class CostMultTests(unittest.TestCase):
+    """--cost-mult (Jack 2026-11-26 on the 2028 R-primary long shots at a 1c wall: "5x only on
+    1c though"): a side whose touch costs <= C rests as if its market's multiple were M."""
+    R1, R2 = "KXRPRESPRIMARY-28NM-TCAR", "KXRPRESPRIMARY-28TX-TCAR"
+    TIERS = ("--cheap-tiers", "2:15,7.5:15,15:6.75", "--side-cap", "ALL:90.01:300")
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.lst = os.path.join(self.d, "list.json")
+        ents = {}
+        for t in (self.R1, self.R2):
+            e = entry(size=285)
+            e.pop("bid_size")
+            ents[t] = e
+        json.dump({"markets": ents}, open(self.lst, "w"))
+        self.mf = os.path.join(self.d, "mult.json")
+        json.dump({self.R1: 2.5}, open(self.mf, "w"))       # R2 stays x1
+        self.touch = {self.R1: (1.0, 8.0, 0.0), self.R2: (1.0, 7.0, 0.0)}
+
+    def run_tune(self, extra=(), env=None):
+        mod = load()
+        mod.LIST, mod.LOCK = self.lst, os.path.join(self.d, "scan.lock")
+        mod.read_touches = lambda ts_: (dict(self.touch), 0)
+        old, sys.argv = sys.argv, ["x", "--series", "KXRPRESPRIMARY", "--since", "2026-11-13T17:30:00Z",
+                                   "--write", "--size-mult-file", self.mf, *self.TIERS, *extra]
+        old_env = os.environ.get("PVD_COST_MULT")
+        if env is not None:
+            os.environ["PVD_COST_MULT"] = env
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                self.assertEqual(mod.main(), 0)
+        finally:
+            sys.argv = old
+            if env is not None:
+                if old_env is None:
+                    os.environ.pop("PVD_COST_MULT", None)
+                else:
+                    os.environ["PVD_COST_MULT"] = old_env
+        with open(self.lst) as fh:
+            return json.load(fh)["markets"], buf.getvalue()
+
+    CM = ("--cost-mult", "KXRPRESPRIMARY:bid:1:5")
+
+    def test_a_1c_bid_rests_as_x5_whatever_its_own_multiple(self):
+        L, out = self.run_tune(self.CM)
+        # R1 at x2.5: 285 x 2.5 = 712 a side -> 1c bid 712 x 15 x 2 (as x5 = 285 x 15 x 5)
+        self.assertEqual(L[self.R1]["size"], 712)
+        self.assertEqual(L[self.R1]["bid_size"], 21360)
+        self.assertEqual(L[self.R2]["bid_size"], 21375)                     # x1 -> as x5: 285 x 15 x 5
+        self.assertEqual((L[self.R1]["ask_size"], L[self.R2]["ask_size"]), (300, 300))   # 92-93c asks: the cap
+        self.assertIn("<= 1c as x5", L[self.R1]["cheap"])
+        self.assertIn("cost multiple (--cost-mult KXRPRESPRIMARY:bid:<=1c:x5): 2 side(s) of 2 markets", out)
+
+    def test_only_at_1c_back_to_its_own_size_off_it(self):
+        self.run_tune(self.CM)
+        self.touch[self.R1] = (3.0, 8.0, 0.0)                              # the bids came back to 3c
+        L, _ = self.run_tune(self.CM)
+        self.assertEqual(L[self.R1]["bid_size"], 10680)                     # 712 x 15: x2.5 again
+        self.assertEqual(L[self.R2]["bid_size"], 21375)                     # still at 1c
+        self.touch[self.R1] = (1.5, 8.0, 0.0)                              # 1.5c is past 1c
+        L, _ = self.run_tune(self.CM)
+        self.assertEqual(L[self.R1]["bid_size"], 10680)
+
+    def test_never_lowers_a_market_already_past_m(self):
+        json.dump({self.R1: 6.0}, open(self.mf, "w"))
+        L, _ = self.run_tune(self.CM)
+        self.assertEqual(L[self.R1]["bid_size"], 25650)                     # 1710 x 15: its own x6
+
+    def test_other_series_sides_and_the_kill_switch(self):
+        L, _ = self.run_tune(("--cost-mult", "KXDPRESPRIMARY:bid:1:5"))    # another series
+        self.assertEqual(L[self.R1]["bid_size"], 10680)
+        L, _ = self.run_tune(("--cost-mult", "KXRPRESPRIMARY:ask:1:5"))    # asks only: none cost 1c
+        self.assertEqual(L[self.R1]["bid_size"], 10680)
+        L, out = self.run_tune(self.CM, env="0")
+        self.assertEqual(L[self.R1]["bid_size"], 10680)
+        self.assertIn("cost multiple: off (PVD_COST_MULT=0)", out)
+        L, out = self.run_tune()                                            # flag dropped
+        self.assertEqual(L[self.R1]["bid_size"], 10680)
+        self.assertNotIn("cost multiple", out)
+
+    def test_an_off_market_stays_off(self):
+        json.dump({self.R1: 0}, open(self.mf, "w"))
+        L, _ = self.run_tune(self.CM)
+        self.assertEqual((L[self.R1]["bid_size"], L[self.R1]["ask_size"]), (0, 0))
+
+
 
 if __name__ == "__main__":
     unittest.main()
