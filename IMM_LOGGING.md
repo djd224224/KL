@@ -224,8 +224,13 @@ read-only on it: Task Scheduler `KL imm fair-marks` (`register_imm_fair_marks.ps
 runs it every 15 minutes. It reads every `*_fair*.json` in `STATUS_DIR` and
 writes:
 
-- **`fair_marks_<UTC day>.jsonl`**, for the files of the standard shape
-  (`markets` -> ticker -> `p` or `fair`; 15 files and 4,852 markets on 11/26).
+- **`fair_marks_<UTC day>.jsonl`**, for:
+  - the files of the standard shape (`markets` -> ticker -> `p` or `fair`; 15
+    files and 4,852 markets on 11/26). A file of that shape with nothing
+    priced right now (ERCOT past its cutoff, Trump mentions between
+    speeches, Pokemon unmapped) is a family with 0 markets, not a raw file;
+  - and, since the bot view (below), ten files of other shapes: 1,157
+    markets on 11/26.
   - **When:** a row lands when the fair moves 1 point or more, when the mid
     moves 1c or more, or after 30 minutes (an hour without a book).
   - **Fields:** `ts`, `family` (the file name less `_fair`), `ticker`, `p`
@@ -239,19 +244,58 @@ writes:
   (`ticker`, `family`, `result` yes/no, `close_ts`, `status`). The result is
   looked up when the market leaves its model's file (every 6 hours, for up to
   14 days), or seen in the hourly reads.
-- **`fair_raw_<UTC day>.jsonl.gz`:** every other fair file (Vercel, Carbon
-  Arc, OpenRouter, the temperature grids ...), archived whole when it changes.
-  This happens at most hourly, for files up to 3 MB. Their history exists
-  before anyone writes their extractor.
+- **`fair_raw_<UTC day>.jsonl.gz`:** every fair file not of the standard
+  shape (Vercel, Carbon Arc, OpenRouter, the temperature grids ...), archived
+  whole when it changes. This happens at most hourly, for files up to 3 MB.
+  It keeps what the marks drop (mu, sigma, the error sample), and the history
+  of the files nothing prices yet.
 - **`fair_marks_state.json`:** the last mark per market, the result lookups,
   and the last run (`python imm_fair_marks.py status`).
   - Each run appends a one-line summary to `fair-marks-task.log`.
   - A run that crashes, or reads no fair file, writes a `FAILED` line there.
     The review's task-log scan reports that line.
 
+**The bot's view (later on 11/26).** Ten files price a distribution or an
+event, not each market: Carbon Arc's mu and sigma per series, OpenRouter's per
+event, Vercel's error sample, and the temperature and YouTube writers'
+events. The bot turns them into a market's YES probability with its own
+functions, so the task imports the bot's module the way
+`imm_model_coverage.py` does (`imm_quote_gaps` first, which mirrors the
+launcher's env) and asks those functions.
+- **Which markets:** the tickers of the bot's newest hourly
+  `selection_snapshot` (about 4,300 candidates) and of the cycle log. The
+  temperature and YouTube families also price the markets their own files
+  list.
+- **When a market is priced:** when the bot's fair function returns a fair
+  (`ca_fair_p`, `or_fair_c`, `rain_fair_p`), or when its gate passes with no
+  book given. These include `share_gate_reason`, `vercel_gate_reason` (the
+  MODEL, `vercel_fair_p`, not the blend with the book's mid), the
+  temperature gates and the YouTube gates. A stale read, a decided strike, a
+  live period or a complete window gets no mark, because the bot uses no fair
+  there.
+- **Checked on 11/26:**
+  - 866 Carbon Arc and 9 OpenRouter markets, re-derived from the raw JSON
+    with no bot code, matched exactly.
+  - 107 Vercel fairs the running bot logged in `guard_skips` were within
+    0.72c; 75 were identical. The rest were strikes whose file was rewritten
+    after the bot logged them.
+- **Not priced, so raw only:**
+  - datacenter (a count gate, no fair);
+  - gasbuddy (retired);
+  - Carbon Arc's array shadow;
+  - the per-city rain dailies. The station each one's rules name is learned
+    by the running bot, so only the KXRAIN dailies are priced.
+- **Safety:** the bot's globals each pass sets (the file path, the loaded
+  state) are put back after it. A failure writes `bot view <family> FAILED`
+  to the task log, and the standard families' marks still land.
+  `IMM_FAIR_MARKS_BOT_VIEW=0` turns off this step alone. Tests never import
+  the bot (`imm_quote_gaps` would change the env for the rest of a test run),
+  so they hand `run()` a fake.
+
 **Size:** the first run wrote 4,852 marks (1.0 MB). After that it is
-ESTIMATED at 30-35 MB a day, nearly all of it the 30- and 60-minute repeats.
-The review's data-health table measures it daily.
+ESTIMATED at 30-35 MB a day, and about 6 MB a day more with the bot view
+(ESTIMATED: ~1,160 markets, mostly hourly rows). Nearly all of it is the 30-
+and 60-minute repeats. The review's data-health table measures it daily.
 
 **Scoring:** the review scores every model on these files
 (`imm_fair_scorecard.py`, evidence section 13) three ways:
