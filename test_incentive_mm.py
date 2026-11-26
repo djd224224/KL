@@ -46640,6 +46640,42 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual(run(150.0, 95.0, fav=True)[1], [("ask", 97, 150.0)])
         self.assertEqual(run(150.0, 98.0, fav=True)[1], [("ask", 98, 150.0)])   # waits at its cost
 
+    def test_a_close_is_never_held_back_by_its_events_room(self):
+        """Jack 2026-11-26: "only fix bug 3" -- a held wave market's closing
+        order rests whatever its event's net cap has left. The bot's long on a
+        sibling (KXSENATENOM-PAR-28: 4,165 YES on GRES / SGAR) left a short's
+        buy-back (BFIT, SPER) no room from 11/15; a short sibling did the same
+        to a long's sell-back"""
+        sib = "KXGOOD-99DEC31-Z"                 # same event, not quoted
+
+        def run(pos, avg, sib_pos=0.0, sib_avg=1.0):
+            _clean_persist()
+            self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}},
+                        stop=datetime.now(timezone.utc) - timedelta(hours=2))
+            c = FakeClient()
+            c.programs = [p for p in c.programs if p["market_ticker"] != self.T]   # no program
+            bot = IncentiveMarketMaker(client=c, live=False)
+            bot.pnl.pos[self.T], bot.pnl.avg[self.T] = pos, avg
+            c.positions[self.T] = pos
+            if sib_pos:
+                bot.pnl.pos[sib], bot.pnl.avg[sib] = sib_pos, sib_avg
+                c.positions[sib] = sib_pos
+            open(imm.UNWIND_WAVES_ONLY_FILE, "w").close()
+            try:
+                with mock.patch.object(imm, "log", lambda *a, **k: None):
+                    bot.run_cycle()
+            finally:
+                os.remove(imm.UNWIND_WAVES_ONLY_FILE)
+            return bot, sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                               for o in bot.state.sim_orders.values() if o["ticker"] == self.T)
+        over = 10 * imm.event_cap_contracts("KXGOOD-99DEC31")
+        self.assertEqual(run(-80.0, 45.0)[1], [("bid", 45, 80.0)])             # as before
+        bot, orders = run(-80.0, 45.0, sib_pos=over)                            # the sibling's long
+        self.assertIn(self.T, bot._wave_unwind)
+        self.assertEqual(orders, [("bid", 45, 80.0)])                           # still buys back
+        self.assertEqual(run(150.0, 70.0, sib_pos=-over, sib_avg=99.0)[1],      # ...and the mirror
+                         [("ask", 70, 150.0)])
+
     def test_wave_unwind_not_at_breakeven_but_never_baited(self):
         """Jack 2026-11-12: "unwind, doesnt have to be at breakeven but dont
         lead", then "and make sure unwind positions also dont get baited" -- a

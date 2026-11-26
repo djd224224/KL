@@ -45814,6 +45814,20 @@ class IncentiveMarketMaker:
                                        else pvd.get("bsize", pvd["size"]))
                     side_max_ask = min(side_max_ask, _pv_a if "ask" in _pv_off
                                        else pvd.get("asize", pvd["size"]))
+            # A CLOSE IS NEVER HELD BACK BY ITS EVENT'S ROOM (Jack 2026-11-26: "only
+            # fix bug 3"): a reduce-only market's reducing side may take room for the
+            # whole position whatever the event's net cap has left. The cap counts
+            # NET YES across the event, so a long on one sibling used up the room a
+            # short's buy-back on another needed: KXSENATENOM-PAR-28-BFIT (short 200
+            # at 8.2c, book 27x29) and -SPER rested no closing bid since 11/15, the
+            # bot's 4,165 YES on GRES / SGAR leaving the event no buy room. The
+            # reduce-only clamp below keeps the side to the position, so it only
+            # ever flattens this market; what it rests is still charged to the
+            # event's room for the siblings after it.
+            if reduce_only and own_pos <= -1:
+                share_buy = max(share_buy, -own_pos)
+            elif reduce_only and own_pos >= 1:
+                share_sell = max(share_sell, own_pos)
             room_buy = min(pos_room_buy, share_buy, side_max_bid)
             room_sell = min(pos_room_sell, share_sell, side_max_ask)
             fam_m = applied_mention_mult(meta.series) * home_far_mult(t)
