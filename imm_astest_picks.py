@@ -467,7 +467,7 @@ def candidate_reason(t: str, info: dict, quoted: set, incumbents: set,
         return "quoted"
     if gaps.ticker_day_over(t, now):
         return "day over"
-    if imm.astest_member_family(series) in ("BB", "VH"):
+    if imm.astest_member_family(series) in ("BB", "VH", "MLB"):
         return "AS family"
     gas = _GAS_STATE_RE.fullmatch(series) is not None
     if any(t.startswith(p) for p in imm.SERIES_BLOCKLIST_PREFIXES) \

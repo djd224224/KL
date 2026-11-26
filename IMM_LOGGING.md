@@ -178,7 +178,8 @@ held guard re-emits `enter` with `prev=null`, which does not mean a new
 episode.
 
 Guards: `manual_grace`, `manual_yield`, `scan_evicted`, `cutoff_passed`,
-`aaa_blackout`, `closing`, `breaker_cooldown`, `event_fill_tripwire`,
+`aaa_blackout`, `astest_window` (an AS family outside its quote window: MLB
+next team's 00:00-07:00 ET nights, VoteHub's), `closing`, `breaker_cooldown`, `event_fill_tripwire`,
 `scan_fill_tripwire`, `fill_burst`, `blind`, `event_depth_trip`,
 `event_depth_hold`, `one_sided_breaker`, `scan_mid_tripwire`, `move_breaker`,
 `crossed`, `wide_spread`, `band_both_out`, `cannot_qualify`, `rain_fair`,

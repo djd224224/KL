@@ -43804,7 +43804,7 @@ class TestOpportunisticAsTestBillboardVoteHub(unittest.TestCase):
             st["checked"] = 0.0
 
     def test_admitted_while_live_and_each_family_stops_alone(self):
-        self.assertEqual(imm.ASTEST_FAMILIES, ("BB", "VH", "PICK"))
+        self.assertEqual(imm.ASTEST_FAMILIES, ("BB", "VH", "PICK", "MLB"))
         self.assertEqual(imm.ASTEST_BB_SERIES, {"KXBBSINGLE"})
         self.assertEqual(imm.ASTEST_VH_SERIES, {"KXVHGCB"})
         self.assertEqual(imm.astest_family("KXBBSINGLE"), "BB")
@@ -44006,6 +44006,186 @@ class TestOpportunisticAsTestBillboardVoteHub(unittest.TestCase):
         self.assertTrue(bot._guard_now[self.BB]["inputs"]["family"])
 
 
+class TestOpportunisticAsTestMlbNights(unittest.TestCase):
+    """Jack 2026-11-26: "Pilot MLB nights" -- KXMLBNEXTTEAM quoted only
+    00:00-07:00 ET, at x3 literal on the AS test's stops, to the programs' end
+    (ASTEST_MLB_UNTIL), its payout-floor projection counting the window's
+    hours alone. The end is patched far away so the fixture does not age out;
+    fixture events 2068 (EST)."""
+
+    EV = "KXMLBNEXTTEAM-68GSPRINGER4"
+    T = "KXMLBNEXTTEAM-68GSPRINGER4-TOR"
+
+    def setUp(self):
+        _clean_persist()
+        for p in (mock.patch.dict(imm._astest_family_stop["MLB"],
+                                  {"checked": 0.0, "stopped": False}),
+                  mock.patch.object(imm, "ALLOWLIST_ONLY", True),
+                  mock.patch.object(imm, "ASTEST_MLB_UNTIL_TS", float("inf"))):
+            p.start()
+            self.addCleanup(p.stop)
+        stop = os.path.join(imm.STATUS_DIR, imm.ASTEST_MLB_STOP_FILE)
+        self.addCleanup(lambda s=stop: os.path.exists(s) and os.remove(s))
+
+    def _stop(self):
+        with open(os.path.join(imm.STATUS_DIR, imm.ASTEST_MLB_STOP_FILE), "w") as fh:
+            fh.write("stop")
+        imm._astest_family_stop["MLB"]["checked"] = 0.0
+
+    def test_admitted_to_its_end_and_out_on_its_stop_file(self):
+        self.assertEqual(imm.ASTEST_MLB_SERIES, {"KXMLBNEXTTEAM"})
+        self.assertEqual(imm.ASTEST_MLB_UNTIL, utc(2026, 12, 3, 5, 0))
+        self.assertEqual(imm.astest_family("KXMLBNEXTTEAM"), "MLB")
+        self.assertTrue(imm.astest_new_series("KXMLBNEXTTEAM"))
+        for t in (self.T, self.EV):
+            self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+        # the other next-team series stay out
+        for t in ("KXNEXTTEAMMLB-26PALONSO-NYM", "KXNFLNEXTTEAM-26JTAYLOR28-IND",
+                  "KXMLBNEXTTEAMX-26GSPRINGER4-TOR"):
+            self.assertIsNone(imm.astest_family(imm.series_of(t)), t)
+            self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+        # past its end: no member, nothing admitted
+        with mock.patch.object(imm, "ASTEST_MLB_UNTIL_TS", time.time() - 1):
+            self.assertIsNone(imm.astest_member_family("KXMLBNEXTTEAM"))
+            self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+            self.assertIsNone(imm.pilot_budget_key(self.T))
+        # the stop file: out, its member still a member (positions ride)
+        self._stop()
+        self.assertIsNone(imm.astest_family("KXMLBNEXTTEAM"))
+        self.assertEqual(imm.astest_member_family("KXMLBNEXTTEAM"), "MLB")
+        self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+        os.remove(os.path.join(imm.STATUS_DIR, imm.ASTEST_MLB_STOP_FILE))
+        imm._astest_family_stop["MLB"]["checked"] = 0.0
+        self.assertTrue(IncentiveMarketMaker._allowed(self.T))
+        # the kill switches: the family's, or every AS family's
+        with mock.patch.object(imm, "ASTEST_MLB_ENABLE", False):
+            self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+            self.assertNotIn(imm.ASTEST_MLB_HALT_KEY, imm.pilot_halt_keys())
+        with mock.patch.object(imm, "ASTEST_ENABLE", False):
+            self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+
+    def test_quotes_00_to_07_et_every_day_and_nowhere_else(self):
+        self.assertEqual(imm.ASTEST_MLB_WINDOW_ET, ("00:00", "07:00"))
+        ov = imm.SERIES_OVERRIDES["KXMLBNEXTTEAM"]
+        self.assertEqual(ov.blackout_et, ("07:00", "00:00"))
+        self.assertFalse(ov.blackout_weekdays_only)
+        self.assertTrue(ov.safe_join)
+        # (EST: ET = UTC-5)
+        for now, shut in ((utc(2026, 11, 27, 4, 59), True),            # Thu 23:59 ET
+                          (utc(2026, 11, 27, 5, 0), False),            # Fri 00:00 ET
+                          (utc(2026, 11, 27, 11, 59), False),          # 06:59 ET
+                          (utc(2026, 11, 27, 12, 0), True),            # 07:00 ET
+                          (utc(2026, 11, 27, 17, 0), True),            # 12:00 ET
+                          (utc(2026, 11, 28, 8, 0), False),            # Sat 03:00 ET
+                          (utc(2026, 11, 29, 20, 0), True)):           # Sun 15:00 ET
+            self.assertEqual(imm.series_in_blackout("KXMLBNEXTTEAM", now), shut, now)
+        self.assertTrue(imm.astest_window_series("KXMLBNEXTTEAM"))
+        self.assertIn("00:00-07:00 ET only, to 2026-12-03 05:00Z",
+                      imm.ASTEST_WINDOW_NOTE["MLB"])
+
+    def test_x3_literal_sizes_caps_and_its_own_loss_budget(self):
+        saturday_night = utc(2068, 12, 1, 7, 0)              # Sat 02:00 ET
+        s = "KXMLBNEXTTEAM"
+        self.assertEqual(imm.ASTEST_MLB_SIZE_MULT, 3.0)
+        self.assertEqual(imm.series_levels(s), imm.scale_levels(imm.LEVELS, 3.0))
+        self.assertEqual(imm.series_max_position(s), 150.0)
+        self.assertEqual(imm.event_cap_contracts(self.EV), 450.0)
+        self.assertEqual(imm.ASTEST_MLB_BURST_CONTRACTS, 300.0)
+        self.assertEqual(imm.ASTEST_MLB_FILL_PAUSE_MIN, 15.0)
+        # x1 by the clock on top of the literal x3: no quiet-hours x2, no
+        # Saturday or yield size, out of the size test
+        self.assertTrue(imm.is_daily_series(s))
+        self.assertEqual(imm.hour_size_mult(s, saturday_night), 1.0)
+        self.assertFalse(imm.yield_size_eligible(s))
+        self.assertIsNone(imm.size_test_arm(s))
+        # its own $100 budget
+        self.assertEqual(imm.pilot_budget_key(self.T), imm.ASTEST_MLB_HALT_KEY)
+        self.assertEqual(imm.pilot_halt_limit(imm.ASTEST_MLB_HALT_KEY), 100.0)
+        self.assertIn(imm.ASTEST_MLB_HALT_KEY, imm.pilot_halt_keys())
+        for k in ("ASTEST_MLB_ENABLE", "ASTEST_MLB_SERIES", "ASTEST_MLB_WINDOW_ET",
+                  "ASTEST_MLB_UNTIL", "ASTEST_MLB_SIZE_MULT", "ASTEST_MLB_MAX_POSITION",
+                  "ASTEST_MLB_EVENT_CAP", "ASTEST_MLB_DAILY_LOSS",
+                  "ASTEST_MLB_BURST_CONTRACTS"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def test_the_payout_floor_counts_the_window_hours_alone(self):
+        # any 24 hours hold 7 of the window's: 17/24 of the walk at 0
+        start = utc(2026, 11, 27, 14, 17)                    # Fri 09:17 ET
+        prof = dict(imm.size_mult_profile("KXMLBNEXTTEAM", start, 1.0))
+        self.assertAlmostEqual(prof[0.0], 17 / 24, places=9)
+        self.assertAlmostEqual(prof[1.0], 7 / 24, places=9)
+        prof = dict(imm.size_mult_profile("KXMLBNEXTTEAM", start, 3.0))
+        self.assertAlmostEqual(prof[0.0], 17 / 24, places=9)
+        # VoteHub's nights the same way (9 window hours); a family without a
+        # window and a series outside the test are untouched
+        prof = dict(imm.size_mult_profile("KXVHGCB", start, 1.0))
+        self.assertAlmostEqual(prof[0.0], 15 / 24, places=9)
+        self.assertNotIn(0.0, dict(imm.size_mult_profile("KXBBSINGLE", start, 1.0)))
+        self.assertNotIn(0.0, dict(imm.size_mult_profile("KXGOOD", start, 1.0)))
+        # past the pilot's end the series is no member: no window weighting
+        with mock.patch.object(imm, "ASTEST_MLB_UNTIL_TS", time.time() - 1):
+            self.assertNotIn(0.0, dict(imm.size_mult_profile("KXMLBNEXTTEAM", start, 1.0)))
+        # the bot's own projection: 7/24 of the live estimate over a day (a
+        # day the clocks change holds 6 or 8 window hours: the delta)
+        bot = self._bot()
+        meta = MarketMeta(ticker=self.T, event_ticker=self.EV, series="KXMLBNEXTTEAM",
+                          dollars_per_day=100.0,
+                          program_end=datetime.now(timezone.utc) + timedelta(days=1),
+                          target_size=1000.0, discount_factor=0.5, cutoff=None,
+                          close_time=None)
+        self.assertTrue(bot._estimate_candidate_yield(meta, []))
+        self.assertGreater(meta.est_dollars_per_day, 0.0)
+        self.assertAlmostEqual(meta.floor_dollars_per_day / meta.est_dollars_per_day,
+                               7 / 24, delta=1.01 / 24)
+        self.assertTrue(meta.floor_mult_profile.startswith("0"), meta.floor_mult_profile)
+
+    def _bot(self):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": "2068-12-03T04:59:00Z",
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def test_quoted_in_the_window_aside_outside_it_and_after_a_fill(self):
+        quotes = TestOpportunisticAsTestBillboardVoteHub._quotes
+        inside = mock.patch.object(imm, "series_in_blackout", lambda s, n: False)
+        inside.start()
+        bot = self._bot()
+        bot.run_cycle()
+        inside.stop()
+        self.assertNotEqual(quotes(bot, self.T), [])
+        # outside the window: every order cancelled, the market kept
+        with mock.patch.object(imm, "series_in_blackout", lambda s, n: True):
+            bot.run_cycle()
+        self.assertEqual(quotes(bot, self.T), [])
+        self.assertEqual(bot._guard_now[self.T]["guard"], "astest_window")
+        self.assertIn(self.T, bot.state.selected)
+        # back inside: quoting again; our fill stands the event aside 15 min
+        with mock.patch.object(imm, "series_in_blackout", lambda s, n: False):
+            bot.run_cycle()
+            self.assertNotEqual(quotes(bot, self.T), [])
+            now = time.time()
+            bot._sweep_note_fill({"order_id": "o-ws", "market_ticker": self.T,
+                                  "count_fp": "3.00", "ts_ms": int(now * 1000),
+                                  "is_taker": False}, now)
+            self.assertAlmostEqual(bot.state.astest_fill_pause_until[self.EV],
+                                   now + 900, delta=1)
+            bot.run_cycle()
+            self.assertEqual(quotes(bot, self.T), [])
+            self.assertEqual(bot._guard_now[self.T]["guard"], "astest_fill_pause")
+
+
 class TestOpportunisticAsTestDailyPicks(unittest.TestCase):
     """Jack 2026-10-27: "Turn back on opportunistic bot but now pick 5
     distinct events each day, optimizing for likelihood of profitability,
@@ -44052,7 +44232,7 @@ class TestOpportunisticAsTestDailyPicks(unittest.TestCase):
         imm._astest_family_stop["PICK"]["checked"] = 0.0
 
     def test_the_file_admits_each_picked_event_alone(self):
-        self.assertEqual(imm.ASTEST_FAMILIES, ("BB", "VH", "PICK"))
+        self.assertEqual(imm.ASTEST_FAMILIES, ("BB", "VH", "PICK", "MLB"))
         self.assertFalse(IncentiveMarketMaker._allowed(self.T))
         self.assertTrue(IncentiveMarketMaker._blocked(self.GAS))
         self._write([{"event": self.EV},

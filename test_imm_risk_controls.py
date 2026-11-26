@@ -389,8 +389,12 @@ class ClearerBlockTests(unittest.TestCase):
                   _guard("move_breaker", "KXRAIN-A"), _guard("breaker_cooldown", "KXRAIN-A"),
                   _guard("twk_halt", "KXTS-A"), _guard("manual_yield", "KXATTY-A"),
                   _guard("ust_blackout", "KXUST-A"), _guard("brand_new_gate", "KXNEW-A"),
-                  _guard("band_both_out", "KXB-A")]
+                  _guard("band_both_out", "KXB-A"),
+                  # MLB next team outside its 00:00-07:00 ET window (2026-11-26)
+                  _guard("astest_window", "KXMLBNEXTTEAM-A")]
         rows = _by(rc.build_rows(_ev(guards=guards), _ctx()))
+        self.assertIn("AS quote windows 1",
+                      rows["Release pauses (CPI, AAA, Treasury, state stats)"]["impact"])
         self.assertEqual(rows["Fair-value & data gates"]["impact"],
                          "3 markets: Vercel 2 · YouTube weekly 1")
         self.assertEqual(rows["Live games & news holds"]["impact"], "1 market: leagues live 1")

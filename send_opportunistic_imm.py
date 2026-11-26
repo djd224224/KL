@@ -499,13 +499,16 @@ def _astest_knob(fam: str, name: str, default=None):
 
 
 def astest_family_of(ticker_or_event: str):
-    """"BB" | "VH" | "GAS" | None -- the AS test family of a market (or
-    event)."""
+    """"BB" | "VH" | "MLB" | "GAS" | None -- the AS test family of a market
+    (or event). MLB next team's nights (2026-11-26) by its series, whatever
+    the pilot's end date says, so its events stay its own after it ends."""
     series = ticker_or_event.split("-")[0]
     if series in _astest_knob("BB", "SERIES", ()):
         return "BB"
     if series in _astest_knob("VH", "SERIES", ()):
         return "VH"
+    if series in _astest_knob("MLB", "SERIES", ()):
+        return "MLB"
     if series in _astest_knob("GAS", "SERIES", ()):
         d = imm.parse_event_date(ticker_or_event)
         if d is not None and d.astimezone(imm.ET).date().isoformat() >= ASTEST_GAS_FIRST_DAY:
@@ -522,7 +525,7 @@ def astest_status(state: dict, now_utc, status_dir=None) -> str:
     halted = state.get("twk_halt_day") or {}
     enabled = getattr(imm, "ASTEST_ENABLE", False)
     parts = []
-    for fam in ("BB", "VH", "GAS"):
+    for fam in ("BB", "VH", "MLB", "GAS"):
         if fam == "GAS":
             what = "gas states " + "/".join(getattr(imm, "ASTEST_GAS_STATES", ()))
             w = _astest_knob(fam, "WINDOW_ET", ())
@@ -536,8 +539,11 @@ def astest_status(state: dict, now_utc, status_dir=None) -> str:
             on = enabled and _astest_knob(fam, "ENABLE", False)
             stop = _astest_knob(fam, "STOP_FILE", "")
         stop_path = os.path.join(status_dir, stop) if stop else ""
+        until = _astest_knob(fam, "UNTIL", None)       # MLB next team's end
         if not on:
             now_txt = "OFF"
+        elif until is not None and now_utc >= until:
+            now_txt = f"ENDED {until.astimezone(imm.ET):%b %d}"
         elif stop_path and os.path.exists(stop_path):
             since = datetime.fromtimestamp(os.path.getmtime(stop_path), timezone.utc)
             now_txt = f"STOPPED since {since.astimezone(imm.ET):%b %d} ({stop})"
@@ -1222,6 +1228,7 @@ def build_report(now_utc):
     cum_rows = []
     for key, name in (("finecon", "FINECON"), ("scan", "OPEN SCAN"),
                       ("astest:BB", "AS: BILLBOARD"), ("astest:VH", "AS: VOTEHUB"),
+                      ("astest:MLB", "AS: MLB NIGHTS"),
                       ("astest:GAS", "AS: GAS STATES"), ("picks", "DAILY PICKS")):
         b = cum_by_tier.get(key)
         if not b:

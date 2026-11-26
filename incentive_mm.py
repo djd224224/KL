@@ -2799,18 +2799,24 @@ def size_mult_profile(series: str, start_utc: datetime,
     exclusions, all of it, because this IS hour_size_mult sampled once per
     ET hour (ET hour boundaries are UTC hour boundaries). The walk is capped
     at FLOOR_PROFILE_MAX_DAYS, whose mix then stands for a longer window.
-    An empty window reports the live multiplier alone."""
+    An empty window reports the live multiplier alone. An AS family quoted
+    only inside a window (astest_window_series: VoteHub, MLB next team,
+    2026-11-26) carries 0 for every hour outside it -- it rests nothing
+    then, so those hours earn nothing toward the payout floor."""
     if horizon_days <= 0:
         return [(hour_size_mult(series, start_utc), 1.0)]
     remaining = min(horizon_days, max(FLOOR_PROFILE_MAX_DAYS, 1.0 / 24)) * 24.0
     weights: Dict[float, float] = {}
+    # read at call time: defined further down
+    win = globals().get("astest_window_series", lambda s: False)(series)
     t = start_utc
     while remaining > 1e-9:
         nxt = t.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         step = min(remaining, (nxt - t).total_seconds() / 3600.0)
         if step <= 0:
             step = min(remaining, 1.0)
-        m = hour_size_mult(series, t + timedelta(hours=step / 2.0))
+        mid = t + timedelta(hours=step / 2.0)
+        m = 0.0 if (win and series_in_blackout(series, mid)) else hour_size_mult(series, mid)
         weights[m] = weights.get(m, 0.0) + step
         t += timedelta(hours=step)
         remaining -= step
@@ -13182,7 +13188,7 @@ def astest_blackout(window: Tuple[str, str]) -> Tuple[str, str]:
 #   20:00-05:00 ET, ASTEST_VH_WINDOW_ET (blackout_et, every day), and each
 #   event is out at 05:00 ET on its read day (event_day_cutoff_et): one
 #   overnight per event, the one before its read.
-ASTEST_FAMILIES = ("BB", "VH", "PICK")  # the gas family keeps its own wiring above
+ASTEST_FAMILIES = ("BB", "VH", "PICK", "MLB")  # the gas family keeps its own wiring above
 ASTEST_BB_ENABLE = os.environ.get("IMM_ASTEST_BB_ENABLE", "1") == "1"
 ASTEST_BB_SERIES = frozenset(
     s.strip() for s in os.environ.get("IMM_ASTEST_BB_SERIES", "KXBBSINGLE").split(",")
@@ -13265,6 +13271,56 @@ ASTEST_PICK_BURST_WINDOW_MIN = _env_float("IMM_ASTEST_PICK_BURST_WINDOW_MIN", 15
 ASTEST_PICK_BURST_PAUSE_MIN = _env_float("IMM_ASTEST_PICK_BURST_PAUSE_MIN", 30.0)
 ASTEST_PICK_HALT_KEY = "ASTEST:PICK"
 ASTEST_PICK_FAMILY_KEY = "*PICK"
+# ---- FAMILY 5: MLB NEXT TEAM, NIGHTS ONLY (Jack 2026-11-26: "Pilot MLB
+# nights", on "pilot MLB next team on nights only through Dec 3, or leave it
+# off?"). KXMLBNEXTTEAM-26<PLAYER>: "<player>'s next team before Dec 3, 2026:
+# <club>", a market per club for each of 18 free agents (Springer, Arozarena,
+# Gausman, Chisholm, Imanaga ...); programs 11/26 05:45Z to 12/03 04:59Z at
+# $442.86 an event a day, $7,971/day, the biggest pool the 11/26 gap scans
+# left unquoted. The family watch's insider rule calls the series DON'T QUOTE
+# (the player's camp knows a signing first). The 11/26 tape study (45 days of
+# public trades over 31 headline-driven series: scratchpad tape_open.py,
+# memory project_imm_overnight_blocked_pools_nov25) found this family's news
+# lands by day: of its 14 hourly mid moves of 15c or more, one came between
+# 00:00 and 07:00 ET (three at 21-22 ET), and 20:00-07:00 ET makers marked
+# +0.9c a contract at +1h against -1.3c by day. So it quotes ONLY 00:00 to
+# 07:00 ET, ASTEST_MLB_WINDOW_ET (blackout_et, every day), until
+# ASTEST_MLB_UNTIL (the programs' end), at x3 literal like VoteHub's nights --
+# at x1 a 7-hour window leaves most markets under Kalshi's $1 minimum (the
+# dashboard's floor-aware estimate, all day: $31/day at x1, $76 at x3) --
+# under the AS test's stops: 150 a market, 450 an event, a $100 family loss
+# halt (budget ASTEST:MLB), a 15-minute event pause after our fill (a signing
+# reprices every club of its player at once), the burst breaker, safe-join,
+# and the stop file astest_mlb_stop.txt. Positions ride to settlement. The
+# payout-floor projection counts the hours outside the window as earning
+# nothing (astest_window_series in size_mult_profile), so a market is admitted
+# only if seven hours a night can reach the payout bar.
+ASTEST_MLB_ENABLE = os.environ.get("IMM_ASTEST_MLB_ENABLE", "1") == "1"
+ASTEST_MLB_SERIES = frozenset(
+    s.strip() for s in os.environ.get("IMM_ASTEST_MLB_SERIES", "KXMLBNEXTTEAM").split(",")
+    if s.strip())
+ASTEST_MLB_STOP_FILE = "astest_mlb_stop.txt"                    # in STATUS_DIR
+ASTEST_MLB_LABEL = "MLB next team"
+ASTEST_MLB_WINDOW_ET = tuple(os.environ.get(
+    "IMM_ASTEST_MLB_WINDOW_ET", "00:00-07:00").split("-"))
+# the pilot's end: the programs close 12/03 04:59Z; from this instant the
+# series is no family member, so nothing new rests ("" = no end)
+_astest_mlb_until = os.environ.get(
+    "IMM_ASTEST_MLB_UNTIL", "2026-12-03T05:00:00+00:00").strip()
+ASTEST_MLB_UNTIL: Optional[datetime] = (
+    datetime.fromisoformat(_astest_mlb_until) if _astest_mlb_until else None)
+ASTEST_MLB_UNTIL_TS = ASTEST_MLB_UNTIL.timestamp() if ASTEST_MLB_UNTIL else float("inf")
+ASTEST_MLB_SIZE_MULT = max(0.0, _env_float("IMM_ASTEST_MLB_SIZE_MULT", 3.0))
+ASTEST_MLB_MAX_POSITION = _env_float("IMM_ASTEST_MLB_MAX_POSITION", 50.0 * ASTEST_MLB_SIZE_MULT)
+ASTEST_MLB_EVENT_CAP = _env_float("IMM_ASTEST_MLB_EVENT_CAP", 150.0 * ASTEST_MLB_SIZE_MULT)
+ASTEST_MLB_DAILY_LOSS = _env_float("IMM_ASTEST_MLB_DAILY_LOSS", 100.0)
+ASTEST_MLB_FILL_PAUSE_MIN = max(0.0, _env_float("IMM_ASTEST_MLB_FILL_PAUSE_MIN", 15.0))
+ASTEST_MLB_BURST_CONTRACTS = _env_float("IMM_ASTEST_MLB_BURST_CONTRACTS",
+                                        100.0 * ASTEST_MLB_SIZE_MULT)
+ASTEST_MLB_BURST_WINDOW_MIN = _env_float("IMM_ASTEST_MLB_BURST_WINDOW_MIN", 15.0)
+ASTEST_MLB_BURST_PAUSE_MIN = _env_float("IMM_ASTEST_MLB_BURST_PAUSE_MIN", 30.0)
+ASTEST_MLB_HALT_KEY = "ASTEST:MLB"
+ASTEST_MLB_FAMILY_KEY = "*MLB"
 # the picks in force (load_astest_picks): series -> its picked event, and the
 # series set the family hooks read
 ASTEST_PICK_EVENTS: Dict[str, str] = {}
@@ -13276,7 +13332,9 @@ ASTEST_WINDOW_NOTE = {
     "VH": (f"{'-'.join(ASTEST_VH_WINDOW_ET)} ET only, out at "
            f"{ASTEST_VH_WINDOW_ET[1]} ET on the read day"),
     "PICK": (f"the events in {ASTEST_PICK_FILE} (imm_astest_picks.py, daily; "
-             f"lapse after {ASTEST_PICK_MAX_AGE_H:g}h)")}
+             f"lapse after {ASTEST_PICK_MAX_AGE_H:g}h)"),
+    "MLB": (f"{'-'.join(ASTEST_MLB_WINDOW_ET)} ET only"
+            + (f", to {ASTEST_MLB_UNTIL:%Y-%m-%d %H:%M}Z" if ASTEST_MLB_UNTIL else ""))}
 _astest_family_stop: Dict[str, Dict[str, Any]] = {
     f: {"checked": 0.0, "stopped": False} for f in ASTEST_FAMILIES}
 
@@ -13301,10 +13359,10 @@ def astest_family_stopped(family: str) -> bool:
 
 
 def astest_member_family(series: str) -> Optional[str]:
-    """"BB" / "VH" / "PICK" for a series of a new family while it is on --
-    membership alone, the stop file aside (the gas family:
+    """"BB" / "VH" / "PICK" / "MLB" for a series of a new family while it is
+    on -- membership alone, the stop file aside (the gas family:
     astest_gas_member). On the budget and cap paths for every ticker, so
-    plain lookups."""
+    plain lookups (MLB next team: and only until ASTEST_MLB_UNTIL)."""
     if not ASTEST_ENABLE:
         return None
     if ASTEST_BB_ENABLE and series in ASTEST_BB_SERIES:
@@ -13313,12 +13371,15 @@ def astest_member_family(series: str) -> Optional[str]:
         return "VH"
     if ASTEST_PICK_ENABLE and series in ASTEST_PICK_SERIES:
         return "PICK"
+    if ASTEST_MLB_ENABLE and series in ASTEST_MLB_SERIES \
+            and time.time() < ASTEST_MLB_UNTIL_TS:
+        return "MLB"
     return None
 
 
 def astest_family(series: str) -> Optional[str]:
-    """The live AS-test family of `series` -- "GAS", "BB", "VH" or "PICK" --
-    or None (not a member, the family switched off, or its stop file
+    """The live AS-test family of `series` -- "GAS", "BB", "VH", "PICK" or
+    "MLB" -- or None (not a member, the family switched off, or its stop file
     present)."""
     if astest_gas_series(series):
         return "GAS"
@@ -13332,6 +13393,15 @@ def astest_new_series(series: str) -> bool:
     quoted x1 at every hour (is_daily_series)."""
     fam = astest_family(series)
     return fam is not None and fam != "GAS"
+
+
+def astest_window_series(series: str) -> bool:
+    """A member of an AS family whose blackout_et is the complement of its
+    QUOTE WINDOW -- VoteHub's 20:00-05:00 ET, MLB next team's 00:00-07:00 ET --
+    rather than a short release blackout: its payout-floor projection counts
+    the hours outside the window as earning nothing (size_mult_profile), so a
+    market is not admitted on a day it will never rest (2026-11-26)."""
+    return astest_member_family(series) in ("VH", "MLB")
 
 
 def _astest_levels(family: str) -> Optional[List[Tuple[int, int]]]:
@@ -13352,6 +13422,13 @@ SERIES_OVERRIDES.update({
                       event_day_cutoff_et=tuple(
                           int(x) for x in ASTEST_VH_WINDOW_ET[1].split(":")))
     for s in ASTEST_VH_SERIES})
+# MLB next team (2026-11-26): the x3 rungs and 150 cap, its window's
+# complement as the blackout (00:00-07:00 -> ("07:00", "00:00"), every day),
+# and safe-join -- resting behind a thin touch when a signing lands
+SERIES_OVERRIDES.update({
+    s: SeriesOverride(levels=_astest_levels("MLB"), max_position=ASTEST_MLB_MAX_POSITION,
+                      blackout_et=astest_blackout(ASTEST_MLB_WINDOW_ET), safe_join=True)
+    for s in ASTEST_MLB_SERIES})
 
 
 def astest_pick_event_ok(ticker: str) -> bool:
@@ -13440,7 +13517,7 @@ def load_astest_picks(now_utc: Optional[datetime] = None) -> int:
                             or series in FREEZE_SERIES
                             or any(series.startswith(x) for x in SCAN_EXCLUDE_PREFIXES)
                             or (series_pattern_blocked(series) and not gas)
-                            or astest_member_family(series) in ("BB", "VH")):
+                            or astest_member_family(series) in ("BB", "VH", "MLB")):
                         log(f"[IMM] ! astest pick {ev} refused: the series is "
                             f"blocked, frozen, excluded or another AS family's")
                         continue
@@ -15380,6 +15457,12 @@ _CONFIG_CODE_KNOBS = (
     "ASTEST_VH_MAX_POSITION", "ASTEST_VH_EVENT_CAP", "ASTEST_VH_DAILY_LOSS",
     "ASTEST_VH_FILL_PAUSE_MIN", "ASTEST_VH_BURST_CONTRACTS",
     "ASTEST_VH_BURST_WINDOW_MIN", "ASTEST_VH_BURST_PAUSE_MIN",
+    # ...and its MLB next team nights (2026-11-26)
+    "ASTEST_MLB_ENABLE", "ASTEST_MLB_SERIES", "ASTEST_MLB_WINDOW_ET", "ASTEST_MLB_UNTIL",
+    "ASTEST_MLB_SIZE_MULT",
+    "ASTEST_MLB_MAX_POSITION", "ASTEST_MLB_EVENT_CAP", "ASTEST_MLB_DAILY_LOSS",
+    "ASTEST_MLB_FILL_PAUSE_MIN", "ASTEST_MLB_BURST_CONTRACTS",
+    "ASTEST_MLB_BURST_WINDOW_MIN", "ASTEST_MLB_BURST_PAUSE_MIN",
     # the three fair refreshers' Kalshi reads signed (2026-09-27)
     "FAIR_SIGNED_READS",
     # USGS earthquake bid-only gate (2026-09-27); usgs_quake_fair's own knobs
@@ -42525,7 +42608,9 @@ class IncentiveMarketMaker:
                 total = 0.0
                 f_live: Optional[float] = None
                 for (m, bm, am), w in profile:
-                    f_m = _hyp_share(m, bm, am)
+                    # 0 = an hour outside an AS family's quote window
+                    # (size_mult_profile, 2026-11-26): nothing rests, nothing earns
+                    f_m = _hyp_share(m, bm, am) if m > 0 else 0.0
                     if _is_live((m, bm, am)):
                         f_live = f_m
                     total += w * f_m * meta.dollars_per_day
@@ -44151,17 +44236,23 @@ class IncentiveMarketMaker:
             # book, so stand fully aside across it and resume after. Unlike
             # the cutoff this does NOT deselect — the market is still ours,
             # it just holds no orders while the print lands. The CPI pilot's
-            # weekday 08:25-11:05 ET window runs through the same path.
+            # weekday 08:25-11:05 ET window runs through the same path, and so
+            # do the AS families quoted only inside a window (VoteHub's nights,
+            # MLB next team's 00:00-07:00 ET: astest_window_series).
             if series_in_blackout(meta.series, now_utc):
                 n = self.cancel_market_orders(t, resting)
                 cpi = meta.series in CPI_PILOT_SERIES
                 ust = meta.series in UST_EARLY_BLACKOUT_SERIES   # 10Y 06-07 ET (2026-10-22)
+                _bo_win = astest_window_series(meta.series)
                 if n:
                     log(f"{self.tag} {t}: "
                         + ("CPI pilot release blackout" if cpi else
-                           "Treasury 06-07 ET blackout" if ust else "AAA print blackout")
+                           "Treasury 06-07 ET blackout" if ust else
+                           "outside its AS quote window" if _bo_win else "AAA print blackout")
                         + f"; cancelled {n}")
-                self._gskip(t, "cpi_blackout" if cpi else "ust_blackout" if ust else "aaa_blackout", lambda: dict(n_cx=n))
+                _bo_guard = ("cpi_blackout" if cpi else "ust_blackout" if ust else
+                             "astest_window" if _bo_win else "aaa_blackout")
+                self._gskip(t, _bo_guard, lambda: dict(n_cx=n))
                 continue
             # STATE STATISTICS RELEASE PAUSE (2026-10-22): the same stand-aside
             # around each release of the agency the market's rules cite

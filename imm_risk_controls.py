@@ -122,7 +122,10 @@ GATE_GUARDS = ("treasury_yield", "rain_monthly", "rain_period", "snow_monthly", 
                # temperature, YouTube, NFL prop and RT settled-strike gates
                "lowt_fair", "hight_fair", "ytw_fair", "yt1_fair", "nfl_fair",
                "rt_settled_off")
-BLACKOUT_GUARDS = ("cpi_blackout", "aaa_blackout", "ust_blackout", "release_pause")
+BLACKOUT_GUARDS = ("cpi_blackout", "aaa_blackout", "ust_blackout", "release_pause",
+                   # an AS family outside its quote window (MLB next team's
+                   # 00:00-07:00 ET nights, 2026-11-26)
+                   "astest_window")
 LIVE_GUARDS = ("league_live", "nfl_live", "mlb_mvp", "league_team_news", "nfl_team_news",
                "announce_halt", "announce_hold")
 DEPTH_GUARDS = ("event_depth_trip", "event_depth_hold")
@@ -148,7 +151,7 @@ GUARD_LABELS = {
     "ytw_fair": "YouTube weekly", "yt1_fair": "YouTube #1", "nfl_fair": "NFL props",
     "rt_settled_off": "RT settled strikes",
     "cpi_blackout": "CPI", "aaa_blackout": "AAA gas", "ust_blackout": "Treasury 6-7am",
-    "release_pause": "state stats",
+    "release_pause": "state stats", "astest_window": "AS quote windows",
     "league_live": "leagues live", "nfl_live": "NFL live", "mlb_mvp": "MLB MVP games",
     "league_team_news": "team news", "nfl_team_news": "NFL team news",
     "announce_halt": "announcement jump", "announce_hold": "announcement hold",

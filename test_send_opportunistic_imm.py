@@ -211,6 +211,8 @@ class TestAsTestTier(unittest.TestCase):
     def test_the_named_families_are_the_tiers_markets(self):
         for t, fam in (("KXVHGCB-26OCT29-E8.1", "VH"), ("KXVHGCB-26OCT29", "VH"),
                        ("KXBBSINGLE-26NOV07THRILLER-16T20", "BB"),
+                       ("KXMLBNEXTTEAM-26GSPRINGER4-TOR", "MLB"),
+                       ("KXMLBNEXTTEAM-26GSPRINGER4", "MLB"),
                        ("KXAAAGASDMS-26OCT27-3.825", "GAS"),
                        ("KXAAAGASDMS-26OCT27", "GAS")):
             self.assertEqual(so.astest_family_of(t), fam, t)
@@ -237,6 +239,12 @@ class TestAsTestTier(unittest.TestCase):
                       line)
         self.assertIn("gas states CT/MS/NY/TN/UT x1 (50/market, 150/event, "
                       "$100/day loss halt; 16:00-24:00 ET): ON", line)
+        # MLB next team's nights (2026-11-26), ON to its end, ENDED after
+        self.assertIn("MLB next team KXMLBNEXTTEAM x3 (150/market, 450/event, $100/day "
+                      "loss halt; 00:00-07:00 ET only, to 2026-12-03 05:00Z): ON", line)
+        after = datetime(2026, 12, 4, 12, 25, tzinfo=timezone.utc)
+        self.assertIn("to 2026-12-03 05:00Z): ENDED Dec 03",
+                      so.astest_status({}, after, tmp))
         # a stop file and a loss halt for the roll day (STATUS_DIR is the
         # temp dir here, never the live run-logs)
         with open(os.path.join(tmp, "astest_stop.txt"), "w", encoding="utf-8") as f:
