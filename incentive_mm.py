@@ -10361,18 +10361,27 @@ FORCE_EVENTS = frozenset(
 #   - no lead of either kind (_lead_source): both are threshold ladders, and
 #     the ask was the plain quote, not 200-lot leads off the neighbours'
 #     books.
+#   - inside its own price band (Jack 2026-11-26: "extend range to 1-99c for
+#     KX30YMORTW-26DEC03, KXNBAFRANCHISECOST-31DEC26LV"), in place of the
+#     global PRICE_MIN_CENTS / PRICE_MAX_CENTS (5-90c), on the series
+#     override like the multiple: the weekly's 1-3c tail strikes and the
+#     franchise's $15B strike come in. RUNG_DEEP_FLOOR and STICKY_PRICE_MAX
+#     still bound every rung, as on the election family's 1-99c.
 # IMM_NAMED_EVENTS=0 takes them all out (an env change = task-level restart).
 NAMED_EVENTS_ENABLE = os.environ.get("IMM_NAMED_EVENTS", "1") == "1"
-NAMED_EVENTS: Dict[str, Tuple[float, datetime]] = {
-    # event ticker: (size multiple, stop UTC)
-    "KX30YMORTW-26DEC03": (3.0, datetime(2026, 12, 1, 16, 59, tzinfo=timezone.utc)),
-    "KXNBAFRANCHISECOST-31DEC26LV": (3.0, datetime(2026, 12, 30, 5, 0, tzinfo=timezone.utc)),
+NAMED_EVENTS: Dict[str, Tuple[float, datetime, int, int]] = {
+    # event ticker: (size multiple, stop UTC, price min c, price max c)
+    "KX30YMORTW-26DEC03": (
+        3.0, datetime(2026, 12, 1, 16, 59, tzinfo=timezone.utc), 1, 99),
+    "KXNBAFRANCHISECOST-31DEC26LV": (
+        3.0, datetime(2026, 12, 30, 5, 0, tzinfo=timezone.utc), 1, 99),
 }
 if NAMED_EVENTS_ENABLE:
-    for _nev, (_nmult, _nstop) in NAMED_EVENTS.items():
+    for _nev, (_nmult, _nstop, _npmin, _npmax) in NAMED_EVENTS.items():
         _nser = _nev.split("-")[0]
         SERIES_OVERRIDES[_nser] = replace(
-            SERIES_OVERRIDES.get(_nser) or SeriesOverride(), size_mult=_nmult)
+            SERIES_OVERRIDES.get(_nser) or SeriesOverride(), size_mult=_nmult,
+            price_min_cents=_npmin, price_max_cents=_npmax)
 
 
 def named_event_of(ticker: str) -> Optional[str]:
@@ -50996,8 +51005,8 @@ class IncentiveMarketMaker:
                 f"{MORT_FAIR_REFRESH_SECS}s, status {MORT_STATUS_FILE}")
         if NAMED_EVENTS_ENABLE and NAMED_EVENTS:
             log("named events (2026-11-26): " + "; ".join(
-                f"{ev} x{m:g} to {stop:%m/%d %H:%M}Z"
-                for ev, (m, stop) in sorted(NAMED_EVENTS.items()))
+                f"{ev} x{m:g} {lo}-{hi}c to {stop:%m/%d %H:%M}Z"
+                for ev, (m, stop, lo, hi) in sorted(NAMED_EVENTS.items()))
                 + " -- past the pattern block and the allowlist, no leads")
         if SNOW_DAYS_ENABLE:
             log(f"snow-day counts (2026-11-14): {','.join(sorted(SNOW_DAYS_SERIES))}"

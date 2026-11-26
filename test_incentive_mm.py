@@ -51634,6 +51634,10 @@ class TestNamedEvents(unittest.TestCase):
     def test_x3_to_each_stop(self):
         self.assertEqual(imm.SERIES_OVERRIDES["KX30YMORTW"].size_mult, 3.0)
         self.assertEqual(imm.SERIES_OVERRIDES["KXNBAFRANCHISECOST"].size_mult, 3.0)
+        # 1-99c (Jack 2026-11-26: "extend range to 1-99c"), not the global 5-90c
+        for s in ("KX30YMORTW", "KXNBAFRANCHISECOST"):
+            self.assertEqual((imm.series_price_min(s), imm.series_price_max(s)), (1, 99), s)
+        self.assertEqual((imm.PRICE_MIN_CENTS, imm.PRICE_MAX_CENTS), (5, 90))
         utc = timezone.utc
         # the weekly: two days before its 12/03 16:59Z close, ahead of the
         # ticker date's 00:00 ET 12/03
