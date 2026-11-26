@@ -32,6 +32,12 @@ quotable days.
 The gates that live in the quote loop (the fair gates, sweep holds, slots and
 the collateral budget) are not modelled: "yes" is admission, not a promise.
 
+A REGISTRY WAVE'S RELIGHT (2026-11-26) is judged as the wave will list it: a
+market of an enabled wave's series (pvd_waves.py's waves.json) whose list entry
+still carries LAST period's stop is judged with the stop the wave's relist
+writes at the start (the program's end, or the wave's stop cap). See
+relist_entries.
+
 ATTRACTIVENESS = EST $: the bot's estimator on today's book -- day-size $/day
 over the market's quotable days from its start (the payout bar's
 projection) -- for quotable and unquotable markets alike, so a "no" row says
@@ -47,10 +53,11 @@ STRICTLY READ-ONLY: GETs only, an offline bot (live=False) that never runs a
 cycle or saves state, no files written.
 """
 
+import json
 import os
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import imm_quote_gaps as gaps          # applies the launcher env first
 import incentive_mm as imm
@@ -119,6 +126,67 @@ def hot_reload() -> None:
             log(f"! upcoming: {name} failed ({e!r:.80}); verdicts may be narrow")
 
 
+# THE WAVE RELIGHT (2026-11-26). A registry wave relists its series' markets
+# when their next programs start (the relight task's pass 7), each with a new
+# stop at its program's end, or the wave's stop cap (pvd_scan.py). Until then
+# a relit market's list entry still carries LAST period's stop, so judged as
+# of its start the bot read it the way it reads an ended wave market: for an
+# election series the passed stop REPLACES the cutoff
+# (apply_series_cutoff_adjustments), and pvd_entry drops the wave's own band.
+# 11/26 the family watch alerted "KXDPRESPRIMARY ... would start dark (cutoff
+# at or before the start)" for all 621 markets of w1111-elec2028's relight at
+# 05:00Z 11/27 (stop 11/25 05:00Z on every entry). Such a market is now judged
+# with the entry the relist will write: the same entry, the new stop.
+# Not covered: a market of a wave series with no entry yet is judged unlisted
+# (the scan's bar and budget decide whether the wave lists it at all).
+WAVES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "run-logs", "pvd-scan", "waves.json")
+
+
+def wave_relists(path: Optional[str] = None) -> Dict[str, Optional[datetime]]:
+    """{series: its wave's stop cap, or None for no cap} for every series
+    (main and near) of an enabled registry wave; a series on two waves keeps
+    the earlier cap. {} when the file can't be read."""
+    try:
+        with open(path or WAVES_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+    waves = data.get("waves", data) if isinstance(data, dict) else data
+    out: Dict[str, Optional[datetime]] = {}
+    for w in (waves.values() if isinstance(waves, dict) else (waves or [])):
+        if not isinstance(w, dict) or not w.get("enabled", True):
+            continue
+        cap = imm.parse_iso_utc(str(w.get("stop_cap") or ""))
+        for s in list(w.get("series") or []) + list(w.get("near") or []):
+            s = str(s)
+            if s not in out or (cap is not None and (out[s] is None or cap < out[s])):
+                out[s] = cap
+    return out
+
+
+def relist_entries(programs: Dict[str, dict], active_markets: set,
+                   waves: Dict[str, Optional[datetime]]) -> Dict[str, dict]:
+    """{ticker: the list entry the wave's relist will write} for each upcoming
+    market of a wave series (`waves`, wave_relists) that is not paying now and
+    whose entry's stop is at or before its program's start: the same entry
+    with the stop moved to the program's end (or the wave's stop cap)."""
+    out = {}
+    for t, info in programs.items():
+        if info is None or t in active_markets:
+            continue
+        s = imm.series_of(t)
+        if s not in waves:
+            continue
+        e = imm.PVD_MARKETS.get(t)
+        if not e or e.get("stop") is None or e["stop"] > info["start"]:
+            continue
+        stop = info["end"] if waves[s] is None else min(info["end"], waves[s])
+        if stop > info["start"]:
+            out[t] = dict(e, stop=stop)
+    return out
+
+
 def _days(info) -> float:
     return max((info["end"] - info["start"]).total_seconds() / 86400.0, 1.0 / 24)
 
@@ -156,16 +224,36 @@ def _floor_verdict(meta, est_day: float, est_total: float, at: datetime):
 
 
 def assess(client, bot, raw_rows: list, active_markets: set,
-           now_utc: datetime, max_books: int = None) -> dict:
+           now_utc: datetime, max_books: int = None,
+           waves: Optional[Dict[str, Optional[datetime]]] = None) -> dict:
     """{"rows": [series rows, best first], "renewals": (n markets, $ pool),
     "n_new_markets", "n_events", "books", "horizon_days", "markets": {ticker:
-    its verdict row (series, event, info, pool, kind, why)}}. See the module
+    its verdict row (series, event, info, pool, kind, why)}, "relisted":
+    [tickers judged on their wave's relist entry]}. See the module
     docstring. `max_books` (default MAX_BOOKS) caps the estimator's book
     reads; 0 is the family watch's cheap read (2026-11-18): the config and
-    screen verdicts only, the estimates left to the pool proxy."""
+    screen verdicts only, the estimates left to the pool proxy. `waves`
+    (default: wave_relists() of waves.json) names the registry waves' series."""
     max_books = MAX_BOOKS if max_books is None else max_books
     hot_reload()
     programs = bot.upcoming_by_market(raw_rows, now_utc)
+    # a wave's relight: judged on the entry its relist writes (THE WAVE
+    # RELIGHT), put back however the judging ends
+    relist = relist_entries(programs, active_markets,
+                            wave_relists() if waves is None else waves)
+    saved = {t: imm.PVD_MARKETS[t] for t in relist}
+    imm.PVD_MARKETS.update(relist)
+    try:
+        out = _assess(client, bot, programs, active_markets, now_utc, max_books)
+    finally:
+        imm.PVD_MARKETS.update(saved)
+    out["relisted"] = sorted(relist)
+    return out
+
+
+def _assess(client, bot, programs: dict, active_markets: set,
+            now_utc: datetime, max_books: int) -> dict:
+    """assess's body, on the upcoming programs by market."""
     horizon = now_utc + timedelta(days=HORIZON_DAYS)
     renew_n, renew_pool = 0, 0.0
     new: Dict[str, dict] = {}

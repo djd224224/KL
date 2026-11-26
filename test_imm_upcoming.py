@@ -12,6 +12,7 @@ market paying now is a renewal and not listed, the ranking is by estimate,
 and an extreme-mid strike neither earns nor inherits its series' capture.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -81,13 +82,13 @@ def _meta(bot, t, info, m, at):
                            yield_per_contract=0.0)
 
 
-def run(rows, bot, active=(), markets=None, max_books=None):
+def run(rows, bot, active=(), markets=None, max_books=None, waves=None, meta=_meta):
     tickers = {p["market_ticker"] for p in rows}
     markets = markets if markets is not None else {
         t: {"ticker": t, "status": "active"} for t in tickers}
     with mock.patch.object(up.gaps, "bulk_market_details",
                            lambda c, ts: {t: markets[t] for t in ts if t in markets}), \
-            mock.patch.object(up.gaps, "build_meta", _meta), \
+            mock.patch.object(up.gaps, "build_meta", meta), \
             mock.patch.object(up, "hot_reload", lambda: None), \
             mock.patch.object(imm, "ensure_family_override", lambda s: None), \
             mock.patch.object(imm, "curated_event", lambda *a: False), \
@@ -96,7 +97,9 @@ def run(rows, bot, active=(), markets=None, max_books=None):
             mock.patch.object(imm, "NO_NEW_SERIES", set()), \
             mock.patch.object(imm, "scan_universe_reason", lambda t: "not_scan"), \
             mock.patch.object(imm, "series_family_suffix", lambda s: False):
-        return up.assess(None, bot, rows, set(active), NOW, max_books=max_books)
+        # no registry waves unless a test names them (never the live waves.json)
+        return up.assess(None, bot, rows, set(active), NOW, max_books=max_books,
+                         waves={} if waves is None else waves)
 
 
 class Verdicts(unittest.TestCase):
@@ -198,6 +201,100 @@ class Verdicts(unittest.TestCase):
             self.assertTrue(callable(getattr(imm, name, None)), name)
         for name in ("load_rain_wknd", "load_snow_days", "load_resort_snow", "load_hight_fair"):
             self.assertIn(name, up._RELOADS)
+
+
+class WaveRelight(unittest.TestCase):
+    """2026-11-26: the 621 KXDPRESPRIMARY markets of w1111-elec2028's relight
+    read "cutoff at or before the start" because their list entries still
+    carried last period's stop. A wave series' relit market is judged on the
+    entry the wave's relist writes: the same entry, the stop at its program's
+    end (or the wave's stop cap)."""
+
+    T = "KXWAVEP-28AK-ABC"
+    OLD = NOW - timedelta(days=1)                   # last period's stop, passed
+
+    class CutoffBot(FakeBot):
+        def _screen(self, meta, at):
+            return "cutoff" if meta.cutoff is not None and at >= meta.cutoff else None
+
+    def setUp(self):
+        self.seen = []
+
+        def meta(bot, t, info, m, at):
+            # the election-series rule: a listed market's stop IS its cutoff
+            e = imm.PVD_MARKETS.get(t)
+            self.seen.append(e["stop"] if e else None)
+            return SimpleNamespace(**dict(vars(_meta(bot, t, info, m, at)),
+                                          cutoff=e["stop"] if e else None))
+        self.meta = meta
+        self.entry = {"stop": self.OLD, "pmin": 1, "pmax": 99, "event": "KXWAVEP-28AK",
+                      "bsize": 4500, "asize": 300}
+        patcher = mock.patch.dict(imm.PVD_MARKETS, {self.T: dict(self.entry)}, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _run(self, waves, **kw):
+        return run([prog(self.T)], self.CutoffBot(allowed={"KXWAVEP"}), max_books=0,
+                   waves=waves, meta=self.meta, **kw)
+
+    def test_a_relit_market_is_judged_on_the_stop_its_wave_writes(self):
+        res = self._run({"KXWAVEP": None})
+        r = res["markets"][self.T]
+        self.assertEqual((r["kind"], r["why"]), ("maybe", "not estimated (book budget)"))
+        self.assertEqual(res["relisted"], [self.T])
+        self.assertEqual(self.seen, [END])                 # the program's end
+        # ...and the bot's list is put back
+        self.assertEqual(imm.PVD_MARKETS[self.T], self.entry)
+
+    def test_without_its_wave_the_passed_stop_still_reads_dark(self):
+        res = self._run({})
+        r = res["markets"][self.T]
+        self.assertEqual((r["kind"], r["why"]), ("no", "cutoff at or before the start"))
+        self.assertEqual(res["relisted"], [])
+
+    def test_the_waves_stop_cap_bounds_the_new_stop(self):
+        cap = START + timedelta(days=1)
+        self._run({"KXWAVEP": cap})
+        self.assertEqual(self.seen, [cap])
+        # a cap at or before the start relists nothing
+        self.seen.clear()
+        res = self._run({"KXWAVEP": START})
+        self.assertEqual((res["relisted"], self.seen), ([], [self.OLD]))
+
+    def test_a_live_entry_and_a_paying_market_are_left_alone(self):
+        imm.PVD_MARKETS[self.T]["stop"] = START + timedelta(hours=1)  # listed through the start
+        self.assertEqual(self._run({"KXWAVEP": None})["relisted"], [])
+        imm.PVD_MARKETS[self.T]["stop"] = self.OLD
+        res = self._run({"KXWAVEP": None}, active={self.T})          # a renewal
+        self.assertEqual(res["relisted"], [])
+        # an unlisted market of a wave series is judged unlisted
+        del imm.PVD_MARKETS[self.T]
+        self.assertEqual(self._run({"KXWAVEP": None})["relisted"], [])
+
+    def test_the_list_is_put_back_when_the_judging_fails(self):
+        class Boom(self.CutoffBot):
+            def _screen(self, meta, at):
+                raise RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            run([prog(self.T)], Boom(allowed={"KXWAVEP"}), max_books=0,
+                waves={"KXWAVEP": None}, meta=self.meta)
+        self.assertEqual(imm.PVD_MARKETS[self.T], self.entry)
+
+    def test_wave_relists_reads_enabled_waves_main_and_near(self):
+        cap = "2026-12-01T05:00:00Z"
+        data = {"waves": {
+            "w-a": {"enabled": True, "series": ["KXA", "KXB"], "near": ["KXN"], "stop_cap": None},
+            "w-b": {"enabled": True, "series": ["KXB"], "stop_cap": cap},
+            "w-off": {"enabled": False, "series": ["KXOFF"]}}}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as f:
+            json.dump(data, f)
+        self.addCleanup(os.unlink, f.name)
+        got = up.wave_relists(f.name)
+        self.assertEqual(set(got), {"KXA", "KXB", "KXN"})
+        self.assertIsNone(got["KXA"])
+        self.assertEqual(got["KXB"], imm.parse_iso_utc(cap))   # the earlier cap
+        self.assertEqual(up.wave_relists(f.name + ".missing"), {})
 
 
 class EmailSection(unittest.TestCase):
