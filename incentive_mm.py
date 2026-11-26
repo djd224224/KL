@@ -1571,6 +1571,39 @@ def series_pad_to_target(series: str) -> bool:
     return bool(ov and ov.pad_to_target)
 
 
+# MONTHLY RAIN 1K A SIDE (Jack 2026-11-26: "they should have 1k on each side
+# when they go live. make sure ALL the rain month cities would be picked up").
+# The December monthly rain programs start 11/27 06:01Z on 238 strikes in 34
+# cities ($55 a strike, target 1,000 a side), and under most strikes the YES
+# bids are 50-140 contracts at 1-9c: the pad touch band (no pad while the best
+# bid is under PAD_TOUCH_MIN_CENTS) and the distance rule (PAD_MIN_TICKS_BEHIND)
+# kept the 1c pad off, the bid side sat under the target, and the strike read
+# est 0 -- Denver and Las Vegas 0 of 7, 91 of 238 able to qualify on the 11/26
+# 17:30Z books. A monthly rain strike now pads at any touch: its 1c bid / 99c
+# ask pad rests under a best bid below 10c or a best ask above 90c, and may
+# join a 1c / 99c touch, so a side under the target reaches it (207 of 238 on
+# those books). The 5-90 mid band stays: the other 31 are near-certain strikes
+# (mid over 90) the bot does not quote at all. A filled pad costs at most ~$10
+# a side. Everything else about a pad stays: it rests only while one of the
+# market's rungs earns (EARN ONLY), only where the quote loop pads (a quoted
+# side, or the other side of a selected market), at pad_quantity's size.
+# IMM_RAIN_MONTHLY_PAD_ANY_TOUCH=0 puts the touch band and the distance back.
+RAIN_MONTHLY_PAD_ANY_TOUCH = os.environ.get("IMM_RAIN_MONTHLY_PAD_ANY_TOUCH", "1") == "1"
+
+
+def pad_any_touch(series: str) -> bool:
+    """A series whose pads skip the touch band and the distance rule
+    (MONTHLY RAIN 1K A SIDE): a monthly rain city."""
+    return RAIN_MONTHLY_PAD_ANY_TOUCH and rain_monthly_series(series)
+
+
+def pad_min_behind(series: str) -> int:
+    """Ticks a pad must rest behind its side's external touch:
+    PAD_MIN_TICKS_BEHIND, or 0 (it may join the touch) where
+    pad_any_touch."""
+    return 0 if pad_any_touch(series) else PAD_MIN_TICKS_BEHIND
+
+
 def pad_band_ok(series: str, ext_bid: Optional[int],
                 ext_ask: Optional[int]) -> bool:
     """Pads only on markets whose EXTERNAL mid sits inside the SERIES band
@@ -1586,6 +1619,8 @@ def pad_band_ok(series: str, ext_bid: Optional[int],
     mid = (ext_bid + ext_ask) / 2.0
     if not (series_price_min(series) <= mid <= series_price_max(series)):
         return False
+    if pad_any_touch(series):
+        return True          # MONTHLY RAIN 1K A SIDE: no touch band
     # 2026-09-13: the TOUCHES must sit inside 10-90 too (see the knobs) --
     # a low best bid puts the 1c pad within reach of any seller, a high
     # best ask does the same for the 99c pad
@@ -1652,9 +1687,9 @@ def sides_can_qualify(series: str, target: float, depth_yes: float,
         if is_bid and ticker is not None and no_side_only(ticker):
             return False     # ...nor a NO-side-only market its bid side
         if is_bid:
-            if ext_bid is None or ext_bid - PAD_BID_CENTS < PAD_MIN_TICKS_BEHIND:
+            if ext_bid is None or ext_bid - PAD_BID_CENTS < pad_min_behind(series):
                 return False
-        elif ext_ask is None or PAD_ASK_CENTS - ext_ask < PAD_MIN_TICKS_BEHIND:
+        elif ext_ask is None or PAD_ASK_CENTS - ext_ask < pad_min_behind(series):
             return False
         return depth + pad_quantity(depth, target) >= target
 
@@ -15424,6 +15459,7 @@ _CONFIG_CODE_KNOBS = (
     "RAIN_MONTHLY_ENABLE", "RAIN_MONTHLY_TOL_CENTS", "RAIN_MONTHLY_TTL_MIN",
     "RAIN_MONTHLY_DRY_MIN", "RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN",
     "RAIN_MONTHLY_ONE_SIDE", "RAIN_MONTHLY_BUY_ONLY",
+    "RAIN_MONTHLY_PAD_ANY_TOUCH",                # 1k a side (2026-11-26)
     # period rain totals (2026-10-04) on the same file and gate
     "RAIN_PERIOD_ENABLE", "RAIN_PERIOD_TOL_CENTS", "RAIN_PERIOD_CAP",
     "RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN", "RAIN_PERIOD_SIZE_MULT",
@@ -15583,6 +15619,7 @@ _CONFIG_CODE_KNOBS = (
     "HOME_EXPECTED_RELEASE_DAY", "HOME_PRE_RELEASE_DAYS", "HOME_PRE_RELEASE_MAX_DAY",
     "HOME_PRE_RELEASE_MODE",
     "HOME_QUOTE_THROUGH_DAY",     # home cutoff = end of the 3rd of next month (2026-11-25)
+    "HOME_NEAR_SIZE_MULT", "HOME_NEAR_FOLLOW_BOOK", "HOME_NEAR_BOOK_TOL_CENTS",  # (2026-11-26)
     "HOME_AUTO", "HOME_AUTO_PATTERN",
     # placement queue priority (2026-11-14)
     "PLACE_PRIORITY", "RENEW_URGENT_SECS",
@@ -23382,6 +23419,15 @@ HOME_QUOTE_THROUGH_DAY = max(0, min(27, _env_int("IMM_HOME_QUOTE_THROUGH_DAY", 3
 # ever. IMM_HOME_FAR_SIZE_MULT=1 turns it off.
 HOME_FAR_SIZE_MULT = _env_float("IMM_HOME_FAR_SIZE_MULT", 5.0)
 HOME_FAR_DAYS = _env_float("IMM_HOME_FAR_DAYS", 90.0)
+# THE NEAR MONTHS, x3 (Jack 2026-11-26: "size near months x3", on that day's
+# read of the family: $6.65/day of a $971/day pool, 15-lot bids and 30-lot
+# asks against 8-56k-contract books, 19 of 89 markets projected under the $1
+# floor). A Zillow market under HOME_FAR_DAYS from its cutoff rests
+# HOME_NEAR_SIZE_MULT its size, through the same readers as THE FAR MONTHS'
+# x5 (home_far_mult: the rungs, the per-market position cap, the event cap,
+# the skew knees); x1 inside THE PRE-RELEASE WINDOW's x1 mode as ever.
+# IMM_HOME_NEAR_SIZE_MULT=1: off.
+HOME_NEAR_SIZE_MULT = _env_float("IMM_HOME_NEAR_SIZE_MULT", 3.0)
 # THE FAR MONTHS FOLLOW THE BOOK (Jack 2026-11-18: "on Zillow far out
 # markets, still not placing asks" -> "Yes, follow the book"). Past
 # HOME_FAR_DAYS the fair is mostly the re-anchor drift (-0.5% a release
@@ -23397,6 +23443,23 @@ HOME_FAR_DAYS = _env_float("IMM_HOME_FAR_DAYS", 90.0)
 # there (no model-priced close). IMM_HOME_FAR_FOLLOW_BOOK=0: the model's
 # bound again.
 HOME_FAR_FOLLOW_BOOK = os.environ.get("IMM_HOME_FAR_FOLLOW_BOOK", "1") == "1"
+# THE NEAR MONTHS FOLLOW THE BOOK, INSIDE A FAIR CHECK (Jack 2026-11-26: "let
+# follow the book but have a check it's not too far from fair"). On 11/26 the
+# near months' books were 1c wide and the model sat 0.25-0.8% under them
+# (mostly its -0.5%/release re-anchor drift), so the band (bids <= fair -
+# 15c, asks >= fair + 15c) and JOIN THE REFERENCE's 2c margin let at most one
+# side reach the book: 41 of 68 markets rested an ask only, 7 a bid only, 3
+# both. Now a near month's bid may rest up to fair + HOME_NEAR_BOOK_TOL_CENTS
+# and its ask down to fair - it, so a book inside the check is joined on both
+# sides (no lead: home_lead_off). A touch past the check on a side -- a bid
+# over fair + tol, an ask under fair - tol -- is the breach it always was:
+# that side to its 1c / 99c edge, the other at the book (ONE SIDE OFF A
+# BREACH). The fail-closed stand-asides, THE PRE-RELEASE WINDOW and the hold
+# after a release all apply first; JOIN THE REFERENCE has nothing left to do
+# there. On 11/26's books 15c put 46 of the 68 on both sides (20c: 58).
+# IMM_HOME_NEAR_FOLLOW_BOOK=0: the band + JOIN THE REFERENCE again.
+HOME_NEAR_FOLLOW_BOOK = os.environ.get("IMM_HOME_NEAR_FOLLOW_BOOK", "1") == "1"
+HOME_NEAR_BOOK_TOL_CENTS = _env_int("IMM_HOME_NEAR_BOOK_TOL_CENTS", 15)
 # ...CONSISTENT ACROSS MONTHS (Jack the same night: "and make sure the book
 # is consistent across months for a city" -> "Cross-month bound"). A far
 # month's quote on a strike may not go past the same strike's book in the
@@ -23609,14 +23672,21 @@ def home_far_month(ticker: str, now_ts: Optional[float] = None) -> bool:
 
 
 def home_far_mult(ticker: str, now_ts: Optional[float] = None) -> float:
-    """HOME_FAR_SIZE_MULT for a Zillow far month (home_far_month), else 1.0
-    (THE FAR MONTHS, x5); 1.0 inside THE PRE-RELEASE WINDOW."""
-    if HOME_FAR_SIZE_MULT == 1.0 or HOME_FAR_SIZE_MULT <= 0:
+    """A Zillow market's (or event's) month size: HOME_FAR_SIZE_MULT for a
+    far month (home_far_month: THE FAR MONTHS, x5), HOME_NEAR_SIZE_MULT for a
+    near one (THE NEAR MONTHS, x3), 1.0 for anything else -- not Zillow, an
+    unparseable date -- and inside THE PRE-RELEASE WINDOW's x1 mode."""
+    if all(m_ == 1.0 or m_ <= 0 for m_ in (HOME_FAR_SIZE_MULT, HOME_NEAR_SIZE_MULT)):
         return 1.0
-    if not home_far_month(ticker, now_ts) or \
-            (HOME_PRE_RELEASE_MODE == "x1" and home_pre_release(now_ts)):
+    if not home_series(series_of(ticker)) or \
+            home_cutoff_utc("-".join(str(ticker).split("-")[:2])) is None:
         return 1.0
-    return HOME_FAR_SIZE_MULT
+    m = HOME_FAR_SIZE_MULT if home_far_month(ticker, now_ts) else HOME_NEAR_SIZE_MULT
+    if m == 1.0 or m <= 0:
+        return 1.0
+    if HOME_PRE_RELEASE_MODE == "x1" and home_pre_release(now_ts):
+        return 1.0
+    return m
 
 
 def home_xmonth_tickers(ticker: str) -> List[str]:
@@ -23717,7 +23787,9 @@ def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     all -- else (why, guard-skip inputs, None). Fails CLOSED. One exception
     (HOME_EDGES): a touch fighting the fair returns (why, inputs, caps) --
     that side at its 1c / 99c edge, the other at its usual cap
-    (HOME_ONE_SIDE_BREACH; off, both edges alone) (inputs["edges_only"])."""
+    (HOME_ONE_SIDE_BREACH; off, both edges alone) (inputs["edges_only"]).
+    A near month (HOME_NEAR_FOLLOW_BOOK) caps at fair + / - its own
+    HOME_NEAR_BOOK_TOL_CENTS instead (inputs["near_follow"])."""
     snap = _home_state.get("snap")
     if snap is None or snap.get("checked_ts") is None:
         return "no zillow read yet", {"reason": "no_read"}, None
@@ -23753,21 +23825,32 @@ def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     # FOLLOW THE BOOK; the quote loop adds the cross-month bound)
     if HOME_FAR_FOLLOW_BOOK and home_far_month(ticker, now_ts):
         return "", dict(inputs, follow_book=True, bid_cap=99, ask_floor=1), (99, 1)
+    # a near month follows the book inside the fair check: bids up to fair +
+    # tol, asks down to fair - tol (THE NEAR MONTHS FOLLOW THE BOOK, INSIDE A
+    # FAIR CHECK); the breach below reads the same tol
+    near = HOME_NEAR_FOLLOW_BOOK and not home_far_month(ticker, now_ts)
+    tol = HOME_NEAR_BOOK_TOL_CENTS if near else HOME_FAIR_TOL_CENTS
+    if near:
+        inputs = dict(inputs, tol=tol, near_follow=True)
     # the band edges a fair of `fair` never argues with (HOME_EDGES)
     edges = ((1 if fair >= 1.0 else None, 99 if fair <= 99.0 else None)
              if HOME_EDGES else (None, None))
-    bid_cap = int(math.floor(fair - HOME_FAIR_TOL_CENTS + 1e-9))
-    ask_floor = int(math.ceil(fair + HOME_FAIR_TOL_CENTS - 1e-9))
+    if near:
+        bid_cap = min(99, int(math.floor(fair + tol + 1e-9)))
+        ask_floor = max(1, int(math.ceil(fair - tol - 1e-9)))
+    else:
+        bid_cap = int(math.floor(fair - HOME_FAIR_TOL_CENTS + 1e-9))
+        ask_floor = int(math.ceil(fair + HOME_FAIR_TOL_CENTS - 1e-9))
     if edges[0] is not None:
         bid_cap = max(bid_cap, edges[0])
     if edges[1] is not None:
         ask_floor = min(ask_floor, edges[1])
     caps = (bid_cap if bid_cap >= 1 else None,
             ask_floor if ask_floor <= 99 else None)
-    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair, HOME_FAIR_TOL_CENTS)
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair, tol)
     if bid_bad or ask_bad:
         why = (f"book {ext_bid}x{ext_ask} vs fair {fair:.0f}c (tol "
-               f"{HOME_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
+               f"{tol}c, {'bid' if bid_bad else 'ask'} side; "
                f"mu ${e.get('mu') or 0:,})")
         band_in = dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad)
         if edges != (None, None):
@@ -24338,21 +24421,41 @@ def drop_unearning_sides(quotes: List["Quote"], yes_levels: List[List[float]],
 # off.
 EARN_ONLY_MODE = os.environ.get("IMM_EARN_ONLY", "on").strip().lower()
 EARN_ONLY_LOG_MAX = _env_int("IMM_EARN_ONLY_LOG_MAX", 25)
+# UNWIND REACH (Jack 2026-11-26: "why is KXMIAHOME-30NOV26, KXSDHOME-30NOV26
+# quoting and not earning....this happened before. stop making mistakes"). The
+# unwind exemption took EVERY reducing-side rung, so a fair gate's closing side
+# parked at its edge or cap rested all day, earning nothing and unable to fill:
+# KXMIAHOME-30NOV26-GT665000 short 200, its bid at 1c under an 85x86 book (the
+# home gate's "edges only" on a 68c fair), and 17 more Zillow Nov-30 closes 14-89c
+# behind their touch. That is no purposeful unwind. Now a non-earning reducing
+# rung rests as the unwind only on a market that IS unwinding -- reduce-only
+# (deselected, UNWIND ONLY, the waves' switch, a Carbon Arc family unwind,
+# pre-cutoff, sell-back-only), the cheap at-cap unwind, UNWIND AT MARKET, a held
+# wave market off the selection -- or within EARN_ONLY_UNWIND_REACH_C cents of
+# the best external price on its own side. A rung past that reach does not rest;
+# the position rides. IMM_EARN_ONLY_UNWIND_REACH_C=0 restores every reducing rung.
+EARN_ONLY_UNWIND_REACH_C = _env_float("IMM_EARN_ONLY_UNWIND_REACH_C", 10.0)
 
 
 def earning_only_quotes(quotes: List["Quote"], yes_levels: List[List[float]],
                         no_levels: List[List[float]],
                         own_in_book: List[Tuple[str, float, float]],
-                        target: float, own_pos: float = 0.0
+                        target: float, own_pos: float = 0.0,
+                        unwind_reach_c: Optional[float] = None
                         ) -> Tuple[List["Quote"], Dict[str, list]]:
     """(kept, info): `quotes` minus every rung the program's walk would not
     pay, but for the unwind (see EARN ONLY above). yes_levels / no_levels:
     [price in cents, size] (whole cents or exact) INCLUDING our resting
     orders, which own_in_book (book side, YES price in cents, size) nets
-    out. own_pos: the bot's YES position in the market. info: "dropped" and
-    "unwind" as [(book side, YES price, contracts)], "short" the book sides
-    under the target (the snapshot then pays nobody)."""
-    info: Dict[str, list] = {"dropped": [], "unwind": [], "short": []}
+    out. own_pos: the bot's YES position in the market. unwind_reach_c (see
+    UNWIND REACH): a non-earning reducing rung more than this many cents
+    behind the best external price on its side is no unwind and does not
+    rest; None = every reducing rung may (a market purposefully unwinding).
+    info: "dropped", "unwind" and "far" (dropped as past the reach, with
+    how far behind) as [(book side, YES price, contracts[, cents behind])],
+    "short" the book sides under the target (the snapshot then pays
+    nobody)."""
+    info: Dict[str, list] = {"dropped": [], "unwind": [], "short": [], "far": []}
     if not quotes or target <= 0:
         return quotes, info
 
@@ -24372,6 +24475,9 @@ def earning_only_quotes(quotes: List["Quote"], yes_levels: List[List[float]],
         s_ = "bid" if side == "bid" else "ask"
         k = key(s_, float(yes_px))
         depth[s_][k] = max(0.0, depth[s_].get(k, 0.0) - float(n))
+    # the best EXTERNAL price on each side, on the walk's axis (before our rungs)
+    ext_best = {s: max((k for k, n in depth[s].items() if n > 1e-9), default=None)
+                for s in ("bid", "ask")}
     for q in quotes:
         k = key(q.book_side, px_of(q))
         depth[q.book_side][k] = depth[q.book_side].get(k, 0.0) + float(q.count)
@@ -24388,6 +24494,7 @@ def earning_only_quotes(quotes: List["Quote"], yes_levels: List[List[float]],
     any_earning = any(e and not q.is_pad for q, e in zip(quotes, ok))
     red = "ask" if own_pos >= 1 else ("bid" if own_pos <= -1 else None)
     keep_n: Dict[int, int] = {}
+    far: Dict[int, float] = {}
     if red is not None:
         room = int(abs(own_pos)) - sum(q.count for q, e in zip(quotes, ok)
                                        if e and not q.is_pad and q.book_side == red)
@@ -24396,6 +24503,11 @@ def earning_only_quotes(quotes: List["Quote"], yes_levels: List[List[float]],
                         key=lambda i: -key(red, px_of(quotes[i]))):   # best price first
             if room <= 0:
                 break
+            behind = (ext_best[red] - key(red, px_of(quotes[i]))
+                      if ext_best[red] is not None else 0.0)
+            if unwind_reach_c is not None and behind > unwind_reach_c + 1e-9:
+                far[i] = round(behind, 2)     # UNWIND REACH: no unwind this far back
+                continue
             keep_n[i] = min(int(quotes[i].count), room)
             room -= keep_n[i]
     kept: List["Quote"] = []
@@ -24410,6 +24522,8 @@ def earning_only_quotes(quotes: List["Quote"], yes_levels: List[List[float]],
                 info["dropped"].append((q.book_side, px_of(q), q.count - n))
         else:
             info["dropped"].append((q.book_side, px_of(q), q.count))
+            if i in far:
+                info["far"].append((q.book_side, px_of(q), q.count, far[i]))
     return kept, info
 
 
@@ -40141,19 +40255,26 @@ class IncentiveMarketMaker:
         return out or None
 
     def _earn_only(self, t: str, meta, mq: List["Quote"], ob, yes_levels, no_levels,
-                   own_in_book, own_exact, own_pos: float, ext_bid, ext_ask) -> List["Quote"]:
+                   own_in_book, own_exact, own_pos: float, ext_bid, ext_ask,
+                   purposeful: bool = False) -> List["Quote"]:
         """EARN ONLY (see EARN_ONLY_MODE): the market's quotes minus every
         rung the walk would not pay, but for the unwind; dry logs and keeps
-        them all. A failure never costs the cycle: the quotes as built."""
+        them all. purposeful: the market is unwinding (see UNWIND REACH), so
+        its non-earning reducing rungs rest wherever they are priced; else
+        only within EARN_ONLY_UNWIND_REACH_C of their side's best. A failure
+        never costs the cycle: the quotes as built."""
+        reach = None if (purposeful or EARN_ONLY_UNWIND_REACH_C <= 0) else EARN_ONLY_UNWIND_REACH_C
         try:
             if meta.price_step < 0.01:
                 # the walk runs over exact levels (see drop_unearning_sides)
                 _ey, _en = orderbook_exact_levels(ob)
                 kept, info = earning_only_quotes(mq, _ey, _en, own_exact,
-                                                 float(meta.target_size or 0.0), own_pos)
+                                                 float(meta.target_size or 0.0), own_pos,
+                                                 unwind_reach_c=reach)
             else:
                 kept, info = earning_only_quotes(mq, yes_levels, no_levels, own_in_book,
-                                                 float(meta.target_size or 0.0), own_pos)
+                                                 float(meta.target_size or 0.0), own_pos,
+                                                 unwind_reach_c=reach)
         except Exception as e:
             if not self._earn_only_err_logged:
                 self._earn_only_err_logged = True
@@ -40171,6 +40292,10 @@ class IncentiveMarketMaker:
         if unwind:
             c["unwind_markets"] = c.get("unwind_markets", 0) + 1
             c["unwind_contracts"] = c.get("unwind_contracts", 0) + int(sum(n for _s, _p, n in unwind))
+        far = info.get("far") or []
+        if far:
+            c["far_markets"] = c.get("far_markets", 0) + 1
+            c["far_contracts"] = c.get("far_contracts", 0) + int(sum(f[2] for f in far))
         sig = (tuple(sorted((s, round(p, 2)) for s, p, _n in dropped)), tuple(short))
         if sig != self._earn_only_noted.get(t, ((), ())):
             if dropped and c.get("logged", 0) < EARN_ONLY_LOG_MAX:
@@ -40184,6 +40309,12 @@ class IncentiveMarketMaker:
                 if unwind:
                     kept_u = (f"; kept as the unwind of {own_pos:+.0f}: "
                               + ", ".join(f"{s} {n} @ {p:g}c" for s, p, n in unwind))
+                if far:
+                    kept_u += (f"; no unwind of {own_pos:+.0f} that far back (reach "
+                               f"{EARN_ONLY_UNWIND_REACH_C:g}c): "
+                               + ", ".join(f"{s} {n} @ {p:g}c is {b:g}c behind its side's best"
+                                           for s, p, n, b in far)
+                               + " -- the position rides")
                 dry = " (dry)" if EARN_ONLY_MODE == "dry" else ""
                 log(f"{self.tag} earn-only{dry} {t}: not resting {what} -- {why} "
                     f"(book {ext_bid}x{ext_ask}){kept_u}")
@@ -40200,7 +40331,9 @@ class IncentiveMarketMaker:
             f"{c.get('contracts', 0)} contracts on {c.get('markets', 0)} market(s) "
             f"not resting ({c.get('short', 0)} with a book side under the target); "
             f"{c.get('unwind_contracts', 0)} non-earning contracts rest as unwinds on "
-            f"{c.get('unwind_markets', 0)} market(s)")
+            f"{c.get('unwind_markets', 0)} market(s); {c.get('far_contracts', 0)} closing "
+            f"contracts on {c.get('far_markets', 0)} market(s) held off as no unwind "
+            f"(over {EARN_ONLY_UNWIND_REACH_C:g}c behind their side's best)")
 
     def _twin_check(self, t: str, meta, mq: List["Quote"], now_ts: float) -> List["Quote"]:
         """THE TWIN CHECK (TWIN_CHECK_MODE) on market `t`'s rungs as built:
@@ -42536,13 +42669,13 @@ class IncentiveMarketMaker:
                 nt_ask = sum(q.count for q in quotes if q.book_side == "ask")
                 if nt_bid > 0 or nt_ask > 0:
                     if eb is not None and not no_side_only(meta.ticker) \
-                            and eb - PAD_BID_CENTS >= PAD_MIN_TICKS_BEHIND:
+                            and eb - PAD_BID_CENTS >= pad_min_behind(meta.series):
                         n = pad_quantity(sum(sz for _px, sz in ylv) + nt_bid,
                                          meta.target_size)
                         if n > 0:
                             overlay.append(("bid", PAD_BID_CENTS, float(n)))
                     if ea is not None and not series_bid_only(meta.series) \
-                            and PAD_ASK_CENTS - ea >= PAD_MIN_TICKS_BEHIND:
+                            and PAD_ASK_CENTS - ea >= pad_min_behind(meta.series):
                         n = pad_quantity(sum(sz for _px, sz in nlv) + nt_ask,
                                          meta.target_size)
                         if n > 0:
@@ -45408,8 +45541,10 @@ class IncentiveMarketMaker:
                         else:
                             self._home_xmonth_note.pop(t, None)
                 # a near month the gate clears: JOIN THE REFERENCE (the
-                # external book's, our own orders out)
-                elif not hg_why and home_caps is not None and HOME_JOIN_REF:
+                # external book's, our own orders out) -- not one following
+                # the book inside the fair check (its caps are past the book)
+                elif not hg_why and home_caps is not None and HOME_JOIN_REF \
+                        and not hg_in.get("near_follow"):
                     _jy, _jn = (external_levels(yes_levels, no_levels, own_in_book)
                                 if own_in_book else (yes_levels, no_levels))
                     home_caps, jr_why = home_join_ref_caps(
@@ -46832,12 +46967,17 @@ class IncentiveMarketMaker:
             # most the national YES ask + NATNOM_BID_CEIL_C
             mq = self._natnom_floor(t, meta, mq, now_ts, own_pos)
             # EARN ONLY (EARN_ONLY_MODE): the very last step -- no rung the
-            # program's walk would not pay rests, but for the unwind
+            # program's walk would not pay rests, but for the unwind -- a
+            # purposeful one (UNWIND REACH: reduce-only, the cheap at-cap
+            # unwind, UNWIND AT MARKET, a held wave market off the selection)
+            # anywhere, any other close only within EARN_ONLY_UNWIND_REACH_C
             if mq and EARN_ONLY_MODE in ("on", "dry"):
+                _purposeful = bool(reduce_only or t in self.state.cheap_cap_unwind
+                                   or t in self._unwind_at_market or t in self._wave_unwind)
                 mq = self._earn_only(t, meta, mq, ob, yes_levels, no_levels,
                                      own_in_book,
                                      own_exact_by_ticker.get(t, []) if self.live else [],
-                                     own_pos, ext_bid, ext_ask)
+                                     own_pos, ext_bid, ext_ask, purposeful=_purposeful)
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -47649,10 +47789,13 @@ class IncentiveMarketMaker:
         # Distance gates (Jack 2026-08-03): a pad only rests when it sits
         # >= PAD_MIN_TICKS_BEHIND behind its side's EXTERNAL touch — a 1c pad
         # under a 1-2c best bid is the market itself, bought up easily.
+        # A monthly rain strike's pad may join the touch (pad_min_behind 0,
+        # MONTHLY RAIN 1K A SIDE).
+        behind = pad_min_behind(series_of(ticker))
         bid_pad_safe = (ext_bid is not None
-                        and ext_bid - PAD_BID_CENTS >= PAD_MIN_TICKS_BEHIND)
+                        and ext_bid - PAD_BID_CENTS >= behind)
         ask_pad_safe = (ext_ask is not None
-                        and PAD_ASK_CENTS - ext_ask >= PAD_MIN_TICKS_BEHIND)
+                        and PAD_ASK_CENTS - ext_ask >= behind)
         if bid_pad_safe and (nt_bid > 0 or (pad_missing_side and nt_ask > 0)) \
                 and not no_side_only(ticker):
             # live: book already holds our near-touch, subtract only our pad;
@@ -50635,10 +50778,13 @@ class IncentiveMarketMaker:
                    f"(any HOME series on the feed whose rules name a Zillow "
                    f"Home Value Index)" if HOME_AUTO else "")
                 + f" fail-closed, "
-                f"bids <= fair - {HOME_FAIR_TOL_CENTS}c, asks >= fair + "
-                f"{HOME_FAIR_TOL_CENTS}c"
-                + (f" or AT the side's reference when that sits {HOME_JOIN_REF_CENTS:g}c+ "
-                   f"on the model's side (never ahead of it)" if HOME_JOIN_REF else "")
+                + (f"near months follow the book inside fair +/- "
+                   f"{HOME_NEAR_BOOK_TOL_CENTS}c (bids <= fair + {HOME_NEAR_BOOK_TOL_CENTS}c, "
+                   f"asks >= fair - {HOME_NEAR_BOOK_TOL_CENTS}c)" if HOME_NEAR_FOLLOW_BOOK
+                   else f"bids <= fair - {HOME_FAIR_TOL_CENTS}c, asks >= fair + "
+                   f"{HOME_FAIR_TOL_CENTS}c"
+                   + (f" or AT the side's reference when that sits {HOME_JOIN_REF_CENTS:g}c+ "
+                      f"on the model's side (never ahead of it)" if HOME_JOIN_REF else ""))
                 + ", a touch fighting the fair by more "
                 + ("sends that side to its 1c / 99c edge (the other keeps its cap)"
                    if HOME_ONE_SIDE_BREACH else "rests the 1c / 99c edges alone")
@@ -50647,8 +50793,8 @@ class IncentiveMarketMaker:
                    f"{max(1, HOME_EXPECTED_RELEASE_DAY - HOME_PRE_RELEASE_DAYS)}th "
                    f"00:00 ET of each month until that month's release (to the "
                    f"{HOME_PRE_RELEASE_MAX_DAY}th at most)" if HOME_PRE_RELEASE_DAYS > 0 else "")
-                + f", size x{HOME_SIZE_MULT:g} (x{HOME_FAR_SIZE_MULT:g} with "
-                f"{HOME_FAR_DAYS:g}+ days to the cutoff"
+                + f", size x{HOME_SIZE_MULT:g} (near months x{HOME_NEAR_SIZE_MULT:g}; "
+                f"x{HOME_FAR_SIZE_MULT:g} with {HOME_FAR_DAYS:g}+ days to the cutoff"
                 + (f", where both sides follow the book inside the city's other months "
                    f"+/-{HOME_XMONTH_TOL_CENTS}c" if HOME_FAR_FOLLOW_BOOK else "")
                 + "), 1-99c, out 00:00 ET on the "

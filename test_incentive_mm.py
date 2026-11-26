@@ -257,6 +257,11 @@ def setUpModule():
     imm.HOME_FAR_SIZE_MULT = 1.0
     # ...and the far months' follow-the-book rule likewise (2026-11-18)
     imm.HOME_FAR_FOLLOW_BOOK = False
+    # ...and THE NEAR MONTHS' x3 and follow-the-book-inside-a-fair-check
+    # (2026-11-26): the gate fixtures above test the band; TestHomeNearMonths
+    # turns both on
+    imm.HOME_NEAR_SIZE_MULT = 1.0
+    imm.HOME_NEAR_FOLLOW_BOOK = False
     # ...and the pre-release window (2026-11-18): the fixtures' last release
     # is 30 days old, so from the 12th to the 24th every Zillow test would
     # run at x1 -- off here; TestHomeFarSize turns it on
@@ -14417,7 +14422,7 @@ class TestRainMonthlyGate(unittest.TestCase):
         TestRainMonthlyGate._bump += 1
         return imm.load_rain_monthly()
 
-    def _bot(self, yes_lv=None):
+    def _bot(self, yes_lv=None, no_lv=None, listing=("0.4900", "0.5100")):
         client = FakeClient()
         now = datetime.now(timezone.utc)
         far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -14430,13 +14435,92 @@ class TestRainMonthlyGate(unittest.TestCase):
         client.markets[self.T] = {
             "ticker": self.T, "event_ticker": self.EV,
             "status": "active", "close_time": far,
-            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "yes_bid_dollars": listing[0], "yes_ask_dollars": listing[1],
             "volume_fp": "500.00"}
         lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
               ["0.48", "400"], ["0.49", "300"]]
         client.books[self.T] = {"orderbook_fp": {"yes_dollars": yes_lv or lv,
-                                                 "no_dollars": lv}}
+                                                 "no_dollars": no_lv or lv}}
         return IncentiveMarketMaker(client=client, live=False)
+
+    def _side_totals(self, bot, yes_lv, no_lv):
+        """(bid side, ask side) contracts: the book's plus our sim orders."""
+        ours = {"bid": 0.0, "ask": 0.0}
+        for o in bot.state.sim_orders.values():
+            if o["ticker"] == self.T:
+                ours[o["book_side"]] += float(o["remaining_count"])
+        return (sum(float(n) for _p, n in yes_lv) + ours["bid"],
+                sum(float(n) for _p, n in no_lv) + ours["ask"])
+
+    def test_pads_at_any_touch_on_a_monthly_rain_strike(self):
+        # Jack 2026-11-26: "they should have 1k on each side when they go
+        # live. make sure ALL the rain month cities would be picked up" -- a
+        # monthly rain strike pads under a best bid below 10c / a best ask
+        # above 90c and may join a 1c / 99c touch; every other series keeps
+        # the touch band and the 2-tick distance; the 5-90 mid band stays
+        self.assertTrue(imm.rain_monthly_series("KXRAINDENM"))
+        self.assertTrue(imm.pad_band_ok("KXRAINDENM", 1, 10))      # Denver DEC-2..7
+        self.assertTrue(imm.pad_band_ok("KXRAINDENM", 8, 28))      # Denver DEC-1
+        self.assertTrue(imm.pad_band_ok("KXRAINLVM", 1, 11))       # a city by name
+        self.assertFalse(imm.pad_band_ok("KXGOOD", 1, 10))
+        self.assertFalse(imm.pad_band_ok("KXGOOD", 8, 28))
+        self.assertFalse(imm.pad_band_ok("KXRAINDENM", 90, 99))    # mid 94.5: band stays
+        self.assertFalse(imm.pad_band_ok("KXRAINDENM", None, 10))  # one-sided stays out
+        self.assertEqual(imm.pad_min_behind("KXRAINDENM"), 0)
+        self.assertEqual(imm.pad_min_behind("KXGOOD"), imm.PAD_MIN_TICKS_BEHIND)
+        # the qualify gate the selection and the loop share
+        q = imm.sides_can_qualify
+        self.assertEqual(q("KXRAINDENM", 1000.0, 50, 1076, 1, 10), (True, True))
+        self.assertEqual(q("KXRAINDENM", 1000.0, 140, 838, 8, 28), (True, True))
+        self.assertEqual(q("KXGOOD", 1000.0, 50, 1076, 1, 10), (False, True))
+        self.assertEqual(q("KXGOOD", 1000.0, 140, 838, 8, 28), (False, False))
+        # the kill switch puts the touch band and the distance back
+        self.assertIn("RAIN_MONTHLY_PAD_ANY_TOUCH", imm._CONFIG_CODE_KNOBS)
+        with mock.patch.object(imm, "RAIN_MONTHLY_PAD_ANY_TOUCH", False):
+            self.assertFalse(imm.pad_band_ok("KXRAINDENM", 1, 10))
+            self.assertEqual(imm.pad_min_behind("KXRAINDENM"), imm.PAD_MIN_TICKS_BEHIND)
+            self.assertEqual(q("KXRAINDENM", 1000.0, 50, 1076, 1, 10), (False, True))
+
+    def test_a_1c_bid_strike_goes_live_with_1k_on_each_side(self):
+        # KXRAINDENM-26DEC-3 on 11/26: 50 YES bids at 1c, the NO bids up to
+        # 90c (YES ask 10c), fair 0 -- the bid side pads at the 1c touch and
+        # the ask joins at 10c, so both sides reach the 1,000 target
+        yes = [["0.01", "50"]]
+        no = [["0.01", "51"], ["0.03", "500"], ["0.04", "200"], ["0.12", "125"],
+              ["0.13", "45"], ["0.65", "50"], ["0.66", "14"], ["0.90", "90"]]
+        bot = self._bot(yes_lv=yes, no_lv=no, listing=("0.0100", "0.1000"))
+        self._write(p=0.0)
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertIn(("bid", imm.PAD_BID_CENTS), q)
+        self.assertIn(("ask", 10), q)
+        bid_n, ask_n = self._side_totals(bot, yes, no)
+        self.assertGreaterEqual(bid_n, 1000.0, q)
+        self.assertGreaterEqual(ask_n, 1000.0, q)
+        # the kill switch: the 1c touch takes no pad, the bid side cannot
+        # reach the target, and nothing rests
+        _clean_persist()
+        bot2 = self._bot(yes_lv=yes, no_lv=no, listing=("0.0100", "0.1000"))
+        with mock.patch.object(imm, "RAIN_MONTHLY_PAD_ANY_TOUCH", False):
+            bot2.run_cycle()
+        self.assertNotIn(("bid", imm.PAD_BID_CENTS), self._quotes(bot2))
+
+    def test_a_9c_bid_strike_pads_both_sides(self):
+        # KXRAINDENM-26DEC-1 on 11/26: 140 YES bids (90 at 8c), 838 NO bids
+        # (YES ask 28c), fair 6.5c -- both sides under the target, the bid
+        # touch under 10c: a 1c bid pad and a 99c ask pad
+        yes = [["0.01", "50"], ["0.08", "90"]]
+        no = [["0.01", "51"], ["0.03", "500"], ["0.12", "125"], ["0.13", "52"],
+              ["0.71", "50"], ["0.72", "60"]]
+        bot = self._bot(yes_lv=yes, no_lv=no, listing=("0.0800", "0.2800"))
+        self._write(p=0.0647)
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertIn(("bid", imm.PAD_BID_CENTS), q)
+        self.assertIn(("ask", imm.PAD_ASK_CENTS), q)
+        bid_n, ask_n = self._side_totals(bot, yes, no)
+        self.assertGreaterEqual(bid_n, 1000.0, q)
+        self.assertGreaterEqual(ask_n, 1000.0, q)
 
     def _quotes(self, bot):
         return sorted((o["book_side"], o["yes_price"])
@@ -28038,6 +28122,184 @@ class TestHomeFarSize(unittest.TestCase):
         self.assertEqual({px for s, px in q if s == "ask"}, {90, 91, 92})
         self.assertTrue(any(f"home-value cross-month {self.T}: bids <= 45 ({other} ask 30 + 15)"
                             in s for s in lines), [s for s in lines if "cross-month" in s])
+
+
+class TestHomeNearMonths(unittest.TestCase):
+    """THE NEAR MONTHS, x3 (Jack 2026-11-26: "size near months x3") and THE
+    NEAR MONTHS FOLLOW THE BOOK, INSIDE A FAIR CHECK (the same day: "let
+    follow the book but have a check it's not too far from fair"): a Zillow
+    market under HOME_FAR_DAYS from its cutoff rests x HOME_NEAR_SIZE_MULT,
+    and its bids may rest up to fair + HOME_NEAR_BOOK_TOL_CENTS, its asks down
+    to fair - it -- a touch past that on a side sends that side to its edge.
+    TestZillowHomeGate's fixture (cutoff 2067, so home_far_month is patched
+    False where the fixture plays a near month)."""
+
+    T, EV, CLOSE = TestZillowHomeGate.T, TestZillowHomeGate.EV, TestZillowHomeGate.CLOSE
+    setUp, tearDown = TestZillowHomeGate.setUp, TestZillowHomeGate.tearDown
+    _snap, _bot = TestZillowHomeGate._snap, TestZillowHomeGate._bot
+    _sizes = TestHomeFarSize._sizes
+    _quotes = TestHomeFarSize._quotes
+
+    @staticmethod
+    def _near():
+        return mock.patch.object(imm, "home_far_month", lambda *a, **k: False)
+
+    def test_the_defaults_and_knobs(self):
+        for k in ("HOME_NEAR_SIZE_MULT", "HOME_NEAR_FOLLOW_BOOK", "HOME_NEAR_BOOK_TOL_CENTS"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS, k)
+        # the code defaults (the test module pins the first two off)
+        with open(imm.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('_env_float("IMM_HOME_NEAR_SIZE_MULT", 3.0)', src)
+        self.assertIn('os.environ.get("IMM_HOME_NEAR_FOLLOW_BOOK", "1") == "1"', src)
+        self.assertIn('_env_int("IMM_HOME_NEAR_BOOK_TOL_CENTS", 15)', src)
+
+    def test_near_months_size_x3(self):
+        now = time.time()
+        et = datetime.now(timezone.utc).astimezone(imm.ET)
+
+        def ev(days):
+            return "KXSEAHOME-" + (et + timedelta(days=days)).strftime("%d%b%y").upper()
+        near = ev(30) + "-GT1"
+        with mock.patch.object(imm, "HOME_NEAR_SIZE_MULT", 3.0), \
+                mock.patch.object(imm, "HOME_FAR_SIZE_MULT", 5.0):
+            self.assertEqual(imm.home_far_mult(near, now), 3.0)
+            self.assertEqual(imm.home_far_mult(ev(30), now), 3.0)            # an event too
+            self.assertEqual(imm.home_far_mult(self.T, now), 5.0)            # far: x5
+            self.assertEqual(imm.home_far_mult("KXSEAHOME-NOV67-GT1", now), 1.0)  # no day
+            self.assertEqual(imm.home_far_mult("KXRT-67OCT01-T80", now), 1.0)     # not Zillow
+            base = imm.series_max_position("KXSEAHOME")
+            self.assertEqual(imm.market_max_position(near), base * 3.0)
+            self.assertEqual(imm.event_cap_contracts(ev(30)),
+                             imm.MAX_EVENT_CONTRACTS * imm.applied_mention_mult("KXSEAHOME") * 3.0)
+            # x1 inside THE PRE-RELEASE WINDOW's x1 mode
+            with mock.patch.object(imm, "HOME_PRE_RELEASE_MODE", "x1"), \
+                    mock.patch.object(imm, "home_pre_release", lambda *a, **k: "window"):
+                self.assertEqual(imm.home_far_mult(near, now), 1.0)
+            # off: the near months x1, the far months as set
+            with mock.patch.object(imm, "HOME_NEAR_SIZE_MULT", 1.0):
+                self.assertEqual(imm.home_far_mult(near, now), 1.0)
+                self.assertEqual(imm.home_far_mult(self.T, now), 5.0)
+        with mock.patch.object(imm, "HOME_NEAR_SIZE_MULT", 3.0):         # far x1, near x3
+            self.assertEqual(imm.home_far_mult(self.T, now), 1.0)
+            self.assertEqual(imm.home_far_mult(near, now), 3.0)
+
+    def test_the_quote_loop_rests_three_times_the_size(self):
+        self._snap(p=0.70)
+        with self._near():
+            one = self._bot()
+            one.run_cycle()
+            s1 = self._sizes(one)
+            _clean_persist()
+            with mock.patch.object(imm, "HOME_NEAR_SIZE_MULT", 3.0):
+                self._snap(p=0.70)
+                three = self._bot()
+                three.run_cycle()
+                s3 = self._sizes(three)
+                self.assertEqual(three._market_size_mult(self.T), 3.0)
+        self.assertGreater(s1["bid"], 0)
+        self.assertGreater(s1["ask"], 0)
+        for side in ("bid", "ask"):
+            self.assertAlmostEqual(s3[side], 3 * s1[side], delta=0.02 * 3 * s1[side] + 2,
+                                   msg=(side, s1, s3))
+
+    def test_the_gate_follows_the_book_inside_the_check(self):
+        now = time.time()
+        g = lambda b=50, a=90: imm.home_gate(self.T, now, b, a)
+        with mock.patch.object(imm, "HOME_NEAR_FOLLOW_BOOK", True):
+            # a far month is untouched: the band (far months' own rule is off here)
+            self._snap(p=0.70)
+            self.assertEqual(g()[2], (55, 85))
+            with self._near():
+                why, inputs, caps = g()
+                self.assertEqual((why, caps), ("", (85, 55)))      # fair 70 +/- 15
+                self.assertTrue(inputs["near_follow"])
+                self.assertEqual(inputs["tol"], 15)
+                # FAIR CLOSE keeps the model's price
+                self.assertEqual(imm.home_fair_c(self.T, now), 70.0)
+                # a book the band kept one-sided: both sides now at the book
+                self._snap(p=0.40)
+                self.assertEqual(g(), ("", g()[1], (55, 25)))
+                # the check: a bid touch over fair + 15 to its 1c edge, the
+                # ask at the book (ONE SIDE OFF A BREACH)
+                self._snap(p=0.30)
+                why, inputs, caps = g()
+                self.assertIn("tol 15c, bid side", why)
+                self.assertEqual(caps, (1, 15))
+                self.assertTrue(inputs["edges_only"])
+                self.assertEqual(g(b=45)[0], "")                     # at the tol: quotes
+                # an ask touch under fair - 15 to its 99c edge
+                self._snap(p=0.70)
+                why, _in, caps = g(a=54)
+                self.assertIn("ask side", why)
+                self.assertEqual(caps, (85, 99))
+                # the 1-99c clamp at the ends
+                self._snap(p=0.995)
+                self.assertEqual(g(b=95, a=99)[2], (99, 85))
+                self._snap(p=0.002)
+                self.assertEqual(g(b=1, a=3)[2], (15, 1))
+                # the tolerance is its own knob
+                with mock.patch.object(imm, "HOME_NEAR_BOOK_TOL_CENTS", 20):
+                    self._snap(p=0.30)
+                    self.assertEqual(g(), ("", g()[1], (50, 10)))
+                # the fail-closed stand-asides still come first
+                self._snap(p=0.70, release_age=60)
+                self.assertIsNone(g()[2])
+                self._snap(err="not modelled: x")
+                self.assertIsNone(g()[2])
+        # off: the band
+        with self._near():
+            self._snap(p=0.70)
+            self.assertEqual(g()[2], (55, 85))
+            self.assertNotIn("near_follow", g()[1])
+
+    def test_a_tight_book_has_both_caps_past_it(self):
+        # 11/26's shape: a 1c book (49x50) the model sits 4.5c under -- the
+        # band + JOIN THE REFERENCE reach the book on the ask alone (the bid
+        # held 19c off it); inside the check both caps sit past the book
+        now = time.time()
+        self._snap(p=0.45)
+        with self._near():
+            band, _why = imm.home_join_ref_caps(
+                imm.home_gate(self.T, now, 49, 50)[2], 45.0, 49, 50)
+            self.assertEqual(band, (30, 50))
+            with mock.patch.object(imm, "HOME_NEAR_FOLLOW_BOOK", True):
+                why, _in, caps = imm.home_gate(self.T, now, 49, 50)
+            self.assertEqual((why, caps), ("", (60, 30)))
+
+    def test_the_quote_loop_joins_the_bid_the_band_kept_off(self):
+        # the fixture book 50x90 at fair 40: the band capped the bid at 25 (the
+        # 50c reference is not 2c under the fair); inside the check it joins
+        # the book, never past it, and JOIN THE REFERENCE stays quiet
+        def run(follow):
+            _clean_persist()
+            self._snap(p=0.40)
+            bot = self._bot()
+            lines = []
+            with self._near(), mock.patch.object(imm, "HOME_NEAR_FOLLOW_BOOK", follow), \
+                    mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+            q = self._quotes(bot)
+            return ({px for s, px in q if s == "bid"}, {px for s, px in q if s == "ask"},
+                    lines)
+        bids, asks, lines = run(False)
+        self.assertFalse(bids & {48, 49, 50}, (bids, asks, lines[-30:]))
+        bids, asks, lines = run(True)
+        self.assertEqual(bids, {48, 49, 50}, (bids, asks, lines[-30:]))
+        self.assertEqual(asks, {90, 91, 92}, (bids, asks, lines[-30:]))
+        self.assertFalse(any("home-value join-ref" in s for s in lines))
+
+    def test_a_breach_side_still_goes_to_its_edge(self):
+        self._snap(p=0.30)                     # bid touch 50 over 30 + 15
+        with self._near(), mock.patch.object(imm, "HOME_NEAR_FOLLOW_BOOK", True):
+            bot = self._bot()
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertFalse({px for s, px in q if s == "bid"} - {1}, q)
+        self.assertEqual({px for s, px in q if s == "ask"}, {90, 91, 92}, lines[-30:])
+        self.assertIn(self.T, bot._home_edges)
 
 
 class TestHomeAutoFamily(TestZillowHomeGate):
@@ -50586,6 +50848,58 @@ class TestSnowDaysLoop(TestSnowDaysGate):
         self.assertTrue(any(f"earn-only {self.T}:" in s_ and "kept as the unwind of -25" in s_
                             for s_ in lines), [s_ for s_ in lines if self.T in s_][-8:])
 
+    def _short_far_behind(self, bot=None, **patches):
+        # short 25 with the gate's bid cap 16c behind the 40c pile (a 20c
+        # margin on the 44c fair: the bid caps at 24c) -- no purposeful unwind
+        for k, v in dict({"SNOW_DAYS_RUNG_TOL_CENTS": 20}, **patches).items():
+            p = mock.patch.object(imm, k, v)
+            p.start()
+            self.addCleanup(p.stop)
+        if bot is None:
+            bot, _rest, _lines = self._cycle()
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.01", "5000"], ["0.40", "1500"]],
+            "no_dollars": [["0.01", "5000"]]}}
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -25.0, 39.8
+        bot.client.positions[self.T] = -25.0
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            self._write()
+            bot.run_cycle()
+        return bot, [(px, n) for side, px, n in self._rest(bot) if side == "bid"], lines
+
+    def test_a_close_past_the_unwind_reach_does_not_rest(self):
+        # Jack 2026-11-26: "why is KXMIAHOME-30NOV26, KXSDHOME-30NOV26 quoting
+        # and not earning....this happened before. stop making mistakes" --
+        # Zillow shorts resting their gate-capped bid at 1c under an 85c book.
+        # A non-earning close 16c behind its side's best is no unwind: nothing
+        # rests, the position rides, and the log says why
+        bot, bids, lines = self._short_far_behind()
+        self.assertEqual(bids, [], self._rest(bot))
+        self.assertTrue(any(f"earn-only {self.T}:" in s_ and "no unwind of -25 that far back" in s_
+                            and "16c behind its side's best" in s_ and "the position rides" in s_
+                            for s_ in lines), [s_ for s_ in lines if self.T in s_][-8:])
+        self.assertTrue(any("earn-only:" in s_ and "held off as no unwind" in s_ for s_ in lines),
+                        [s_ for s_ in lines if "earn-only" in s_])
+
+    def test_the_unwind_reach_kill_switch_and_a_wider_reach_rest_it_again(self):
+        for reach in (0.0, 20.0):
+            bot, bids, lines = self._short_far_behind(EARN_ONLY_UNWIND_REACH_C=reach)
+            self.assertEqual(sum(n for _px, n in bids), 25, (reach, self._rest(bot)))
+            self.assertTrue(all(px <= 24 for px, _n in bids), (reach, bids))
+
+    def test_a_purposeful_unwind_rests_its_close_however_far_back(self):
+        # reduce-only (here UNWIND ONLY) is unwinding on purpose: its close
+        # rests wherever it is priced, as before
+        bot, _rest, _lines = self._cycle()
+        p = mock.patch.object(bot, "_unwinds", lambda t: True)
+        p.start()
+        self.addCleanup(p.stop)
+        bot, bids, lines = self._short_far_behind(bot=bot)
+        self.assertEqual(sum(n for _px, n in bids), 25, self._rest(bot))
+        self.assertFalse(any("no unwind of" in s_ for s_ in lines),
+                         [s_ for s_ in lines if self.T in s_][-8:])
+
 
 class TestEarningOnlyQuotes(unittest.TestCase):
     """earning_only_quotes (EARN ONLY, Jack 2026-11-15: "fix all gates.
@@ -50671,6 +50985,55 @@ class TestEarningOnlyQuotes(unittest.TestCase):
         # flat (under one contract): nothing to unwind
         kept, _ = self.f(qs, yes, no, pos=-0.4)
         self.assertEqual(kept, [("ask", 35, 40)])
+
+    def g(self, qs, yes, no, pos, reach, own=(), target=1000.0):
+        kept, info = imm.earning_only_quotes(qs, yes, no, list(own), target, pos,
+                                             unwind_reach_c=reach)
+        return [(q.book_side, q.price_cents, q.count) for q in kept], info
+
+    def test_the_unwind_reach_drops_a_close_parked_far_behind_its_side(self):
+        # UNWIND REACH (Jack 2026-11-26, KXMIAHOME-30NOV26-GT665000: short 200,
+        # the home gate's bid at its 1c edge under an 85x86 book)
+        Q, T = imm.Quote, "KXMIAHOME-30NOV26-GT665000"
+        yes, no = [[85, 5000.0], [1, 50000.0]], [[14, 5000.0]]
+        kept, info = self.g([Q(T, "bid", 1, 200)], yes, no, -200.0, 10.0)
+        self.assertEqual(kept, [])
+        self.assertEqual(info["far"], [("bid", 1.0, 200, 84.0)])
+        self.assertEqual(info["dropped"], [("bid", 1.0, 200)])
+        self.assertEqual(info["unwind"], [])
+        # no reach (a purposeful unwind): rests as before
+        kept, info = self.g([Q(T, "bid", 1, 200)], yes, no, -200.0, None)
+        self.assertEqual(kept, [("bid", 1, 200)])
+        self.assertEqual(info["far"], [])
+        # inside the reach it is still the unwind
+        kept, info = self.g([Q(T, "bid", 76, 200)], yes, no, -200.0, 10.0)
+        self.assertEqual(kept, [("bid", 76, 200)])
+        self.assertEqual(info["unwind"], [("bid", 76.0, 200)])
+
+    def test_the_unwind_reach_on_the_ask_side_and_a_ladder(self):
+        # long 200 (KXAUSHOME-30NOV26-GT522000: ask 32c on a 10x11 book): the
+        # ask is 21c behind the best ask (NO bid 89 vs its 68)
+        Q, T = imm.Quote, self.T
+        yes, no = [[10, 5000.0]], [[89, 5000.0]]
+        kept, info = self.g([Q(T, "ask", 32, 200)], yes, no, 200.0, 10.0)
+        self.assertEqual(kept, [])
+        self.assertEqual(info["far"], [("ask", 32.0, 200, 21.0)])
+        kept, _ = self.g([Q(T, "ask", 15, 200)], yes, no, 200.0, 10.0)     # 4c behind
+        self.assertEqual(kept, [("ask", 15, 200)])
+        # a ladder: the rung inside the reach rests up to the position, the one past it goes
+        yes, no = [[29, 1617.0]], [[60, 2000.0]]
+        kept, info = self.g([Q(T, "bid", 25, 40), Q(T, "bid", 12, 40)], yes, no, -60.0, 10.0)
+        self.assertEqual(kept, [("bid", 25, 40)])
+        self.assertEqual(info["unwind"], [("bid", 25.0, 40)])
+        self.assertEqual(info["far"], [("bid", 12.0, 40, 17.0)])
+
+    def test_the_unwind_reach_with_no_external_price_on_its_side(self):
+        # nothing outside to be behind: the close rests as the unwind
+        Q, T = imm.Quote, self.T
+        kept, info = self.g([Q(T, "bid", 3, 50)], [], [[60, 2000.0]], -50.0, 10.0)
+        self.assertEqual(info["short"], ["bid"])
+        self.assertEqual(kept, [("bid", 3, 50)])
+        self.assertEqual(info["far"], [])
 
 
 class TestListedComboFair(unittest.TestCase):

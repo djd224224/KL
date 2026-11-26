@@ -110,6 +110,19 @@ OBS_MAX_AGE_MIN = _env_float("IMM_RAIN_MONTHLY_OBS_MAX_AGE_MIN", 90)
 BOUNDARY_IN = _env_float("IMM_RAIN_MONTHLY_BOUNDARY_IN", rm.BOUNDARY_IN)
 EVENTS_TTL_SECS = 3600
 HTTP_TIMEOUT = 30
+# A MONTH THAT HAS NOT STARTED READS DRY (Jack 2026-11-26: "they should have 1k
+# on each side when they go live. make sure ALL the rain month cities would be
+# picked up"). The December programs run 11/27 06:01Z - 11/29 05:00Z, all of
+# it before December 1, but a monthly event read the station's weather from
+# the day it was listed: at 17:35Z 11/26 eleven of the 34 December cities (ATL
+# CMH DC EWR IND LEX PHIL PIT SEA STL TTN) read "raining at the station" on
+# Thanksgiving rain that cannot count toward December, so the gate stood them
+# aside. A monthly event before its month's first day (the station's own
+# date) now reads dry with no observation and no remembered wet one, as a
+# period event before its first day already does (2026-10-04) and as the snow
+# months do. From the 1st the station's weather counts again.
+# IMM_RAIN_MONTHLY_BEFORE_DRY=0 reads the weather before the month again.
+MONTHLY_BEFORE_DRY = os.environ.get("IMM_RAIN_MONTHLY_BEFORE_DRY", "1") == "1"
 
 # CLI code (the rules' "at CLIxxx") -> station spec in rain_monthly.STATIONS'
 # shape. Seeded from rain_monthly's verified stations, plus O'Hare (CLIORD,
@@ -735,6 +748,16 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             if spec is not None:
                 before = (now.astimezone(pytz.timezone(spec["tz"])).date().isoformat()
                           < str(info["start"]))
+        elif spec is not None and MONTHLY_BEFORE_DRY:
+            # A MONTH THAT HAS NOT STARTED READS DRY (see MONTHLY_BEFORE_DRY)
+            ym = rm.parse_event_month(ev)
+            try:
+                before = ym is not None and (now.astimezone(pytz.timezone(spec["tz"])).date()
+                                             < date(ym[0], ym[1], 1))
+            except Exception:                    # never costs the write: read the weather
+                before = False
+            if before:
+                st["last_wet_at"] = None         # rain before the month is not its rain
         if before:
             # rain before the period counts for nothing: no stand-aside
             st.update(wet=False, obs_time=None, phour=None, wx=None)

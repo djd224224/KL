@@ -188,6 +188,42 @@ class TestWriter(unittest.TestCase):
         self.assertEqual((st["wet"], st["last_wet_at"]), (False, NOW.isoformat()))
         self.assertEqual(self._read()["model"]["boundary_in"], rmf.BOUNDARY_IN)
 
+    def test_a_month_that_has_not_started_reads_dry(self):
+        # Jack 2026-11-26 ("make sure ALL the rain month cities would be
+        # picked up"): raining at O'Hare on Thanksgiving, the December event
+        # reads dry -- November rain is not December's, and the December
+        # programs end before Dec 1 -- while November's is wet and remembers
+        # it; from Dec 1 (Chicago's date) the weather counts again
+        ev = {"KXRAINCHIM-26NOV": {"series": "KXRAINCHIM", "code": "ORD",
+                                   "strikes": {"KXRAINCHIM-26NOV-3": 3.0}},
+              "KXRAINCHIM-26DEC": {"series": "KXRAINCHIM", "code": "ORD",
+                                   "strikes": {"KXRAINCHIM-26DEC-3": 3.0}}}
+        thanks = datetime(2026, 11, 26, 17, 35, tzinfo=timezone.utc)
+
+        def write(now):
+            obs = {"wet": True, "obs_time": now.isoformat(), "phour": 0.1, "wx": "RA"}
+            rmf.write_fair_file(self.path, now=now, events=ev, fair_fn=self.fair,
+                                obs_fn=lambda spec, n: obs)
+            st = self._read()["event_state"]
+            return st["KXRAINCHIM-26NOV"], st["KXRAINCHIM-26DEC"]
+        # the kill switch: December reads the weather and remembers it
+        with mock.patch.object(rmf, "MONTHLY_BEFORE_DRY", False):
+            nov, dec = write(thanks)
+        self.assertEqual((dec["wet"], dec["last_wet_at"]), (True, thanks.isoformat()))
+        # the rule: dry, no observation, the remembered November rain dropped
+        later = thanks + timedelta(minutes=10)
+        nov, dec = write(later)
+        self.assertEqual((dec["wet"], dec["obs_time"], dec["last_wet_at"]), (False, None, None))
+        self.assertEqual((nov["wet"], nov["last_wet_at"]), (True, later.isoformat()))
+        self.assertIn("KXRAINCHIM-26DEC-3", self._read()["markets"])
+        # 23:30 CST Nov 30 (05:30Z Dec 1) is still November in Chicago
+        nov, dec = write(datetime(2026, 12, 1, 5, 30, tzinfo=timezone.utc))
+        self.assertEqual((dec["wet"], dec["last_wet_at"]), (False, None))
+        # 00:30 CST Dec 1: December's own rain stands it aside
+        dec1 = datetime(2026, 12, 1, 6, 30, tzinfo=timezone.utc)
+        nov, dec = write(dec1)
+        self.assertEqual((dec["wet"], dec["last_wet_at"]), (True, dec1.isoformat()))
+
     def test_a_failing_fair_is_missing_not_fatal(self):
         def boom(ev, info, now):
             raise RuntimeError("acis down")
