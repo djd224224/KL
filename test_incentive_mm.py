@@ -44791,6 +44791,35 @@ class TestBreakevenOffset(unittest.TestCase):
         self.assertEqual(f(sp, -200, 50.0), (sp, 0))
         self.assertEqual(f(sp, -200, 50.5)[1], 200)
 
+    def test_up_to_three_cents_of_loss(self):
+        # Jack 2026-11-26: "change the breakeven offset rule to allow up to 3c
+        # of loss" (KXNCAAFTFUT-30ARK-Y: long 375 at 43.64c, its 43c ask
+        # rested only the normal 60)
+        Q, f = imm.Quote, imm.breakeven_offset_quotes
+        self.assertEqual(imm.BE_OFFSET_LOSS_C, 3.0)
+        asks = [Q("T", "ask", 43, 60), Q("T", "bid", 1, 500, is_pad=True)]
+        self.assertEqual(f(asks, 375, 43.64), (asks, 0))          # breakeven only
+        out, n = f(asks, 375, 43.64, loss_c=3.0)
+        self.assertEqual((n, [(q.book_side, q.price_cents, q.count) for q in out]),
+                         (375, [("ask", 43, 375), ("bid", 1, 500)]))
+        self.assertEqual(f(asks, 375, 46.0, loss_c=3.0)[1], 375)  # 3c exactly
+        self.assertEqual(f(asks, 375, 46.1, loss_c=3.0), (asks, 0))
+        # a short: a bid at most 3c over the average it sold at
+        bids = [Q("T", "bid", 49, 60)]
+        self.assertEqual(f(bids, -200, 46.0, loss_c=3.0)[1], 200)
+        self.assertEqual(f(bids, -200, 45.9, loss_c=3.0), (bids, 0))
+        # the rung nearest the touch inside the allowance takes it
+        lad = [Q("T", "bid", 49, 30), Q("T", "bid", 47, 30)]
+        out, n = f(lad, -200, 47.0, loss_c=3.0)
+        self.assertEqual([q.count for q in out], [170, 30])
+        # the check itself, both sides
+        ok = imm.be_offset_ok
+        self.assertTrue(ok("ask", 43, 43.64, 3.0))
+        self.assertFalse(ok("ask", 43, 43.64))
+        self.assertTrue(ok("bid", 50, 47.0, 3.0))
+        self.assertFalse(ok("bid", 51, 47.0, 3.0))
+        self.assertIn("BE_OFFSET_LOSS_C", imm._CONFIG_CODE_KNOBS)
+
     # --- end to end ---------------------------------------------------
     def test_a_selected_short_rests_a_full_buy_back(self):
         bot = self._bot()
@@ -44809,9 +44838,36 @@ class TestBreakevenOffset(unittest.TestCase):
 
     def test_a_short_sold_under_the_touch_keeps_its_normal_size(self):
         bot = self._bot()
-        self._hold(bot, -200, 45.0)            # the 49c bid would lock a loss
+        # every rung (49/48/47c) more than BE_OFFSET_LOSS_C over the average:
+        # the nearest, 47c, would give back 4c (45.0 since 11/26 takes 48c)
+        self._hold(bot, -200, 43.0)
         bot.run_cycle()
         self.assertLess(sum(o["remaining_count"] for o in self._side(bot, "bid")), 200)
+        self.assertNotIn(self.T, bot._be_offset_n)
+
+    def test_a_short_sold_within_three_cents_of_the_touch_rests_a_full_buy_back(self):
+        bot = self._bot()
+        self._hold(bot, -200, 47.0)            # the 49c bid gives back 2c
+        bot.run_cycle()
+        bids = self._side(bot, "bid")
+        self.assertEqual(sum(o["remaining_count"] for o in bids if o["yes_price"] > 1), 200)
+        self.assertTrue(all(o["yes_price"] <= 50 for o in bids))
+        # the touch rung (49c) carries it, not the 47c rung at breakeven
+        top = max(bids, key=lambda o: o["remaining_count"])
+        self.assertEqual(top["yes_price"], 49)
+        self.assertEqual(bot._be_offset_n.get(self.T), (200, top["remaining_count"]))
+        # the allowance off: breakeven or better, as before (the 47c rung)
+        bot = self._bot()
+        self._hold(bot, -200, 47.0)
+        with mock.patch.object(imm, "BE_OFFSET_LOSS_C", 0.0):
+            bot.run_cycle()
+        bids = self._side(bot, "bid")
+        self.assertEqual(max(bids, key=lambda o: o["remaining_count"])["yes_price"], 47)
+        # ...and sold at 43 nothing reaches it
+        bot = self._bot()
+        self._hold(bot, -200, 43.0)
+        with mock.patch.object(imm, "BE_OFFSET_LOSS_C", 0.0):
+            bot.run_cycle()
         self.assertNotIn(self.T, bot._be_offset_n)
 
     def test_near_the_stop_no_offset(self):

@@ -3251,6 +3251,15 @@ def unwind_side_sizes(series: str, pos: float, maxpos: float) -> Tuple[int, int]
 # PnlTracker.avg, before fees. IMM_BE_OFFSET_DAYS=0 turns it off.
 BE_OFFSET_DAYS = _env_float("IMM_BE_OFFSET_DAYS", 30.0)
 BE_OFFSET_MIN_CONTRACTS = _env_float("IMM_BE_OFFSET_MIN", 5.0)
+# LOSS ALLOWANCE (Jack 2026-11-26: "change the breakeven offset rule to allow
+# up to 3c of loss", after KXNCAAFTFUT-30ARK-Y, long 375 at 43.64c, rested only
+# its normal 60 at the 43c touch, 0.64c under its average): the reducing rung
+# may sit up to BE_OFFSET_LOSS_C cents worse than the average -- a bid at most
+# avg + 3, an ask at least avg - 3 -- before fees. Still the built rung nearest
+# the touch, never a new price and never past flat. The Carbon Arc unwind
+# (CA UNWIND, off since 11/25) keeps breakeven or better.
+# IMM_BE_OFFSET_LOSS_C=0 restores breakeven or better.
+BE_OFFSET_LOSS_C = _env_float("IMM_BE_OFFSET_LOSS_C", 3.0)
 
 
 def be_offset_far(cutoff: Optional[datetime], close_time: Optional[datetime],
@@ -3262,22 +3271,25 @@ def be_offset_far(cutoff: Optional[datetime], close_time: Optional[datetime],
             and stop - now_utc >= timedelta(days=BE_OFFSET_DAYS))
 
 
-def be_offset_ok(book_side: str, price: float, avg: float) -> bool:
+def be_offset_ok(book_side: str, price: float, avg: float,
+                 loss_c: float = 0.0) -> bool:
     """A reducing order at `price` (YES cents) fills at the bot's average
     cost or better: a bid buys back a short at or under the average it sold
-    at, an ask sells a long at or over the average it paid."""
+    at, an ask sells a long at or over the average it paid -- or at most
+    `loss_c` cents worse (the breakeven offset's LOSS ALLOWANCE)."""
     if book_side == "bid":
-        return price <= avg + 1e-9
-    return price >= avg - 1e-9
+        return price <= avg + loss_c + 1e-9
+    return price >= avg - loss_c - 1e-9
 
 
 def breakeven_offset_quotes(quotes: List["Quote"], pos: float,
-                            avg: Optional[float]) -> Tuple[List["Quote"], int]:
+                            avg: Optional[float],
+                            loss_c: float = 0.0) -> Tuple[List["Quote"], int]:
     """(quotes, n): the BREAKEVEN OFFSET on one market's built quotes. The
     reducing side (bids when short, asks when long) is raised to the whole
     position, in whole contracts, on its breakeven-or-better rung nearest the
-    touch; n is that rung's new size (0 = unchanged). Pads never count or
-    carry."""
+    touch (or one at most `loss_c` cents worse, the LOSS ALLOWANCE); n is
+    that rung's new size (0 = unchanged). Pads never count or carry."""
     if not avg or abs(pos) < max(1.0, BE_OFFSET_MIN_CONTRACTS):
         return quotes, 0
     side = "bid" if pos < 0 else "ask"
@@ -3286,7 +3298,7 @@ def breakeven_offset_quotes(quotes: List["Quote"], pos: float,
         return q.price_exact if q.price_exact is not None else float(q.price_cents)
 
     rungs = [q for q in quotes if q.book_side == side and not q.is_pad]
-    ok = [q for q in rungs if be_offset_ok(side, px(q), avg)]
+    ok = [q for q in rungs if be_offset_ok(side, px(q), avg, loss_c)]
     want = int(abs(pos))
     have = sum(q.count for q in rungs)
     if not ok or have >= want:
@@ -15471,6 +15483,7 @@ _CONFIG_CODE_KNOBS = (
     "ADMIT_SUSTAIN_SECS", "ADMIT_RUN_MAX_GAP_SECS",
     "ADMIT_SKIP_MULT",            # a 3x margin skips the wait (2026-11-01)
     "BE_OFFSET_DAYS", "BE_OFFSET_MIN_CONTRACTS",   # breakeven offset (2026-11-05)
+    "BE_OFFSET_LOSS_C",                           # its loss allowance (2026-11-26)
     "CA_UNWIND",                                   # Carbon Arc unwind (2026-11-07)
     "HOURLY_ACTIVATION_WINDOW_SECS", "HOURLY_ACTIVATION_AUTO",
     "HOURLY_PROGRAM_MAX_HOURS",
@@ -46461,7 +46474,8 @@ class IncentiveMarketMaker:
                 self._cheap_unwind.pop(t, None)
             # BREAKEVEN OFFSET (a SELECTED market BE_OFFSET_DAYS out or
             # more): the reducing side carries the whole position at
-            # breakeven or better. The event room below is charged the
+            # breakeven or better, or at most BE_OFFSET_LOSS_C cents worse
+            # (LOSS ALLOWANCE, 2026-11-26). The event room below is charged the
             # quotes as built (mq_built), so the offset never squeezes a
             # sibling's side. A Carbon Arc market with the bot's own position
             # (CA UNWIND, ca_uw) takes it whatever the stop's distance: its
@@ -46469,10 +46483,13 @@ class IncentiveMarketMaker:
             # gated or not, so it works toward the period's $1.
             mq_built = mq
             be_n = 0
+            be_far = be_offset_far(meta.cutoff, meta.close_time, now_utc)
             if t in self.state.selected and cheap is None \
-                    and (be_offset_far(meta.cutoff, meta.close_time, now_utc) or ca_uw is not None) \
+                    and (be_far or ca_uw is not None) \
                     and not (pos_manual or event_manual):
-                mq, be_n = breakeven_offset_quotes(mq, own_pos, self.pnl.avg.get(t))
+                mq, be_n = breakeven_offset_quotes(
+                    mq, own_pos, self.pnl.avg.get(t),
+                    loss_c=BE_OFFSET_LOSS_C if be_far else 0.0)
             if be_n:
                 self._be_offset_n[t] = (int(abs(own_pos)), be_n)
                 be_side = "bid" if own_pos < 0 else "ask"
@@ -50758,7 +50775,8 @@ class IncentiveMarketMaker:
             + (f"selected markets {BE_OFFSET_DAYS:g}+ days from their stop -- the "
                f"side that reduces the bot's own position (>= "
                f"{BE_OFFSET_MIN_CONTRACTS:g}) rests the whole position on its "
-               f"breakeven-or-better rung (markets earning rewards only)"
+               f"rung nearest the touch at breakeven or better, or at most "
+               f"{BE_OFFSET_LOSS_C:g}c worse (markets earning rewards only)"
                if BE_OFFSET_DAYS > 0 else "off"))
         log("ca unwind (2026-11-07): "
             + ("selected Carbon Arc markets -- the side that reduces the bot's own "
