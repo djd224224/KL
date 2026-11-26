@@ -12776,8 +12776,40 @@ SERIES_OVERRIDES["KXTRUMPAPPROVE"] = SeriesOverride(
 # a hand resize inside its control half would move that half's baseline.
 # IMM_APRPOTUS_SIZE_MULT=3 puts it back on the twin's size.
 APRPOTUS_SIZE_MULT = _env_float("IMM_APRPOTUS_SIZE_MULT", 5.0)
+# WEEKDAY MORNING STAND-DOWN (Jack 2026-11-26: "Yes, build it", on the
+# daily review's R-261125-01 and "any adjustments i can make besides size?").
+# Our 193 maker fills 10/20-11/26 marked to settlement (26NOV27 at its mid):
+# those in Mon-Fri 08:00-12:00 ET -- the hours RCP's editors move the
+# Average, and takers lead the move by minutes (the daily twin's tape study,
+# 9/26) -- lost $308 (55 fills), every other hour together made +$41, while
+# those hours earned 16.8% of the modelled rewards (~$92 of $548 since
+# 10/26): ~+$216 net over the five weeks. 26NOV20 holds most of it (short
+# 343 of 38.2-38.4 sold Tue 11/17 08:09-09:17 ET while RCP stepped 38.6 ->
+# 38.3; settled YES), and the sample is six weekly events. The short-horizon
+# mark-outs barely moved (60 min -2.0c -> -3.5c); the carry to settlement
+# did (-0.9c -> -18.1c). The weekly quotes nothing in the window and its
+# resting orders are cancelled, closes included (the blackout path of the CPI
+# pilot and the 10-year's 06-07 ET); positions ride through it. Weekends,
+# the other hours, the size and the 07:00 ET settlement-day cutoff are
+# unchanged; the daily KXTRUMPAPPROVE is untouched.
+# IMM_APRPOTUS_BLACKOUT_ET ("HH:MM-HH:MM" ET; "" = off).
+
+
+def aprpotus_blackout(raw) -> Optional[Tuple[str, str]]:
+    """IMM_APRPOTUS_BLACKOUT_ET ("08:00-12:00") -> ("08:00", "12:00"); None
+    (no stand-down) for an empty or malformed value."""
+    parts = [p.strip() for p in str(raw or "").split("-")]
+    if len(parts) != 2 or not all(re.fullmatch(r"\d\d:\d\d", p) for p in parts):
+        return None
+    return parts[0], parts[1]
+
+
+APRPOTUS_BLACKOUT_ET = aprpotus_blackout(
+    os.environ.get("IMM_APRPOTUS_BLACKOUT_ET", "08:00-12:00"))
 SERIES_OVERRIDES["KXAPRPOTUS"] = replace(SERIES_OVERRIDES["KXTRUMPAPPROVE"],
-                                         size_mult=APRPOTUS_SIZE_MULT)
+                                         size_mult=APRPOTUS_SIZE_MULT,
+                                         blackout_et=APRPOTUS_BLACKOUT_ET,
+                                         blackout_weekdays_only=True)
 # KXTRUMPVH, VoteHub's approval average read at 10:00 AM ET on the ticker
 # date (Jack 2026-10-31: "Add at x3", on "x3 under the RCP weekly's rules:
 # out at 7 AM ET on read day, and outside the size test"). The twin's
@@ -15587,6 +15619,7 @@ _CONFIG_CODE_KNOBS = (
     "ELECTION_SIZE_MULT",         # the family x2 (2026-10-11)
     "PRESRUN_SIZE_MULT", "NO_SIDE_ONLY_EVENTS",   # KXPRESRUN-28 (2026-10-11)
     "APRPOTUS_SIZE_MULT",         # the weekly RCP approval x5 (2026-10-25)
+    "APRPOTUS_BLACKOUT_ET",       # its weekday 08-12 ET stand-down (2026-11-26)
     "TRUMPVH_SIZE_MULT",          # the weekly VoteHub approval x3 (2026-10-31)
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     "CONTROLS_SIZE_MULT",         # CONTROLS (2028 Senate) x6 (2026-11-24)
@@ -44244,14 +44277,18 @@ class IncentiveMarketMaker:
                 cpi = meta.series in CPI_PILOT_SERIES
                 ust = meta.series in UST_EARLY_BLACKOUT_SERIES   # 10Y 06-07 ET (2026-10-22)
                 _bo_win = astest_window_series(meta.series)
+                # the RCP weekly's weekday 08-12 ET stand-down (2026-11-26)
+                apr = meta.series == "KXAPRPOTUS" and APRPOTUS_BLACKOUT_ET is not None
                 if n:
                     log(f"{self.tag} {t}: "
                         + ("CPI pilot release blackout" if cpi else
                            "Treasury 06-07 ET blackout" if ust else
-                           "outside its AS quote window" if _bo_win else "AAA print blackout")
+                           "outside its AS quote window" if _bo_win else
+                           "RCP weekly morning stand-down" if apr else "AAA print blackout")
                         + f"; cancelled {n}")
                 _bo_guard = ("cpi_blackout" if cpi else "ust_blackout" if ust else
-                             "astest_window" if _bo_win else "aaa_blackout")
+                             "astest_window" if _bo_win else
+                             "aprpotus_blackout" if apr else "aaa_blackout")
                 self._gskip(t, _bo_guard, lambda: dict(n_cx=n))
                 continue
             # STATE STATISTICS RELEASE PAUSE (2026-10-22): the same stand-aside
@@ -50363,6 +50400,11 @@ class IncentiveMarketMaker:
             log(f"Treasury early blackout (2026-10-22): {','.join(_ust_bo)} out "
                 f"{'-'.join(UST_EARLY_BLACKOUT_ET)} ET on weekdays -- orders "
                 f"cancelled, markets held (its 6 AM fills lost $249 since 9/25)")
+        if APRPOTUS_BLACKOUT_ET is not None:
+            log(f"RCP weekly morning stand-down (2026-11-26): KXAPRPOTUS out "
+                f"{'-'.join(APRPOTUS_BLACKOUT_ET)} ET on weekdays -- orders "
+                f"cancelled, markets held (those hours' fills lost $308 to "
+                f"settlement 10/20-11/26)")
         if LOWT_ENABLE:
             log(f"low-temp family (2026-10-23): {LOWT_PREFIX}* next day only (out "
                 f"00:00 ET of the market day); lowt_fair gate tol "

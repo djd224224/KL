@@ -125,7 +125,9 @@ GATE_GUARDS = ("treasury_yield", "rain_monthly", "rain_period", "snow_monthly", 
 BLACKOUT_GUARDS = ("cpi_blackout", "aaa_blackout", "ust_blackout", "release_pause",
                    # an AS family outside its quote window (MLB next team's
                    # 00:00-07:00 ET nights, 2026-11-26)
-                   "astest_window")
+                   "astest_window",
+                   # the RCP weekly's weekday 08-12 ET stand-down (2026-11-26)
+                   "aprpotus_blackout")
 LIVE_GUARDS = ("league_live", "nfl_live", "mlb_mvp", "league_team_news", "nfl_team_news",
                "announce_halt", "announce_hold")
 DEPTH_GUARDS = ("event_depth_trip", "event_depth_hold")
@@ -152,6 +154,7 @@ GUARD_LABELS = {
     "rt_settled_off": "RT settled strikes",
     "cpi_blackout": "CPI", "aaa_blackout": "AAA gas", "ust_blackout": "Treasury 6-7am",
     "release_pause": "state stats", "astest_window": "AS quote windows",
+    "aprpotus_blackout": "RCP weekly 8am-noon",
     "league_live": "leagues live", "nfl_live": "NFL live", "mlb_mvp": "MLB MVP games",
     "league_team_news": "team news", "nfl_team_news": "NFL team news",
     "announce_halt": "announcement jump", "announce_hold": "announcement hold",
