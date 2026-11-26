@@ -91,6 +91,9 @@ ALLOW = {
     "cycle_log": "csv", "orders": "jsonl", "marks": "jsonl", "selection_snapshot": "jsonl",
     "selection_events": "jsonl", "floor_state": "jsonl", "guard_skips": "jsonl",
     "back_of_line": "jsonl", "ws_stale": "jsonl", "risk_dry": "jsonl",
+    # imm_quote_gaps' scan archive (review R-261124-24, ~3 MB a day); its one
+    # reader, imm_review.gap_scans_of_day, opens it through imm_logfiles
+    "gap_scans": "jsonl",
 }
 NEVER = ("fills", "settlements", "realized", "book_depth")
 assert not set(ALLOW) & set(NEVER)

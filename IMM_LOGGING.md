@@ -208,7 +208,9 @@ a day.
 The daily review adds up the ET day (`imm_review.whole_day_misses`). Each scan
 stands for the time to the next one, capped at 2h. This catches pools that ended
 before the 04:30 morning scan. `IMM_GAPS_ARCHIVE=0` stops the writes, and
-`IMM_GAPS_ARCHIVE_DIR` moves them (tests).
+`IMM_GAPS_ARCHIVE_DIR` moves them (tests). The files are gzipped after 35 days
+with the other text sinks (see "Retention" below). The review reads the `.gz`
+through `imm_logfiles`, so a re-run for an old day adds up the same day.
 
 ### ws_stale (2026-10-04)
 
@@ -341,8 +343,8 @@ place once they are 35 days old, so `cycle_log_2026-10-01.csv` becomes
 
 - **What:** an allowlist. `cycle_log`, `orders`, `marks`, `selection_snapshot`,
   `selection_events`, `floor_state`, `guard_skips`, `back_of_line`, `ws_stale`,
-  `risk_dry`, and the console logs `incentive-mm-<date>.log`, judged by their
-  last write.
+  `risk_dry`, `gap_scans` (added 2026-11-25), and the console logs
+  `incentive-mm-<date>.log`, judged by their last write.
   - **Never:** `fills` (the bot reads 30 days of them for its marks),
     `settlements`, `realized`, `book_depth` (already gzip).
   - A new sink stays plain until it is added to `ALLOW`.

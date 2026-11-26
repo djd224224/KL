@@ -440,6 +440,32 @@ class CounterfactualTests(Base):
         self.assertEqual(wd["scans"], 0)
         self.assertIn("no gap_scans file", wd["note"])
 
+    def test_whole_day_reads_compressed_gap_scans(self):
+        # gap_scans joined imm_log_retention's ALLOW: a re-run for a day past 35 days
+        # reads the .gz copies and adds up the same day
+        import imm_log_retention as ret
+        self.assertEqual(ret.ALLOW.get("gap_scans"), "jsonl")
+        s, _e = rv.et_bounds(DAY)
+        iso = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        A = {"event": "KXA-1", "series": "KXA", "n": 2, "n_est": 2, "pool": 100.0, "est": 24.0,
+             "reason": "screened: extreme_mid"}
+        by_u = defaultdict(list)
+        for ts in (s + 3600, s + 13 * 3600, s + 22 * 3600):          # 22:00 ET is the next UTC day
+            by_u[datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")].append(
+                {"ts": iso(ts), "source": "scan", "ctx": {}, "rows": [A]})
+        self.assertEqual(len(by_u), 2)
+        for u, recs in by_u.items():
+            self.jsonl(f"gap_scans_{u}.jsonl", recs)
+        scans, wd = rv.gap_scans_of_day(DAY), rv.sec_counterfactual(DAY)["whole_day"]
+        self.assertEqual(wd["scans"], 3)
+        for name in os.listdir(self.status):
+            if name.startswith("gap_scans_"):
+                self.assertEqual(ret.compress_file(os.path.join(self.status, name))["action"], "compressed")
+        self.assertEqual(sorted(n for n in os.listdir(self.status) if n.startswith("gap_scans_")),
+                         sorted(f"gap_scans_{u}.jsonl.gz" for u in by_u))
+        self.assertEqual(rv.gap_scans_of_day(DAY), scans)
+        self.assertEqual(rv.sec_counterfactual(DAY)["whole_day"], wd)
+
     def test_reason_class(self):
         self.assertEqual(rv.reason_class("screened: extreme_mid, under payout floor"), "market screen")
         self.assertEqual(rv.reason_class("under payout floor, screened: x"), "economics")

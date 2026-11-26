@@ -81,6 +81,14 @@ class RetentionTests(unittest.TestCase):
                          ["cycle_log_2026-10-02.csv", "orders_2026-10-02.jsonl"])
         self.assertEqual(held, [])
 
+    def test_the_gap_scan_archive_is_allowlisted(self):
+        # review R-261124-24's gap_scans_<UTC date>.jsonl (~3 MB a day) joins the allowlist
+        self.put("gap_scans_2026-10-02.jsonl")
+        self.put("gap_scans_2026-10-23.jsonl")        # 35 days old: not past the cutoff
+        todo, held = ret.scan(self.dir, self.arch, now=NOW)
+        self.assertEqual([r["name"] for r in todo], ["gap_scans_2026-10-02.jsonl"])
+        self.assertEqual(held, [])
+
     def test_cutoff_is_the_dashboard_history_plus_five(self):
         self.assertEqual(ret.CUTOFF_DAYS, ret.HISTORY_DAYS + 5)
         with mock.patch.dict(os.environ, {"IMM_DASH_HISTORY_DAYS": "40"}):
