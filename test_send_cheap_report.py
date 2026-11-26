@@ -57,5 +57,46 @@ class TestFillCost(unittest.TestCase):
         self.assertAlmostEqual(out["KXMOONMAN-31-R"][0]["px"], 2.0)
 
 
+class TestSideBook(unittest.TestCase):
+    """Jack 2026-11-26: "yes fix it" -- XBER's 25,000 bought at 0.3c and sold
+    back at 0.3c on 11/25 read "50,000 filled ($25,000.00); holds 50,000": the
+    sell-back (an ask) was booked as a second purchase, of NO at 99.7c."""
+
+    def test_a_round_trip_is_flat_at_no_cost(self):
+        fl = [{"side": "yes", "px": 0.3, "n": 25000.0},     # the rung's bid
+              {"side": "no", "px": 99.7, "n": 25000.0}]     # the at-cap unwind's ask at 0.3c
+        sb = rep.side_book(fl, "yes", v_yes=0.0035)
+        self.assertAlmostEqual(sb["bought_usd"], 75.0)
+        self.assertAlmostEqual(sb["sold_usd"], 75.0)
+        self.assertEqual((sb["bought_n"], sb["sold_n"], sb["n"]), (25000.0, 25000.0, 0.0))
+        self.assertAlmostEqual(sb["cost"], 0.0)
+        self.assertAlmostEqual(sb["worth"], 0.0)
+
+    def test_a_partial_sell_back_keeps_the_rest_at_net_cost(self):
+        fl = [{"side": "yes", "px": 1.0, "n": 10000.0}, {"side": "no", "px": 99.0, "n": 4000.0}]
+        sb = rep.side_book(fl, "yes", v_yes=0.008)
+        self.assertEqual((sb["held_side"], sb["n"]), ("yes", 6000.0))
+        self.assertAlmostEqual(sb["cost"], 60.0)              # $100 bought - $40 sold back
+        self.assertAlmostEqual(sb["worth"], 48.0)
+
+    def test_a_no_side_rung_holds_no(self):
+        fl = [{"side": "no", "px": 2.0, "n": 10000.0}]        # a NO bid at 2c (YES ask at 98c)
+        sb = rep.side_book(fl, "no", v_yes=0.985)
+        self.assertEqual((sb["held_side"], sb["n"]), ("no", 10000.0))
+        self.assertAlmostEqual(sb["cost"], 200.0)
+        self.assertAlmostEqual(sb["worth"], 150.0)
+
+    def test_selling_more_than_was_bought_holds_the_other_contract(self):
+        sb = rep.side_book([{"side": "no", "px": 98.0, "n": 1000.0}], "yes", v_yes=0.02)
+        self.assertEqual((sb["held_side"], sb["n"]), ("no", 1000.0))
+        self.assertAlmostEqual(sb["cost"], 980.0)             # the NO at 98c
+        self.assertAlmostEqual(sb["worth"], 980.0)            # worth - cost = the P&L, 0 here
+
+    def test_the_side_defaults_to_the_first_fill_and_worth_waits_for_a_price(self):
+        sb = rep.side_book([{"side": "no", "px": 1.0, "n": 500.0}])
+        self.assertEqual(sb["side"], "no")
+        self.assertIsNone(sb["worth"])
+
+
 if __name__ == "__main__":
     unittest.main()

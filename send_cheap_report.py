@@ -250,6 +250,36 @@ def fills_in(tickers, lo, hi, spans=None):
     return dict(out)
 
 
+def side_book(fl, side=None, v_yes=None):
+    """One market's fills in the terms of its cheap-side contract (`side`, or
+    the first fill's): a fill buying that contract opens; one buying the other
+    sells it back -- Kalshi nets YES against NO in one market, so the at-cap
+    unwind's ask on a YES rung closes YES. It is not a second purchase at
+    100 - px (Jack 2026-11-26: XBER's 25,000 bought at 0.3c and sold at 0.3c
+    on 11/25 read "50,000 filled ($25,000.00); holds 50,000").
+
+    cost = cash spent net of what was sold back (plus, if more was sold than
+    bought, the other contract's price for the excess); worth = what is held
+    now at v_yes (None while unpriced); worth - cost is the market's fill P&L."""
+    side = side or (fl[0]["side"] if fl else "yes")
+    b_n = b_usd = s_n = s_usd = 0.0
+    for x in fl:
+        if x["side"] == side:
+            b_n += x["n"]
+            b_usd += x["n"] * x["px"] / 100.0
+        else:
+            s_n += x["n"]
+            s_usd += x["n"] * (100.0 - x["px"]) / 100.0
+    held = b_n - s_n
+    out = {"side": side, "bought_n": b_n, "bought_usd": b_usd, "sold_n": s_n, "sold_usd": s_usd,
+           "held_side": side if held >= 0 else ("no" if side == "yes" else "yes"),
+           "n": abs(held), "cost": b_usd - s_usd + (0.0 if held >= 0 else -held), "worth": None}
+    if v_yes is not None:
+        v_side = v_yes if out["held_side"] == "yes" else 1.0 - v_yes
+        out["worth"] = abs(held) * v_side
+    return out
+
+
 def market_values(tickers):
     """{ticker: {"yes": value of 1 YES in $, "status"}} from Kalshi now: the
     settlement if settled, else the mid."""
@@ -321,29 +351,33 @@ def build(day, now):
     fills_all = fills_in(all_t, lo_all, now, spans)
     vals = market_values(all_t | set(fills_all))
     rest = resting_now(set(cur))
+
+    def side_of(t):
+        # the listed contract, else the market's first fill since launch (its opening one)
+        e = listed.get(t) or cur.get(t) or {}
+        return e.get("side") or ((fills_all.get(t) or fills.get(t) or [{}])[0].get("side"))
+
     per = []
+    day_fill_cost = day_fill_worth = 0.0
     for t in sorted(set(listed) | set(fills)):
         e = listed.get(t) or {}
         r = rew.get(t, [0.0, 0, 0])
-        fl = fills.get(t, [])
+        sb = side_book(fills.get(t, []), side_of(t))
         per.append({"t": t, "side": e.get("side"), "px": e.get("px"), "size": e.get("size"),
                     "stop": e.get("stop"), "usd": r[0], "cycles": r[1], "quoted": r[2],
-                    "fill_n": sum(x["n"] for x in fl),
-                    "fill_cost": sum(x["n"] * x["px"] / 100 for x in fl)})
-    pos = {}
-    for t, fl in fills_all.items():
-        v = (vals.get(t) or {}).get("yes")
-        n = sum(x["n"] for x in fl)
-        cost = sum(x["n"] * x["px"] / 100 for x in fl)
-        worth = None if v is None else sum(x["n"] * (v if x["side"] == "yes" else 1 - v) for x in fl)
-        pos[t] = {"n": n, "cost": cost, "worth": worth}
-    day_rew = sum(x["usd"] for x in per)
-    day_fill_cost = sum(x["fill_cost"] for x in per)
-    day_fill_worth = 0.0
-    for t, fl in fills.items():
+                    "fill_n": sb["bought_n"], "fill_cost": sb["bought_usd"],
+                    "sold_n": sb["sold_n"], "sold_usd": sb["sold_usd"]})
+        # the day's fills at today's marks: net cash out, and the net change in
+        # what is held (signed, in the listed contract)
+        day_fill_cost += sb["bought_usd"] - sb["sold_usd"]
         v = (vals.get(t) or {}).get("yes")
         if v is not None:
-            day_fill_worth += sum(x["n"] * (v if x["side"] == "yes" else 1 - v) for x in fl)
+            v_side = v if sb["side"] == "yes" else 1.0 - v
+            day_fill_worth += (sb["bought_n"] - sb["sold_n"]) * v_side
+    pos = {}
+    for t, fl in fills_all.items():
+        pos[t] = side_book(fl, side_of(t), (vals.get(t) or {}).get("yes"))
+    day_rew = sum(x["usd"] for x in per)
     days[str(day)] = {"rewards": round(day_rew, 4), "fill_cost": round(day_fill_cost, 4),
                       "markets": len(per), "by_ticker": {x["t"]: round(x["usd"], 4) for x in per}}
     store["launch"] = launch
@@ -351,6 +385,9 @@ def build(day, now):
     tot_rew = sum(v.get("rewards", 0.0) for k, v in days.items() if k <= str(day))
     tot_cost = sum(p["cost"] for p in pos.values())
     tot_worth = sum(p["worth"] or 0.0 for p in pos.values())
+    tot_sold = sum(p["sold_usd"] for p in pos.values())
+    day_bought_n = sum(x["fill_n"] for x in per)
+    day_sold_n = sum(x["sold_n"] for x in per)
     risk = sum((e.get("size") or 0) * (e.get("px") or 0) / 100 for e in cur.values())
     n_rest = None if rest is None else sum(1 for t in cur if rest.get(t, 0) > 0)
     full = [t for t, e in cur.items() if (pos.get(t) or {}).get("n", 0) >= (e.get("size") or 1e18)]
@@ -362,8 +399,11 @@ def build(day, now):
                    f"${tot_rew:,.2f} of rewards")
     else:
         verdict = "KEEP"
-        if day_fill_cost > 0:
-            why.append(f"a rung filled yesterday ({sum(x['fill_n'] for x in per):,.0f} contracts)")
+        if day_bought_n > 0:
+            why.append(f"a rung filled yesterday ({day_bought_n:,.0f} contracts"
+                       + (f"; {day_sold_n:,.0f} sold back" if day_sold_n else "") + ")")
+        elif day_sold_n > 0:
+            why.append(f"{day_sold_n:,.0f} contracts were sold back yesterday")
         if full:
             why.append(f"{len(full)} market(s) filled to their cap and rest nothing: {', '.join(full[:5])}")
         if not cur:
@@ -390,7 +430,10 @@ def build(day, now):
             "disc_series": [x["series"] for x in (disc or {}).get("candidates") or []],
             "day": str(day), "lo": lo, "hi": hi_eff, "per": per, "pos": pos, "vals": vals,
             "day_rew": day_rew, "day_fill_cost": day_fill_cost, "day_fill_worth": day_fill_worth,
+            "day_bought_usd": sum(x["fill_cost"] for x in per),
+            "day_sold_usd": sum(x["sold_usd"] for x in per),
             "tot_rew": tot_rew, "tot_cost": tot_cost, "tot_worth": tot_worth, "net_all": net_all,
+            "tot_sold": tot_sold,
             "listed_now": len(cur), "resting_now": n_rest, "risk": risk, "ends": ends,
             "verdict": verdict, "why": why, "store": store, "launch": launch}
 
@@ -398,12 +441,16 @@ def build(day, now):
 def render(c):
     d = datetime.strptime(c["day"], "%Y-%m-%d")
     day_net = c["day_rew"] + c["day_fill_worth"] - c["day_fill_cost"]
+    bought, sold = c.get("day_bought_usd", c["day_fill_cost"]), c.get("day_sold_usd", 0.0)
+    fills_txt = (f"${bought:,.2f} of fills bought" + (f" and ${sold:,.2f} sold back" if sold else "")
+                 + f", {c['day_fill_worth'] - c['day_fill_cost']:+,.2f} at today's marks"
+                 if bought or sold else "no fills")
     lines = [
         f"{c['verdict']}: about ${day_net:+,.2f} on {d:%a %m/%d} (ET) -- ${c['day_rew']:,.2f} of "
-        f"modelled rewards on {len(c['per'])} cheap-side markets, ${c['day_fill_cost']:,.2f} of fills "
-        f"worth ${c['day_fill_worth']:,.2f} now.",
-        f"Since launch ({c['launch'][:10]}): rewards ${c['tot_rew']:,.2f}, fills cost ${c['tot_cost']:,.2f} "
-        f"and are worth ${c['tot_worth']:,.2f} now, net ${c['net_all']:+,.2f}.",
+        f"modelled rewards on {len(c['per'])} cheap-side markets, {fills_txt}.",
+        f"Since launch ({c['launch'][:10]}): rewards ${c['tot_rew']:,.2f}, fills cost ${c['tot_cost']:,.2f}"
+        + (f" net of ${c['tot_sold']:,.2f} sold back" if c.get("tot_sold") else "")
+        + f", and what is held is worth ${c['tot_worth']:,.2f} now, net ${c['net_all']:+,.2f}.",
         f"Now: {c['listed_now']} listed, "
         + (f"{c['resting_now']} resting on Kalshi" if c["resting_now"] is not None else "resting orders unread")
         + f", ${c['risk']:,.0f} if every rung fills; programs end {', '.join(c['ends']) or '-'} "
@@ -417,9 +464,11 @@ def render(c):
         p = c["pos"].get(x["t"]) or {}
         q = f"{x['quoted'] / x['cycles'] * 100:.0f}%" if x["cycles"] else "-"
         rung = f"{(x['side'] or '?').upper()} {x['px']}c x{x['size']}" if x["side"] else "delisted"
-        posn = (f"holds {p['n']:,.0f} (cost ${p['cost']:,.2f}, worth ${p['worth'] or 0:,.2f})"
-                if p.get("n") else "flat")
-        fl = f"{x['fill_n']:,.0f} filled (${x['fill_cost']:,.2f})" if x["fill_n"] else "no fills"
+        posn = (f"holds {p['n']:,.0f} {p['held_side'].upper()} (cost ${p['cost']:,.2f}, "
+                f"worth ${p['worth'] or 0:,.2f})" if p.get("n") else "flat")
+        fl = ", ".join(([f"{x['fill_n']:,.0f} filled (${x['fill_cost']:,.2f})"] if x["fill_n"] else [])
+                       + ([f"{x['sold_n']:,.0f} sold back (${x['sold_usd']:,.2f})"]
+                          if x.get("sold_n") else [])) or "no fills"
         book = (c["vals"].get(x["t"]) or {}).get("book", "")
         lines.append(f"  {x['t']:36} ${x['usd']:6.2f}  quoted {q:>4}  {rung:15} {fl}; {posn}; book {book}")
     lines += ["",
@@ -434,7 +483,7 @@ def subject(c):
     d = datetime.strptime(c["day"], "%Y-%m-%d")
     net = c["day_rew"] + c["day_fill_worth"] - c["day_fill_cost"]
     return (f"Cheap-side books {d:%m/%d}: {net:+.2f} (rewards ${c['day_rew']:.2f}, fills "
-            f"${c['day_fill_cost']:.2f}) -- {c['verdict']}"
+            f"${c.get('day_bought_usd', c['day_fill_cost']):.2f}) -- {c['verdict']}"
             + (f" | {c['n_new']} new series to review" if c.get("n_new") else ""))
 
 

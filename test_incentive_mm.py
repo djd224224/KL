@@ -10867,7 +10867,7 @@ class TestEventLevelStandoff(unittest.TestCase):
         a, b = "KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B"
         self.assertEqual(imm.MANUAL_COEXIST_EVENTS, frozenset({
             "KXVTPERMITS-27MAY03", "KXNYCASKRENT-27JAN31", "KXILNUCLEAR-27FEB28",
-            "KXCABUILDPERMITS-27JAN27", "KXPAMFGEMP-27APR30"}))
+            "KXCABUILDPERMITS-27JAN27", "KXPAMFGEMP-27APR30", "KXSTATE51-29"}))
         self.assertTrue(imm.manual_coexist("KXNYCASKRENT", "KXNYCASKRENT-27JAN31"))
         self.assertFalse(imm.manual_coexist("KXNYCASKRENT", "KXNYCASKRENT-27FEB28"))
 
@@ -10894,6 +10894,38 @@ class TestEventLevelStandoff(unittest.TestCase):
         bot = run(coexist=False)                       # elsewhere: the standoff
         self.assertNotIn(a, bot.state.selected)
         self.assertEqual(bot.state.sim_orders, {})
+
+    def test_a_dated_coexist_entry_stands_off_until_its_start(self):
+        """Jack 2026-11-26: "start quoting 51st state at the next reward" --
+        KXSTATE51-29@2026-11-27T05:00:00Z: his hand NO stands the event off
+        until the new program period, then the bot trades beside it."""
+        start = datetime(2026, 11, 27, 5, tzinfo=timezone.utc)
+        self.assertEqual(imm.MANUAL_COEXIST_FROM["KXSTATE51-29"], start)
+        self.assertIsNone(imm.MANUAL_COEXIST_FROM["KXNYCASKRENT-27JAN31"])   # undated: always
+        self.assertFalse(imm.manual_coexist("KXSTATE51", "KXSTATE51-29",
+                                            now_utc=start - timedelta(seconds=1)))
+        self.assertTrue(imm.manual_coexist("KXSTATE51", "KXSTATE51-29", now_utc=start))
+        self.assertTrue(imm.manual_coexist("KXNYCASKRENT", "KXNYCASKRENT-27JAN31",
+                                           now_utc=start - timedelta(days=400)))
+        # the parse: Z / offset / naive (read as UTC); an unreadable start leaves it out
+        got = imm._coexist_entries(" A-1 , B-2@2026-11-27T05:00:00Z,C-3@2026-11-27T00:00:00-05:00,"
+                                   "D-4@2026-11-27T05:00:00,E-5@soon,,")
+        self.assertEqual(got, {"A-1": None, "B-2": start, "C-3": start, "D-4": start})
+
+        _clean_persist()
+        a, b = "KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B"
+
+        def manual(started: bool):
+            client = FakeClient()
+            client.markets[b] = dict(client.markets[a], ticker=b)
+            client.positions[b] = -400         # his hand NO on a sibling
+            bot = IncentiveMarketMaker(client=client, live=False)
+            frm = datetime.now(timezone.utc) + timedelta(hours=-1 if started else 1)
+            with mock.patch.object(imm, "MANUAL_COEXIST_EVENTS", frozenset({"KXGOOD-99DEC31"})), \
+                    mock.patch.object(imm, "MANUAL_COEXIST_FROM", {"KXGOOD-99DEC31": frm}):
+                return bot.manual_events(client.positions)
+        self.assertEqual(manual(started=False), {"KXGOOD-99DEC31"})   # before: the standoff
+        self.assertEqual(manual(started=True), set())                 # from it: beside him
 
 
 class TestStpProtectsUser(unittest.TestCase):

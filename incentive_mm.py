@@ -14553,18 +14553,56 @@ MANUAL_STANDOFF_CONTRACTS = _env_float("IMM_MANUAL_STANDOFF", 5)
 # WITHOUT its forced selection: the cap, skew and unwind track the bot's OWN
 # book, and only a live non-imm order still yields the one market it rests on.
 # Selection, the payout floor and every other guard apply as usual.
-MANUAL_COEXIST_EVENTS = frozenset(e.strip() for e in os.environ.get(
+# An entry may carry a start, "EVENT@<ISO time>": before it the event stands
+# off as any other (Jack 2026-11-26: "start quoting 51st state at the next
+# reward" -- KXSTATE51-29 from its 11/27 05:00Z program period, the cheap-side
+# rungs on all five listed markets beside his hand NO in six of its eight; a
+# fill there nets against his NO first, which he chose over "only where I
+# hold nothing"). IMM_MANUAL_COEXIST_EVENTS replaces the whole list.
+
+
+def _coexist_entries(raw: str) -> Dict[str, Optional[datetime]]:
+    """{event: start (UTC) or None} from "EV1,EV2@2026-11-27T05:00:00Z,...";
+    an entry whose start does not parse is left out, and said so."""
+    out: Dict[str, Optional[datetime]] = {}
+    for part in raw.split(","):
+        ev, _, frm = part.strip().partition("@")
+        ev, frm = ev.strip(), frm.strip()
+        if not ev:
+            continue
+        start = None
+        if frm:
+            try:
+                start = datetime.fromisoformat(frm.replace("Z", "+00:00"))
+            except ValueError:
+                print(f"[IMM] ! IMM_MANUAL_COEXIST_EVENTS: {part.strip()!r} has an unreadable "
+                      f"start -- left out (the event stands off)", flush=True)
+                continue
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+        out[ev] = start
+    return out
+
+
+MANUAL_COEXIST_FROM = _coexist_entries(os.environ.get(
     "IMM_MANUAL_COEXIST_EVENTS",
     "KXVTPERMITS-27MAY03,KXNYCASKRENT-27JAN31,KXILNUCLEAR-27FEB28,"
-    "KXCABUILDPERMITS-27JAN27,KXPAMFGEMP-27APR30").split(",") if e.strip())
+    "KXCABUILDPERMITS-27JAN27,KXPAMFGEMP-27APR30,"
+    "KXSTATE51-29@2026-11-27T05:00:00Z"))
+MANUAL_COEXIST_EVENTS = frozenset(MANUAL_COEXIST_FROM)
 
 
-def manual_coexist(series: str, event_ticker: str) -> bool:
+def manual_coexist(series: str, event_ticker: str,
+                   now_utc: Optional[datetime] = None) -> bool:
     """The user's hand positions here are his, not the bot's inventory and
-    not a reason to stand off: a quote_all series, MANUAL_COEXIST_EVENTS, or
-    an election night session (ENS_EVENTS)."""
+    not a reason to stand off: a quote_all series, MANUAL_COEXIST_EVENTS (from
+    its start, if it has one), or an election night session (ENS_EVENTS)."""
+    listed = event_ticker in MANUAL_COEXIST_EVENTS
+    if listed:
+        start = MANUAL_COEXIST_FROM.get(event_ticker)
+        listed = start is None or (now_utc or datetime.now(timezone.utc)) >= start
     return bool((series_override(series) or SeriesOverride()).quote_all
-                or event_ticker in MANUAL_COEXIST_EVENTS
+                or listed
                 or event_ticker in ENS_EVENTS)
 
 # Self-trade prevention. The bot's orders are ALWAYS post-only (resting
