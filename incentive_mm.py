@@ -15675,6 +15675,7 @@ _CONFIG_CODE_KNOBS = (
     "ART_PRICE_MIN", "ART_PRICE_MAX",                    # KXART 2-98c (2026-11-11)
     "OSCAR_PRICE_MIN", "OSCAR_PRICE_MAX",                # KXOSCAR* 1-99c (2026-11-13)
     "GOODREADS_PRICE_MIN", "GOODREADS_PRICE_MAX",        # KXGOODREADS 1-99c (2026-11-26)
+    "GOODREADS_COST_TIERS_BID", "GOODREADS_COST_TIERS_ASK",   # its cost tiers (2026-11-26)
     "ART_BOOST_SIDE_CAP", "ART_BOOST_CHEAP_C", "ART_BOOST_CHEAP_SIDE_CAP",
     "ART_EVENT_CAP",                                     # ART FLOOR BOOST (2026-11-11)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
@@ -20610,18 +20611,22 @@ def touch_mid(ext_bid: Optional[float], ext_ask: Optional[float]) -> Optional[fl
 
 
 def side_size_mults(ticker: str, now_utc: datetime,
-                    yes_mid: Optional[float] = None) -> Tuple[float, float]:
+                    yes_mid: Optional[float] = None,
+                    touch: Optional[Tuple[Optional[float], Optional[float]]] = None
+                    ) -> Tuple[float, float]:
     """(bid_mult, ask_mult) on this market's ladder right now: the Carbon Arc
     late-month rule times the series' own side sizes (SIDE_MULT_SERIES, else
     its family's lean, else a KXRT strike's ladder lean: market_side_mults)
-    and, given the YES mid, the event long-shot cut, with
+    and, given the YES mid, the event long-shot cut, and given the (bid, ask)
+    `touch`, the COST TIERS (cost_side_mults), with
     asks zeroed for a bid-only family (a quake ask strike keeps its ask side;
     quake_cap_quotes sizes and floors it) and bids zeroed for a NO-side-only
     market (no_side_only)."""
     bm, am = ca_late_month_mults(ticker, now_utc)
     sb, sa = market_side_mults(ticker)
     lb, la = longshot_side_mults(series_of(ticker), yes_mid)
-    bm, am = bm * sb * lb, am * sa * la
+    cb, ca = cost_side_mults(series_of(ticker), *(touch or (None, None)))
+    bm, am = bm * sb * lb * cb, am * sa * la * ca
     if series_bid_only(series_of(ticker)) and not quake_ask_strike(ticker):
         am = 0.0
     if no_side_only(ticker):
@@ -20641,7 +20646,8 @@ def side_mult_change_points(ticker: str) -> List[datetime]:
 
 
 def floor_size_profile(series: str, ticker: str, start_utc: datetime,
-                       horizon_days: float, hour_schedule: bool = True
+                       horizon_days: float, hour_schedule: bool = True,
+                       touch: Optional[Tuple[Optional[float], Optional[float]]] = None
                        ) -> List[Tuple[Tuple[float, float, float], float]]:
     """[((hour_mult, bid_mult, ask_mult), share of the window)], sorted: the
     size_mult_profile() mix with the per-side multipliers (side_size_mults)
@@ -20650,10 +20656,11 @@ def floor_size_profile(series: str, ticker: str, start_utc: datetime,
     step the 14-day walk cap would never reach still lands at its instant.
     `hour_schedule` False = the flat day size (FLOOR_PROJECTION_SCHEDULE
     off) with the side split kept. An empty window reports the live
-    multipliers alone."""
+    multipliers alone. `touch` = the (bid, ask) the COST TIERS read, held
+    for the window as the estimate holds the book."""
     if horizon_days <= 0:
         return [((hour_size_mult(series, start_utc),)
-                 + side_size_mults(ticker, start_utc), 1.0)]
+                 + side_size_mults(ticker, start_utc, touch=touch), 1.0)]
     end = start_utc + timedelta(days=horizon_days)
     cuts = sorted(c for c in side_mult_change_points(ticker)
                   if start_utc < c < end) if FLOOR_PROJECTION_SIDES else []
@@ -20664,7 +20671,8 @@ def floor_size_profile(series: str, ticker: str, start_utc: datetime,
         if days <= 0:
             continue
         # constant inside a piece; with the split off, the `now` reading
-        sides = side_size_mults(ticker, a + (b - a) / 2 if cuts else start_utc)
+        sides = side_size_mults(ticker, a + (b - a) / 2 if cuts else start_utc,
+                                touch=touch)
         hp = size_mult_profile(series, a, days) if hour_schedule else [(1.0, 1.0)]
         for m, w in hp:
             k = (m,) + sides
@@ -25715,6 +25723,70 @@ SERIES_OVERRIDES["KXOSCAR"] = replace(SERIES_OVERRIDES["KXOSCAR"],
 GOODREADS_BAND_SERIES = "KXGOODREADS"
 GOODREADS_PRICE_MIN = _env_int("IMM_GOODREADS_PRICE_MIN", 1)
 GOODREADS_PRICE_MAX = _env_int("IMM_GOODREADS_PRICE_MAX", 99)
+# GOODREADS COST TIERS (Jack 2026-11-26: "5x when <=2c so 300 size instead of
+# 60", "and 3x when <= 10c", then "the 3x when <=10c should only be on no's
+# not yes"). On the 1-99c band, a Goodreads side rests bigger the less a
+# contract costs at its own EXTERNAL touch -- a YES bid's cost is its price,
+# an ask's (a NO bid's) 100 less its price:
+#   * a YES bid at <= 2c: x5 (a 60 day rung -> 300);
+#   * an ask at >= 98c (NO at <= 2c): x5; at 90-97c (NO at <= 10c): x3
+#     (60 -> 180). The x3 tier is the NO side's only: a 3-10c YES bid keeps
+#     its size (the EVENT LONG-SHOT CUT's finding: in the awards family the
+#     side that buys the cheap YES lost, -4.3c a contract under 30c).
+# On top of the family's x3 and every other side rule; the per-market and
+# per-event caps still bind (an overnight 180 rung x5 stops at the 450
+# position cap). The tier reads the side's touch each cycle, so a side whose
+# touch leaves the tier goes back to its own size at once. The estimate and
+# the $1 floor projection read the same multiples (side_size_mults,
+# floor_size_profile). IMM_GOODREADS_COST_TIERS_BID / _ASK = "C:M,..." (cost
+# cents : multiple, the cheapest matching tier wins); "" turns a side off.
+def _parse_cost_tiers(raw: str) -> Tuple[Tuple[float, float], ...]:
+    """'2:5,10:3' -> ((2.0, 5.0), (10.0, 3.0)), sorted by cost; '' = no
+    tiers. Raises ValueError on a malformed entry."""
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            c, m = (float(x) for x in part.split(":"))
+            out.append((c, max(0.0, m)))
+    return tuple(sorted(out))
+
+
+def _cost_tiers_env(name: str, default: str) -> Tuple[Tuple[float, float], ...]:
+    """The tiers in env `name`, else `default`; a malformed value logs and
+    falls back to `default`."""
+    raw = os.environ.get(name, default)
+    try:
+        return _parse_cost_tiers(raw)
+    except ValueError:
+        log(f"[IMM] ! {name}={raw!r} unreadable; using {default!r}")
+        return _parse_cost_tiers(default)
+
+
+GOODREADS_COST_TIERS_BID = _cost_tiers_env("IMM_GOODREADS_COST_TIERS_BID", "2:5")
+GOODREADS_COST_TIERS_ASK = _cost_tiers_env("IMM_GOODREADS_COST_TIERS_ASK", "2:5,10:3")
+
+
+def _cost_tier_mult(tiers: Tuple[Tuple[float, float], ...],
+                    cost: Optional[float]) -> float:
+    """The multiple of the cheapest tier `cost` (cents a contract) falls in, else 1."""
+    if cost is None:
+        return 1.0
+    for c, m in tiers:
+        if cost <= c + 1e-9:
+            return m
+    return 1.0
+
+
+def cost_side_mults(series: str, ext_bid: Optional[float],
+                    ext_ask: Optional[float]) -> Tuple[float, float]:
+    """(bid_mult, ask_mult) of the GOODREADS COST TIERS on these EXTERNAL
+    touches (YES cents); (1.0, 1.0) for any other series or a missing touch."""
+    if series != GOODREADS_BAND_SERIES:
+        return (1.0, 1.0)
+    return (_cost_tier_mult(GOODREADS_COST_TIERS_BID, ext_bid),
+            _cost_tier_mult(GOODREADS_COST_TIERS_ASK,
+                            None if ext_ask is None else 100.0 - ext_ask))
 
 # FAMILY x2, 2026-10-11 (Jack: "do 1,2,6,8" -- #2 and #6 of the consolidated
 # recommendations): Rotten Tomatoes, Trump endorsements, the strait / port
@@ -39177,7 +39249,8 @@ class IncentiveMarketMaker:
             # atref rests up to 2x the spec size, so an unscaled reservation
             # under-charged the budget up to ~2x on mid-priced deep-ref books
             # (anchor pricing stays — actual rests at/below the anchor cost).
-            _cbm, _cam = side_size_mults(meta.ticker, now_utc, meta.mid_cents)
+            _cbm, _cam = side_size_mults(meta.ticker, now_utc, meta.mid_cents,
+                                         touch=(bid, ask))
             worst = (ladder_collateral_dollars(bid, None, scale_levels(lv, _cbm))
                      * meta.ref_mult_bid
                      + ladder_collateral_dollars(None, ask, scale_levels(lv, _cam))
@@ -42401,7 +42474,12 @@ class IncentiveMarketMaker:
         # so the reward estimate (and the $1 floor projection built on it)
         # see the size the quote loop will actually rest.
         # (side_size_mults: the same rule plus the bid-only quake family)
-        _cbm, _cam = side_size_mults(meta.ticker, _now, meta.mid_cents)
+        # (...and the COST TIERS on the EXTERNAL touch, our own netted out, as
+        # the quote loop reads it)
+        _cost_touch = (external_best(yes_levels, no_levels, own_live)
+                       if (self.live and own_live) else (ext_b, ext_a))
+        _cbm, _cam = side_size_mults(meta.ticker, _now, meta.mid_cents,
+                                     touch=_cost_touch)
         # CARBON ARC UNWIND: the side that reduces the bot's own position is
         # scored as the loop rests it past the late-month cut or the fair
         # gate -- at breakeven or better, the whole position, only if it earns
@@ -42789,7 +42867,7 @@ class IncentiveMarketMaker:
         if FLOOR_PROJECTION_BASE_SIZE and meta.dollars_per_day > 0:
             profile = floor_size_profile(
                 meta.series, meta.ticker, _now, _quotable_days(meta, _now),
-                hour_schedule=FLOOR_PROJECTION_SCHEDULE)
+                hour_schedule=FLOOR_PROJECTION_SCHEDULE, touch=_cost_touch)
             meta.floor_mult_profile = floor_profile_str(profile)
             _live_key = (_hm, _cbm, _cam)
 
@@ -45833,11 +45911,13 @@ class IncentiveMarketMaker:
             # ...times the series' own side sizes (SIDE_MULT_SERIES, Trump B;
             # else the family's lean; a KXRT strike's ladder lean,
             # market_side_mults) and the event long-shot cut at this
-            # book's mid (LONGSHOT_MULT)
+            # book's mid (LONGSHOT_MULT), and the COST TIERS on each side's
+            # own touch (cost_side_mults)
             ss_bm, ss_am = market_side_mults(t)
             ls_bm, ls_am = longshot_side_mults(meta.series, touch_mid(ext_bid, ext_ask))
-            lv_bid = scale_levels(lv, ca_bm * ss_bm * ls_bm)
-            lv_ask = scale_levels(lv, ca_am * ss_am * ls_am)
+            ct_bm, ct_am = cost_side_mults(meta.series, ext_bid, ext_ask)
+            lv_bid = scale_levels(lv, ca_bm * ss_bm * ls_bm * ct_bm)
+            lv_ask = scale_levels(lv, ca_am * ss_am * ls_am * ct_am)
             if series_bid_only(meta.series) and not quake_ask_strike(t):
                 lv_ask = []          # bid-only family (quake gate): no ask rungs
             if no_side_only(t):
@@ -48059,7 +48139,13 @@ class IncentiveMarketMaker:
             # cycle from 6 PM ET (679 side_cap alerts on 10/30)
             # (and a KXRT strike's ladder lean: market_side_mults, x3 asks)
             _ssm = max(1.0, market_side_mults(q.ticker)[0 if q.book_side == "bid" else 1])
-            lv_side = scale_levels(lv_now, _ssm)
+            # (...and the GOODREADS COST TIERS, read at the order's own price:
+            # it rests at or behind its side's touch, so its tier is at least
+            # the one the quote loop sized it by)
+            _ctm = max(1.0, cost_side_mults(series, q.price_cents, None)[0]
+                       if q.book_side == "bid"
+                       else cost_side_mults(series, None, q.price_cents)[1])
+            lv_side = scale_levels(lv_now, _ssm * _ctm)
             side_cap = sum(s for _t, s in lv_side) * cap_mult
             # atref collapses the side's WHOLE ladder to one price level by
             # design, so the per-level bracket is the side bracket — the

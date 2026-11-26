@@ -49215,6 +49215,70 @@ class TestGoodreadsBand(unittest.TestCase):
         self.assertTrue(any("extreme_mid" in s for s in lines if "universe:" in s),
                         [s for s in lines if "universe:" in s][-3:])
 
+    # GOODREADS COST TIERS (Jack 2026-11-26: "5x when <=2c so 300 size
+    # instead of 60", "and 3x when <= 10c", "the 3x when <=10c should only be
+    # on no's not yes")
+
+    def test_the_cost_tiers(self):
+        self.assertEqual(imm.GOODREADS_COST_TIERS_BID, ((2.0, 5.0),))
+        self.assertEqual(imm.GOODREADS_COST_TIERS_ASK, ((2.0, 5.0), (10.0, 3.0)))
+        for k in ("GOODREADS_COST_TIERS_BID", "GOODREADS_COST_TIERS_ASK"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        m = lambda b, a: imm.cost_side_mults("KXGOODREADS", b, a)
+        self.assertEqual(m(1, 94), (5.0, 3.0))      # a DEBUT placeholder book
+        self.assertEqual(m(2, 98), (5.0, 5.0))      # both sides at <= 2c
+        self.assertEqual(m(3, 90), (1.0, 3.0))      # a 3c YES bid: no tier (NO only)
+        self.assertEqual(m(10, 89), (1.0, 1.0))     # an 11c NO: none
+        self.assertEqual(m(8, 97), (1.0, 3.0))      # ROM-NWM's 8c x 97c
+        self.assertEqual(m(None, None), (1.0, 1.0))
+        self.assertEqual(imm.cost_side_mults("KXGAMEAWARDS", 1, 94), (1.0, 1.0))
+        # the env forms: sorted, "" = off, a bad value falls back to the default
+        self.assertEqual(imm._parse_cost_tiers("10:3, 2:5"), ((2.0, 5.0), (10.0, 3.0)))
+        self.assertEqual(imm._parse_cost_tiers(""), ())
+        with mock.patch.dict(os.environ, {"IMM_X_TIERS": "2:five"}), \
+                mock.patch.object(imm, "log", lambda _m: None):
+            self.assertEqual(imm._cost_tiers_env("IMM_X_TIERS", "2:5"), ((2.0, 5.0),))
+        with mock.patch.object(imm, "GOODREADS_COST_TIERS_BID", ()), \
+                mock.patch.object(imm, "GOODREADS_COST_TIERS_ASK", ()):
+            self.assertEqual(m(1, 94), (1.0, 1.0))
+
+    def test_the_estimate_and_floor_projection_see_the_tiers(self):
+        t = self.DEBUT[0]
+        now = datetime.now(timezone.utc)
+        b0, a0 = imm.side_size_mults(t, now)
+        self.assertEqual(imm.side_size_mults(t, now, touch=(1, 94)), (b0 * 5.0, a0 * 3.0))
+        plain = imm.floor_size_profile("KXGOODREADS", t, now, 2.0)
+        tiered = imm.floor_size_profile("KXGOODREADS", t, now, 2.0, touch=(1, 94))
+        self.assertEqual(len(plain), len(tiered))
+        for ((m0, pb, pa), w0), ((m1, tb, ta), w1) in zip(plain, tiered):
+            self.assertEqual((m0, w0), (m1, w1))
+            self.assertAlmostEqual(tb, pb * 5.0)
+            self.assertAlmostEqual(ta, pa * 3.0)
+
+    def _sizes(self, bot, t):
+        out = {}
+        for o in bot.state.sim_orders.values():
+            if o["ticker"] == t:
+                out[o["book_side"]] = out.get(o["book_side"], 0.0) + o["remaining_count"]
+        return out
+
+    def test_a_placeholder_book_rests_the_tiered_size(self):
+        # the 1c bid rests x5 and the 94c ask (a 6c NO) x3 over the same book
+        # with the tiers off; caps lifted so only the tiers differ
+        t = self.DEBUT[0]
+        with mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 100000):
+            with mock.patch.object(imm, "GOODREADS_COST_TIERS_BID", ()), \
+                    mock.patch.object(imm, "GOODREADS_COST_TIERS_ASK", ()):
+                bot0, _r0, _l0 = self._cycle(self.DEBUT, *self._DEBUT_BOOK)
+                off = self._sizes(bot0, t)
+            _clean_persist()
+            bot1, _r1, lines = self._cycle(self.DEBUT, *self._DEBUT_BOOK)
+            on = self._sizes(bot1, t)
+        self.assertGreater(off.get("bid", 0), 0, off)
+        self.assertGreater(off.get("ask", 0), 0, off)
+        self.assertAlmostEqual(on["bid"] / off["bid"], 5.0, delta=0.1, msg=(on, off))
+        self.assertAlmostEqual(on["ask"] / off["ask"], 3.0, delta=0.1, msg=(on, off))
+
 
 class TestCarbonArcTikTokShop(unittest.TestCase):
     """Jack 2026-11-13: "they should quote as part of carbon arc auto-quoting
