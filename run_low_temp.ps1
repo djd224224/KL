@@ -31,7 +31,7 @@ $LogPath = Join-Path $LogDir ("low-temp-{0:yyyy-MM-dd}.log" -f (Get-Date))
 # Delete the file from main to resume. low_temp_trading.py checks it too,
 # covering the GH workflow_dispatch backup and direct invocations.
 if (Test-Path (Join-Path $Repo "low_temp.paused")) {
-    "=== $(Get-Date -Format 'u') low-temp run SKIPPED — low_temp.paused present ===" | Add-Content -Path $LogPath -Encoding utf8
+    "=== $(Get-Date -Format 'u') low-temp run SKIPPED -- low_temp.paused present ===" | Add-Content -Path $LogPath -Encoding utf8
     exit 0
 }
 

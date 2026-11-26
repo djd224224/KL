@@ -32,7 +32,7 @@ Other makers can copy a quote. They cannot copy months of our own measured outco
 
 | Moat | What compounds | Where | How a run uses it |
 |---|---|---|---|
-| Data | One row per family per day, kept forever: rewards, trading, net, fills, $ resting, mark-outs, and our **share of the reward pool** (from the cycle log). Plus every prediction, finding, verdict, config version and error signature, and every change to the bot with its scope, its 7-day readout and its verdict. | family_daily.csv, counterfactual.jsonl, ledger.jsonl, changes.jsonl, config_manifest.jsonl, error_signatures.json | The base for every measurement. Never delete; propose a durable backup if none exists |
+| Data | One row per family per day, kept forever: rewards, trading, net, fills, $ resting, mark-outs, and our **share of the reward pool** (from the cycle log). Plus every prediction, finding, verdict, config version and error signature, and every change to the bot with its scope, its 7-day readout and its verdict. | family_daily.csv, counterfactual.jsonl, ledger.jsonl, changes.jsonl, config_manifest.jsonl, error_signatures.json | The base for every measurement. Never delete. Backed up to BigQuery `imm_review` every morning after the email (imm_review_backup.py, R-261124-20); section 10 shows the last run |
 | Analysis | Family priors shrunk toward the book (rewards and net per $1k resting, trading tax, mark-out, share). The edge watch (7 days vs the 21 before). Missed-market estimates netted by family tax. The review's own calibration. | priors.json, evidence section 10 | Rank by net, not by modelled reward; discount claims by the review's calibration; see erosion early |
 | Process | Verified fixes become playbook rules. Every bug class becomes a collector check. Rejections stand. Lessons get promoted into this skill. | playbook.md, history.md, imm_review.py | Apply proven rules to new families and waves before they cost money |
 
@@ -492,7 +492,10 @@ The email's numbers card comes from evidence.json, so don't paste the scorecard.
   - **Priors drift:** families whose net per $1k moved most in 3 weeks.
   - **The edge watch:** the 3-week trend and what the competition lens says to do.
   - **The review's calibration:** if a kind runs 2x high, say so and tighten.
-  - **Durability:** the moat lives in run-logs, which has no backup. Until Jack approves a backup (R-261124-20), every Sunday names that risk.
+  - **Durability:** the moat is backed up to BigQuery `imm_review` every morning after the email (imm_review_backup.py, R-261124-20, since 11/26).
+    - Section 10's backup line must say ok, under 36h old.
+    - FAILED, stale or refused is a P1 finding (kind ops) on any day, not only Sundays.
+    - Once a month, prove it restores with `python imm_review_backup.py verify` (read-only), and say so.
 - **From 12/09:** propose which existing IMM emails the review now covers (each with what it would lose), as a decision.
 - **Lessons:** propose promoting durable lines from lessons.md into this skill's history.md. That is a decision, because it changes the skill.
 

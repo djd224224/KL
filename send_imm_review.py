@@ -533,6 +533,13 @@ def health_checks(ev: dict) -> List[Tuple[str, str]]:
         out.append((f"Changes at {rv.REGISTRY_DAYS} days: {worse} of {tot} worse" if worse
                     else f"Changes at {rv.REGISTRY_DAYS} days: none of {tot} worse",
                     "amber" if worse else "green"))
+    bk = ((ev.get("moat") or {}).get("backup")) or {}
+    if bk.get("state"):           # the moat's BigQuery copy (R-261124-20)
+        s = bk["state"]
+        out.append(({"ok": "Moat backed up", "stale": f"Moat backup {rv._f(bk.get('age_h')):.0f}h old",
+                     "FAILED": "Moat backup FAILED", "off": "Moat backup off",
+                     "never run": "Moat backup not run yet"}.get(s, f"Moat backup {s}"),
+                    {"ok": "green", "stale": "amber", "FAILED": "red", "off": "amber"}.get(s, "gray")))
     b = ((ev.get("self") or {}).get("budget")) or {}
     if rv._f(b.get("collect_pct")) >= 0.6:
         out.append((f"Review data gathering at {rv._f(b['collect_pct']) * 100:.0f}% of its limit",

@@ -10,7 +10,14 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
 - **Deploy (11/25):** "Unstick now, review later".
 - **The moat (11/25):** "the skill's daily iterative process should lead to compounding and building a moat on data, analysis, and process that allows it to continually get better even as the markets get more competitive".
   - Built the same day: moat/family_daily.csv (with pool share from the cycle log), priors.json, the edge watch, missed markets netted by family tax, the review's self-calibration, and the playbook.
-  - The durable backup (R-261124-20) is a decision for Jack. The wedged sync was fixed the same morning, then the review landed on main and the 04:30 task was registered.
+  - The durable backup (R-261124-20) was a decision for Jack. The wedged sync was fixed the same morning, then the review landed on main and the 04:30 task was registered.
+- **The moat backup (11/26, R-261124-20):** Jack asked "how expensive is backing up the moat to bigquery?", heard "effectively free" (about 60 MB, +~1 GB a year, inside the free 10 GB the project barely uses), and said "Yes, build it".
+  - **The dataset:** `imm_review` (northamerica-northeast1), created on purpose with no default expiration, and watched by bq_retention_guard.py beside Kalshi (the 5/8 and 7/7 expirations).
+  - **The design:** no bad local file can damage the copy.
+    - Append-only logs are copied line by line; a shorter or rewritten log is refused.
+    - Every other file keeps every version it has had.
+    - The day archive is replaced only by a set with every day.
+  - **The first run** (11/26 21:27Z, 62 s): 150,045 log lines, 69 files, 137 days. A full restore was byte-identical, 210 of 210 files, but only after one fix: the box writes these logs CRLF, and the first reader dropped the `\r`.
 - **The daily self-question (11/26):** "what else should this skill be doing daily to compound and improve itself? everyday it should ask itself this question and come with opportunities".
   - **Built the same day:**
     - SKILL.md step 8, answered in findings.json `compound`, at least one answer a run;

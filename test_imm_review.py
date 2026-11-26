@@ -1668,5 +1668,35 @@ class RegistryTests(Base):
         self.assertEqual(len(sr.pick_changes(rows[:4])), 4)       # all of them when they fit
 
 
+class BackupStatusTests(Base):
+    """The moat's BigQuery backup as the review sees it (R-261124-20)."""
+
+    def test_status_render_and_chip(self):
+        import time as _t
+        self.assertEqual(rv.backup_status()["state"], "never run")
+        path = os.path.join(self.review, "backup_state.json")
+        os.makedirs(self.review, exist_ok=True)
+        rv._write_json(path, {"at": rv._now_iso(), "ok": True, "dataset": "p:imm_review",
+                              "added": {"lines": {"ledger_lines": 2}, "files": 3, "days_changed": 1},
+                              "totals": {"files": 3, "day_archive": 1, "ledger_lines": 2, "changes_lines": 0}})
+        ok = rv.backup_status()
+        self.assertEqual((ok["state"], ok["totals"]["files"]), ("ok", 3))
+        self.assertEqual(rv.backup_status(now=_t.time() + 40 * 3600)["state"], "stale")
+        self.assertIn(("Moat backed up", "green"), sr.health_checks({"moat": {"backup": ok}}))
+        rv._write_json(path, {"at": rv._now_iso(), "ok": False,
+                              "refused": ["ledger_lines: daily_review/ledger.jsonl has 1 lines, the copy 2"]})
+        bad = rv.backup_status()
+        self.assertEqual(bad["state"], "FAILED")
+        self.assertIn(("Moat backup FAILED", "red"), sr.health_checks({"moat": {"backup": bad}}))
+        md = rv.render_evidence({"day": DAY.isoformat(), "window_et": ["a", "b"], "generated": _t.time(),
+                                 "moat": {"assets": {}, "priors_book": {}, "backup": bad}})
+        self.assertIn("**Backup** (BigQuery", md)
+        self.assertIn("backup problem: ledger_lines", md)
+        self.assertIn("raise it as P1", md)
+        with open(path, "w") as fh:
+            fh.write('{"at": "2026-11-26T00:00:00Z", "off": true, "ok": true}')
+        self.assertEqual(rv.backup_status()["state"], "off")
+
+
 if __name__ == "__main__":
     unittest.main()

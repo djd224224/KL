@@ -2727,7 +2727,29 @@ def sec_moat(day: date) -> dict:
                                   for f, v in priors["families"].items()),
                                  key=lambda x: -_f(x.get("net_per_1k")))[:20],
             "share_today": {r["family"]: r.get("share") for r in today if r.get("share") not in (None, "")},
-            "review_calibration": review_calibration()}
+            "review_calibration": review_calibration(),
+            "backup": backup_status()}
+
+
+BACKUP_STALE_H = 36                  # the backup runs daily after the email: older than this is late
+
+
+def backup_status(now: Optional[float] = None) -> dict:
+    """The moat's BigQuery backup, from the last imm_review_backup.py run
+    (backup_state.json; review R-261124-20): ok / FAILED / off / never run,
+    how old, what it added, the copy's row counts, and any refusal."""
+    st = _load_json(os.path.join(REVIEW_DIR, "backup_state.json"))
+    if not isinstance(st, dict):
+        return {"state": "never run"}
+    at = _ts_of(st.get("at"))
+    age = round(((now or time.time()) - at) / 3600, 1) if at else None
+    state = "off" if st.get("off") else ("ok" if st.get("ok") else "FAILED")
+    if state == "ok" and age is not None and age > BACKUP_STALE_H:
+        state = "stale"
+    return {"state": state, "at": et_str(at, "%Y-%m-%d %H:%M") if at else None, "age_h": age,
+            "dataset": st.get("dataset"), "added": st.get("added") or {}, "totals": st.get("totals") or {},
+            "errors": (st.get("errors") or [])[:5], "refused": (st.get("refused") or [])[:5],
+            "secs": st.get("secs")}
 
 
 # ---------------------------------------------------------------------------
@@ -5119,6 +5141,21 @@ def render_evidence(ev: dict) -> str:
                         f"tax {_fmt(p.get('tax'), 2)}, {p['days']}d" for p in mo["priors_top"][:12]))
         if mo.get("review_calibration"):
             a(f"The review's own calibration (realised / predicted $/day, by kind): {mo['review_calibration']}")
+        bk = mo.get("backup") or {}
+        if bk:
+            tot = bk.get("totals") or {}
+            ad = bk.get("added") or {}
+            a(f"**Backup** (BigQuery {bk.get('dataset') or 'imm_review'}, imm_review_backup.py, R-261124-20): "
+              f"{bk.get('state')}" + (f" at {bk['at']} ET ({bk.get('age_h')}h ago)" if bk.get("at") else "")
+              + (f"; added {sum((ad.get('lines') or {}).values())} log lines, {ad.get('files')} file versions, "
+                 f"{ad.get('days_changed')} changed day files" if ad else "")
+              + (f"; the copy holds {tot.get('files')} file versions, {tot.get('day_archive')} days, "
+                 f"{tot.get('ledger_lines')} ledger and {tot.get('changes_lines')} registry lines" if tot else "")
+              + ".")
+            for x in (bk.get("errors") or []) + (bk.get("refused") or []):
+                a(f"- backup problem: {x}")
+            if bk.get("state") in ("FAILED", "stale"):
+                a("- A failed or late backup leaves the moat on one unbacked disk: raise it as P1 (kind ops).")
     render_self(ev.get("self") or {}, a)
     render_registry(ev.get("registry") or {}, a)
     a("")

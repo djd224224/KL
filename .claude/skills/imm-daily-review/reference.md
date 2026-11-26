@@ -42,7 +42,13 @@ The facts the runbook (`SKILL.md`) leans on. Sourced from the 11/25 survey of th
 
 ## 3. Data map and reading recipes
 
-`STATUS_DIR` = `C:\Users\jackd\Documents\KL\run-logs\incentive-mm`. It is 113+ GB, not in git, has no backup, and grows about 2.2 GB a day; nothing prunes it.
+`STATUS_DIR` = `C:\Users\jackd\Documents\KL\run-logs\incentive-mm`. It is 120+ GB, not in git, and grows about 2.4 GB a day. Text sinks are gzipped after 35 days (R-261124-03).
+
+Only the review's moat is backed up: every morning after the email, `imm_review_backup.py` copies `daily_review/`, the day archive and `program_history.jsonl` into BigQuery `elite-contact-446323-q7:imm_review` (R-261124-20).
+- **Commands:** `imm_review_backup.py status | verify | restore --to DIR`. `restore` rebuilds the files byte-for-byte, never into the live run-logs.
+- **Tables:** `*_lines` (the append-only logs, one row per line), `files` (every version of every other file), `day_archive` (the latest day files).
+- **Query it:** e.g. `SELECT JSON_VALUE(raw,'$.title') FROM imm_review.ledger_lines WHERE op='create'`.
+- **Off:** `IMM_REVIEW_BQ=0`.
 
 Every sink row from `_sink` carries `run_id` and `config_hash`. Files are `<name>_<UTC date>.jsonl`.
 

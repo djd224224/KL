@@ -21,6 +21,9 @@
 #     emails review.md + the exact-number appendix. If the analysis produced
 #     no review.md, the evidence-only fallback goes out instead. Never silent:
 #     every failure emails the log tail (send_alert_email.py).
+#  6. imm_review_backup.py run: daily_review (the moat), the day archive and
+#     the program history into BigQuery imm_review (R-261124-20). A failure
+#     alerts; the email has already gone.
 #
 #   run_imm_daily_review.ps1                  # the scheduled run (yesterday, ET)
 #   run_imm_daily_review.ps1 -Day 2026-11-24  # a given day
@@ -314,6 +317,22 @@ if ($s.ExitCode -ne 0) {
     Send-Alert "IMM review $Day FAILED: email not sent" "send_imm_review.py exit=$($s.ExitCode)`n`n$logTail"
 } elseif ($Reason -and -not $SkipClaude) {
     $code = 2   # the fallback went out; Task Scheduler shows a non-zero result
+}
+
+# 5. back up the moat to BigQuery (imm_review_backup.py, review R-261124-20):
+#    after the send, so a backup problem never delays the email. A failure or
+#    a refusal (a log shorter than its copy, a lost day) alerts; the next
+#    collect reports the run in evidence section 10. IMM_REVIEW_BQ=0 turns it
+#    off; a -NoEmail test only dry-runs it (a scratch folder never reaches
+#    the real dataset).
+if ($env:IMM_REVIEW_BQ -ne "0") {
+    $bkArgs = "imm_review_backup.py run --day $Day"
+    if ($NoEmail) { $bkArgs += " --dry" }
+    $b = Invoke-Proc $Python $bkArgs 10
+    Log "backup exit=$($b.ExitCode) timedout=$($b.TimedOut): $(($b.Out + $b.Err).Trim() -replace '\s+', ' ')"
+    if ($b.ExitCode -ne 0) {
+        Send-Alert "IMM review ${Day}: moat backup FAILED" ("imm_review_backup.py exit=$($b.ExitCode) timedout=$($b.TimedOut)`n`n" + ($b.Out + $b.Err).Trim() + "`n`nThe email went out; only the BigQuery copy of daily_review is behind. Re-run: python imm_review_backup.py run`n`nLog: $LogPath")
+    }
 }
 Log "=== done in $([int]((Get-Date) - $Started).TotalMinutes) min, exit=$code ==="
 exit $code
