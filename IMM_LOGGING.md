@@ -46,6 +46,9 @@ Every row carries `run_id` and `config_hash`.
 | `ws_sweep_*.jsonl` | per sweep-breaker trip | would pulling an event on a sweep have paid (2026-10-04) |
 | `join_wait_*.jsonl` | per join-wait hold / join / gone | which better prices an at-ref rung waited on, for how long (2026-11-02) |
 | `gap_scans_*.jsonl` | per gap scan (hourly, plus the 7:20 email) | every unquoted paying event, why, and its modelled $/day, all day long (2026-11-25) |
+| `fair_marks_*.jsonl` | 15 min, outside the bot | each fair model's view beside the market's book: does the model beat the price (2026-11-26) |
+| `fair_results_*.jsonl` | per settled market a model priced | the outcome those marks are scored on (2026-11-26) |
+| `fair_raw_*.jsonl.gz` | hourly, when a file changed | the fair files of other shapes, kept whole for a later extractor (2026-11-26) |
 
 ### fills
 
@@ -213,6 +216,56 @@ before the 04:30 morning scan. `IMM_GAPS_ARCHIVE=0` stops the writes, and
 with the other text sinks (see "Retention" below). The review reads the `.gz`
 through `imm_logfiles`, so a re-run for an old day adds up the same day.
 
+### fair_marks, fair_results, fair_raw (2026-11-26)
+
+The bot logs no fair values, so until now nothing could say whether a model's
+fair beat the market's price. `imm_fair_marks.py` runs outside the bot and is
+read-only on it: Task Scheduler `KL imm fair-marks` (`register_imm_fair_marks.ps1`)
+runs it every 15 minutes. It reads every `*_fair*.json` in `STATUS_DIR` and
+writes:
+
+- **`fair_marks_<UTC day>.jsonl`**, for the files of the standard shape
+  (`markets` -> ticker -> `p` or `fair`; 15 files and 4,852 markets on 11/26).
+  - **When:** a row lands when the fair moves 1 point or more, when the mid
+    moves 1c or more, or after 30 minutes (an hour without a book).
+  - **Fields:** `ts`, `family` (the file name less `_fair`), `ticker`, `p`
+    (the YES probability, 0-1), `src_ts` (the model's own stamp), `bid` and
+    `ask` (cents; an empty side is null), `book_ts`, and `book_src`:
+    - "cycle": the bot's cycle log, at most 20 minutes old;
+    - "api": Kalshi's top of book, read hourly for the markets the bot is not
+      cycling;
+    - null: no book.
+- **`fair_results_<UTC day>.jsonl`:** a market's result once it has settled
+  (`ticker`, `family`, `result` yes/no, `close_ts`, `status`). The result is
+  looked up when the market leaves its model's file (every 6 hours, for up to
+  14 days), or seen in the hourly reads.
+- **`fair_raw_<UTC day>.jsonl.gz`:** every other fair file (Vercel, Carbon
+  Arc, OpenRouter, the temperature grids ...), archived whole when it changes.
+  This happens at most hourly, for files up to 3 MB. Their history exists
+  before anyone writes their extractor.
+- **`fair_marks_state.json`:** the last mark per market, the result lookups,
+  and the last run (`python imm_fair_marks.py status`).
+  - Each run appends a one-line summary to `fair-marks-task.log`.
+  - A run that crashes, or reads no fair file, writes a `FAILED` line there.
+    The review's task-log scan reports that line.
+
+**Size:** the first run wrote 4,852 marks (1.0 MB). After that it is
+ESTIMATED at 30-35 MB a day, nearly all of it the 30- and 60-minute repeats.
+The review's data-health table measures it daily.
+
+**Scoring:** the review scores every model on these files
+(`imm_fair_scorecard.py`, evidence section 13) three ways:
+- Brier skill against the mid at settlement;
+- convergence over the day;
+- the edge on our own fills.
+
+The scores accumulate in `daily_review/moat/model_scores.jsonl`, which is
+backed up to BigQuery.
+
+**Stop and retention:** `IMM_FAIR_MARKS=0` stops the writes. `fair_marks` and
+`fair_results` are gzipped after 35 days with the other text sinks.
+`fair_raw` is already gzip.
+
 ### ws_stale (2026-10-04)
 
 One row per event of a stale-quote episode: a resting rung the WebSocket
@@ -344,7 +397,8 @@ place once they are 35 days old, so `cycle_log_2026-10-01.csv` becomes
 
 - **What:** an allowlist. `cycle_log`, `orders`, `marks`, `selection_snapshot`,
   `selection_events`, `floor_state`, `guard_skips`, `back_of_line`, `ws_stale`,
-  `risk_dry`, `gap_scans` (added 2026-11-25), and the console logs
+  `risk_dry`, `gap_scans` (added 2026-11-25), `fair_marks` and `fair_results`
+  (added 2026-11-26), and the console logs
   `incentive-mm-<date>.log`, judged by their last write.
   - **Never:** `fills` (the bot reads 30 days of them for its marks),
     `settlements`, `realized`, `book_depth` (already gzip).
@@ -366,9 +420,9 @@ place once they are 35 days old, so `cycle_log_2026-10-01.csv` becomes
 - **Reading old days:** go through `imm_logfiles` (`day_files`, `resolve`,
   `open_text`, `open_bin`, `sig`). A reader that globs the plain names silently
   loses every compressed day.
-  - `imm_reward_recon`, `imm_saturday_tracker`, `imm_dashboard`, `imm_review`
-    and `imm_sweep_backtest` already do.
-  - The job refuses `--apply` unless the first four import it.
+  - `imm_reward_recon`, `imm_saturday_tracker`, `imm_dashboard`, `imm_review`,
+    `imm_fair_scorecard` and `imm_sweep_backtest` already do.
+  - The job refuses `--apply` unless the first five import it.
   - Ad hoc: `pd.read_csv("x.csv.gz")` and `gzip.open(path, "rt")` read them
     directly; in Git Bash use `zcat` / `zgrep`.
 - **Stop / undo:** `IMM_LOG_RETENTION=0`, or a `retention/STOP` file, stops it.
@@ -388,6 +442,9 @@ place once they are 35 days old, so `cycle_log_2026-10-01.csv` becomes
   more than 3 days old. That ledger is the only record of money actually paid
   and has no API behind it — the human pasting the statement *is* the archive
   job, so it needs a monitor.
+- `imm_fair_marks.py` (every 15 minutes) writes `fair_marks`, `fair_results` and
+  `fair_raw` (see above). `imm_fair_scorecard.py` scores them for the daily
+  review.
 
 ## Kill switches
 
@@ -398,7 +455,8 @@ place once they are 35 days old, so `cycle_log_2026-10-01.csv` becomes
 `CONFIG_HASH`, like every `IMM_*` variable. Tests prove order placement is
 identical with the logging on or off. The nightly compression is outside the
 bot: `IMM_LOG_RETENTION=0` (in the task's environment) or a
-`retention/STOP` file stops it.
+`retention/STOP` file stops it. So is the fair log: `IMM_FAIR_MARKS=0` (in the
+task's environment) stops it.
 
 ## Still open
 

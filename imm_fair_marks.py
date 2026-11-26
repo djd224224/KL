@@ -363,18 +363,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.cmd == "status":
         print(json.dumps(load_state().get("run") or {}, indent=1))
         return 0
-    out = run(dry=a.dry)
-    line = json.dumps({k: v for k, v in out.items() if k != "families"}, default=str)
-    print(line)
-    if a.log:
-        try:
-            with open(a.log, "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-        except OSError:
-            pass
+    try:
+        out = run(dry=a.dry)
+    except Exception as e:
+        # pythonw has no console, so a traceback would vanish: it goes to the
+        # task log as a FAILED line, which the review's task-log scan reports
+        import traceback
+        line = json.dumps({"at": _iso(time.time()), "status": "FAILED",
+                           "error": f"{type(e).__name__}: {e}"[:300],
+                           "trace": traceback.format_exc()[-2000:]})
+        print(line)
+        _log_line(a.log, line)
+        return 2
     # a fair file caught mid-rewrite is noted, not a failed run: fail only when
     # nothing could be read at all (Task Scheduler shows the exit code)
-    return 0 if out.get("off") or out["files"] else 1
+    ok = bool(out.get("off") or out["files"])
+    row = {k: v for k, v in out.items() if k != "families"}
+    if not ok:
+        row["status"] = "FAILED: no fair file could be read"
+    line = json.dumps(row, default=str)
+    print(line)
+    _log_line(a.log, line)
+    return 0 if ok else 1
+
+
+def _log_line(path: Optional[str], line: str) -> None:
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

@@ -169,6 +169,7 @@ TASK_LOGS = (
     ("family-watch", "incentive-mm/family-watch.log"),
     ("saturday-tracker", "incentive-mm/saturday-tracker-task.log"),
     ("dashboard", "incentive-mm/dashboard/dashboard-task.log"),
+    ("fair-marks", "incentive-mm/fair-marks-task.log"),
 )
 TASK_LOG_ERR = re.compile(r"FAILED|Traceback|timed out|unavailable|PermissionError|"
                           r"WinError|UnicodeEncodeError|Too Many Requests|\bERROR\b|send: FAILED")

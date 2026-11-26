@@ -138,6 +138,44 @@ class SnapshotterTests(Base):
         with mock.patch.dict(os.environ, {"IMM_FAIR_MARKS": "0"}):
             self.assertTrue(fm.run(now=now)["off"])
 
+    def test_a_crash_or_an_empty_read_is_a_failed_line_the_review_reports(self):
+        # pythonw has no console: the task log is the only place a crash shows
+        log = os.path.join(self.status, "fair-marks-task.log")
+        now = datetime.now(timezone.utc).timestamp()
+        self._setup_files(now)
+        with mock.patch.object(fm, "kalshi_markets", return_value={}):
+            self.assertEqual(fm.main(["run", "--log", log]), 0)
+        with mock.patch.object(fm, "run", side_effect=RuntimeError("boom")):
+            self.assertEqual(fm.main(["run", "--log", log]), 2)
+        with mock.patch.object(fm, "run", return_value={"at": iso(now), "files": 0, "marks": 0, "families": {}}):
+            self.assertEqual(fm.main(["run", "--log", log]), 1)
+        with open(log, encoding="utf-8") as fh:
+            ok, crash, empty = [json.loads(l) for l in fh if l.strip()]
+        self.assertNotIn("status", ok)
+        self.assertEqual(ok["marks"], 2)
+        self.assertEqual(crash["status"], "FAILED")
+        self.assertIn("RuntimeError: boom", crash["error"])
+        self.assertIn("Traceback", crash["trace"])
+        self.assertTrue(empty["status"].startswith("FAILED"))
+        # the review's task-log scan reads this log and reports both failures, not the good run
+        day = datetime.fromtimestamp(now, timezone.utc).date()
+        hits = [h for h in rv.task_log_errors(day) if h["task"] == "fair-marks"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(sum(x["n"] for x in hits[0]["lines"]), 2)
+
+    def test_the_logging_doc_covers_the_fair_sinks_so_the_review_does_not_flag_them(self):
+        # the review lists a dated sink that IMM_LOGGING.md never names (sec_data "undocumented")
+        here = os.path.dirname(os.path.abspath(fm.__file__))
+        shutil.copy(os.path.join(here, "IMM_LOGGING.md"), os.path.join(self.root, "IMM_LOGGING.md"))
+        u = DAY.isoformat()
+        for name in (f"fair_marks_{u}.jsonl", f"fair_results_{u}.jsonl", f"zzz_unnamed_{u}.jsonl"):
+            self.write(name, "{}\n")
+        self.assertEqual(rv.sec_data(DAY)["undocumented"], ["zzz_unnamed"])
+        with open(os.path.join(here, "IMM_LOGGING.md"), encoding="utf-8") as fh:
+            doc = fh.read()
+        for name in ("fair_raw", "IMM_FAIR_MARKS", "KL imm fair-marks", "fair-marks-task.log"):
+            self.assertIn(name, doc)
+
 
 class ScorecardTests(Base):
     def _mark(self, ts, t, p, bid=None, ask=None, fam="rain_wknd"):

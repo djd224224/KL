@@ -7,8 +7,10 @@
 #
 # WINDOWLESS: runs pythonw.exe directly (the dashboard's pattern), so no console
 # flashes every 15 minutes; the script appends a one-line summary to --log.
-# A run takes ~1 s, plus ~12 s once an hour for Kalshi's top of book on the
-# markets the bot is not cycling (signed reads, paced by kalshi_reads).
+# A run is ~1 s of work (measured 0.8 s; 4-11 s at the task's low priority),
+# plus ~11 s once an hour for Kalshi's top of book on the markets the bot is not
+# cycling (signed reads, paced by kalshi_reads). A crash or a run that reads no
+# fair file writes a FAILED line to the log, which the daily review reports.
 # IgnoreNew stops a slow run from stacking. IMM_FAIR_MARKS=0 turns it off.
 $Repo = "C:\Users\jackd\Documents\KL"
 $TaskName = "KL imm fair-marks"
