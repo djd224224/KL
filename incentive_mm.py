@@ -18096,7 +18096,7 @@ for _s in RAIN_MONTHLY_SERIES:
 # or span ticker keeps its own family), the named members' guard set cloned
 # from RAIN_MONTHLY_ARCHETYPE (band, x2, out 22:00 ET the day before the
 # month's last day), quoted only through this fail-closed gate -- and the
-# programs feed hands it to the writer (refresh_universe's
+# programs feed and the upcoming list hand it to the writer (refresh_universe's
 # _rain_monthly_extra), which auto-maps the station its rules name with the
 # hand rows' checks (rain_monthly_fair AUTO-MAPPED STATIONS); a station that
 # fails them leaves its events without a fair, stood aside, and the watch's
@@ -37785,31 +37785,41 @@ class IncentiveMarketMaker:
             # Per-period accrual baselines (Jack 2026-09-11). LIVE feed only,
             # same guard as the family expansion above.
             self._roll_reward_periods(by_market)
+            # WRITERS READ AHEAD (2026-11-26): the four hand-offs below read
+            # the feed AND the upcoming list. Fourteen December KXRAIN<CITY>M
+            # cities (KXRAINSTLM-26DEC, ...: $55 a strike from 11/27 06:01Z)
+            # were listed ~25 h ahead; the watch checks the upcoming list
+            # (model coverage, 2026-11-18) and mailed them "never read", but
+            # the writer heard of a city only once its program had started,
+            # so each sat dark past its start for a refresh or more. These
+            # sets only tell the writers what to read: nothing quotes before
+            # its program starts.
+            _wfeed = set(by_market) | (set(self._upcoming) if UPCOMING_ENABLE else set())
             # Period rain series the feed programs (2026-10-04): the rain
             # refresher prices them beside its own list, so a new city's
             # fair exists by the time its markets reach the gate.
-            _rp = {series_of(t) for t in by_market if rain_period_gated(t)}
+            _rp = {series_of(t) for t in _wfeed if rain_period_gated(t)}
             if _rp - self._rain_period_series:
                 log(f"{self.tag} rain-period series in the feed: "
                     f"{','.join(sorted(_rp))}")
             self._rain_period_series = _rp
             # ...and the monthly rain cities beyond the named list
             # (2026-10-26), the same way: the writer prices and auto-maps them
-            _rmx = {series_of(t) for t in by_market
+            _rmx = {series_of(t) for t in _wfeed
                     if rain_monthly_auto(series_of(t)) and not rain_period_ticker(t)}
             if _rmx - self._rain_monthly_extra:
                 log(f"{self.tag} rain-monthly cities beyond the list in the feed: "
                     f"{','.join(sorted(_rmx))}")
             self._rain_monthly_extra = _rmx
             # ...and the snow monthlies (2026-10-04), the same way
-            _sn = {series_of(t) for t in by_market if snow_monthly_series(series_of(t))}
+            _sn = {series_of(t) for t in _wfeed if snow_monthly_series(series_of(t))}
             if _sn - self._snow_series:
                 log(f"{self.tag} snow-monthly series in the feed: "
                     f"{','.join(sorted(_sn))}")
             self._snow_series = _sn
             # ...and every resort-named series (2026-10-22): the resort
             # writer maps a new one, and its "mapped" list enrolls it
-            _rs = {series_of(t) for t in by_market if resort_snow_candidate(series_of(t))}
+            _rs = {series_of(t) for t in _wfeed if resort_snow_candidate(series_of(t))}
             if _rs - self._resort_series:
                 log(f"{self.tag} resort-snow series in the feed: "
                     f"{','.join(sorted(_rs))}")

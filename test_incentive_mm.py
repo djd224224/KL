@@ -14316,6 +14316,38 @@ class TestRainMonthlyNewCities(unittest.TestCase):
         self.assertNotIn(self.T, bot._rain_monthly_stood)
         self.assertTrue(self._quotes(bot))
 
+    def test_a_new_city_reaches_the_writer_before_its_program_starts(self):
+        # 2026-11-26: fourteen December cities (KXRAINSTLM-26DEC, ...) were
+        # listed with programs from 11/27 06:01Z; the watch read them off
+        # the upcoming list as "never read", and the writer heard of a
+        # city only from the active feed (WRITERS READ AHEAD)
+        s = "KXRAINPHXM"
+        bot = self._bot()
+        soon = (datetime.now(timezone.utc) + timedelta(hours=16)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        for p in bot.client.programs:
+            if p["market_ticker"] == self.T:
+                p["start_date"] = soon
+        with mock.patch.object(imm, "UPCOMING_ENABLE", True):
+            bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.programmed)       # not paying yet
+        self.assertIn(self.T, bot._upcoming)
+        self.assertEqual(bot._rain_monthly_extra, {s})        # the writer reads it
+        self.assertEqual(self._quotes(bot), [])               # nothing quotes early
+        # all four writer hand-offs read the same feed
+        import inspect
+        src = inspect.getsource(imm.IncentiveMarketMaker.refresh_universe)
+        for name in ("_rp", "_rmx", "_sn", "_rs"):
+            self.assertIn(f"{name} = {{series_of(t) for t in _wfeed", src)
+        # the upcoming read off: the active feed alone, as before
+        bot = self._bot()
+        for p in bot.client.programs:
+            if p["market_ticker"] == self.T:
+                p["start_date"] = soon
+        with mock.patch.object(imm, "UPCOMING_ENABLE", False):
+            bot.run_cycle()
+        self.assertEqual(bot._rain_monthly_extra, set())
+
     def test_the_name_rule_and_what_it_leaves_alone(self):
         for s in ("KXRAINLASM", "KXRAINPHLM", "KXRAINSACM", "KXRAINSLCM"):
             self.assertTrue(imm.rain_monthly_auto(s), s)
