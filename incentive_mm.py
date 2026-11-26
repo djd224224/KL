@@ -7375,7 +7375,11 @@ def grammy_size_mult(series: str) -> float:
 # *_SIZE_MULT name, so env_overrides.txt can carry it);
 # IMM_GOODREADS_EVENT_TOP_N=5 back to the awards' 5 (launcher env).
 GOODREADS_SERIES = "KXGOODREADS"
-GOODREADS_SIZE_MULT = _env_float("IMM_GOODREADS_SIZE_MULT", 3.0)
+# x5 since 2026-11-26 (Jack: "5x on goodreads instead of 3x (so 100 base
+# contract)"): a day rung 20 -> 100, the per-market cap 150 -> 750; the COST
+# TIERS still multiply on top (a 1-2c bid 500, a 90-97c ask 300).
+# IMM_GOODREADS_SIZE_MULT=3 goes back to x3.
+GOODREADS_SIZE_MULT = _env_float("IMM_GOODREADS_SIZE_MULT", 5.0)
 GOODREADS_EVENT_TOP_N = _env_int("IMM_GOODREADS_EVENT_TOP_N", 0)
 
 
@@ -25804,14 +25808,16 @@ GOODREADS_PRICE_MAX = _env_int("IMM_GOODREADS_PRICE_MAX", 99)
 # not yes"). On the 1-99c band, a Goodreads side rests bigger the less a
 # contract costs at its own EXTERNAL touch -- a YES bid's cost is its price,
 # an ask's (a NO bid's) 100 less its price:
-#   * a YES bid at <= 2c: x5 (a 60 day rung -> 300);
+#   * a YES bid at <= 2c: x5 (a 60 day rung -> 300 at the family's x3; 100
+#     -> 500 at its x5 since the same evening);
 #   * an ask at >= 98c (NO at <= 2c): x5; at 90-97c (NO at <= 10c): x3
-#     (60 -> 180). The x3 tier is the NO side's only: a 3-10c YES bid keeps
-#     its size (the EVENT LONG-SHOT CUT's finding: in the awards family the
-#     side that buys the cheap YES lost, -4.3c a contract under 30c).
-# On top of the family's x3 and every other side rule; the per-market and
-# per-event caps still bind (an overnight 180 rung x5 stops at the 450
-# position cap). The tier reads the side's touch each cycle, so a side whose
+#     (60 -> 180; 100 -> 300 at x5). The x3 tier is the NO side's only: a
+#     3-10c YES bid keeps its size (the EVENT LONG-SHOT CUT's finding: in the
+#     awards family the side that buys the cheap YES lost, -4.3c a contract
+#     under 30c).
+# On top of the family's size (GOODREADS_SIZE_MULT) and every other side
+# rule; the per-market and per-event caps still bind (an overnight rung x5
+# stops at the position cap: 450 at x3, 750 at x5). The tier reads the side's touch each cycle, so a side whose
 # touch leaves the tier goes back to its own size at once. The estimate and
 # the $1 floor projection read the same multiples (side_size_mults,
 # floor_size_profile). IMM_GOODREADS_COST_TIERS_BID / _ASK = "C:M,..." (cost

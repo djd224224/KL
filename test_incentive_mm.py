@@ -34225,8 +34225,9 @@ class TestAwardsByKalshiTag(unittest.TestCase):
     def test_goodreads_quotes_every_finalist_at_x3(self):
         # Jack 2026-11-26: "Yes All 10, and don't add to wave just normal
         # quoting but at 3x" -- KXGOODREADS on the awards rule set at x3 with
-        # no per-event cap; another tag member keeps x1 and 5 an event
-        self.assertEqual(imm.GOODREADS_SIZE_MULT, 3.0)
+        # no per-event cap; another tag member keeps x1 and 5 an event. x5
+        # since 2026-11-26: "5x on goodreads instead of 3x (so 100 base contract)"
+        self.assertEqual(imm.GOODREADS_SIZE_MULT, 5.0)
         self.assertEqual(imm.GOODREADS_EVENT_TOP_N, 0)
         for k in ("GOODREADS_SIZE_MULT", "GOODREADS_EVENT_TOP_N"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
@@ -34242,13 +34243,13 @@ class TestAwardsByKalshiTag(unittest.TestCase):
             imm.SERIES_OVERRIDES.pop(s, None)
             imm.ensure_family_override(s)
         self.assertEqual(imm.SERIES_OVERRIDES["KXGOODREADS"],
-                         imm.replace(parent, size_mult=3.0))
+                         imm.replace(parent, size_mult=5.0))
         self.assertTrue(imm.awards_auto_rules("KXGOODREADS"))   # still a member
         self.assertEqual(imm.event_top_n_for("KXGOODREADS"), 0)  # uncapped
         with mock.patch.object(imm, "size_test_mult", return_value=1.0):
-            self.assertEqual(imm.applied_mention_mult("KXGOODREADS"), 3.0)
+            self.assertEqual(imm.applied_mention_mult("KXGOODREADS"), 5.0)
             self.assertEqual(imm.series_max_position("KXGOODREADS"),
-                             3.0 * imm.MAX_POSITION_CONTRACTS)
+                             5.0 * imm.MAX_POSITION_CONTRACTS)
             self.assertEqual(imm.applied_mention_mult("KXGAMEAWARDS"), 1.0)
         self.assertEqual(imm.SERIES_OVERRIDES["KXGAMEAWARDS"], parent)
         self.assertEqual(imm.event_top_n_for("KXGAMEAWARDS"), 5)
