@@ -24602,7 +24602,8 @@ class TestVercelBidEdge(unittest.TestCase):
 
     def test_armed_by_default_with_a_kill_switch(self):
         self.assertTrue(imm.VERCEL_BID_EDGE)
-        self.assertEqual(imm.VERCEL_BID_EDGE_C, 3.0)
+        # 3c -> 2c on the blend (2026-11-26, Jack: "Move to 2c")
+        self.assertEqual(imm.VERCEL_BID_EDGE_C, 2.0)
         for k in ("VERCEL_BID_EDGE", "VERCEL_BID_EDGE_C"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS, k)
 
@@ -24619,9 +24620,10 @@ class TestVercelBidEdge(unittest.TestCase):
     def test_the_bar(self):
         r = lambda b, fair=60.0, t=self.T: imm.vercel_bid_edge_reason(
             t, time.time(), b, fair)
-        self.assertEqual(r(57), "")                           # at fair - 3c: it rests
-        self.assertIn("no YES bid", r(58))
-        self.assertIn("touch bid 57.5c over the 60.0c fair less 3c (57.0c)", r(57.5))
+        self.assertEqual(r(57), "")
+        self.assertEqual(r(58), "")                           # at fair - 2c: it rests
+        self.assertIn("no YES bid", r(59))
+        self.assertIn("touch bid 58.5c over the 60.0c fair less 2c (58.0c)", r(58.5))
         self.assertEqual(r(None), "")                         # no touch bid: nothing to judge
         self.assertEqual(r(58, t="KXOPENSOURCESHARE-68DEC06-T67.5"), "")
         self.assertEqual(r(58, t="KXFOO-68DEC06-T20"), "")
@@ -24633,8 +24635,8 @@ class TestVercelBidEdge(unittest.TestCase):
         # no fair passed: read as FAIR LEAD reads it -- none yet, nothing
         self.assertEqual(r(58, fair=None), "")
         self._write()                                         # fair 40c
-        self.assertTrue(r(38, fair=None))
-        self.assertEqual(r(37, fair=None), "")
+        self.assertTrue(r(39, fair=None))
+        self.assertEqual(r(38, fair=None), "")
 
     def test_the_gate_takes_the_bids_out(self):
         now = time.time()
@@ -24642,12 +24644,12 @@ class TestVercelBidEdge(unittest.TestCase):
         so = lambda b, a: imm.vercel_side_out("KXOPENVREQ", self.T, now, b, a,
                                               self.CLOSE)
         self.assertEqual(self._write(), (1, 0))               # fair 40c
-        why, inp = g(49, 51)                                  # 49 > 40 - 3
+        why, inp = g(49, 51)                                  # 49 > 40 - 2
         self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "bid_edge"))
         self.assertIn("over the 40.0c fair", inp["why"])
         self.assertEqual(so(49, 51), "bid")
-        self.assertEqual(g(37, 51), ("", {}))                 # at the edge: both sides
-        self.assertIsNone(so(37, 51))
+        self.assertEqual(g(38, 51), ("", {}))                 # at the edge: both sides
+        self.assertIsNone(so(38, 51))
         # no YES bid: nothing to judge (an 80c offer keeps the tail rule's
         # mid, (0 + 80) / 2, over its 35c bar)
         self.assertEqual(g(None, 80), ("", {}))
@@ -24662,7 +24664,7 @@ class TestVercelBidEdge(unittest.TestCase):
         why, inp = g(18, 22)
         self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "tail_bid"))
         with mock.patch.object(imm, "VERCEL_TAIL_BID", False):
-            why, inp = g(18, 22)                              # 18 > 20 - 3
+            why, inp = g(19, 22)                              # 19 > 20 - 2
             self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "bid_edge"))
         # an ask breach keeps the bid alone: its touch sits far under the fair
         self._write(x_l=21.0)                                 # fair 80c: ask 51 < 65
@@ -24872,11 +24874,11 @@ class TestVercelBlend(unittest.TestCase):
         now = time.time()
         g = lambda b, a: imm.vercel_gate(self.T, now, b, a, self.CLOSE)
         self._write()                                             # model 40c
-        # on the model the 40c bid sits over 40 - 3: the bids out
+        # on the model the 40c bid sits over 40 - 2: the bids out
         with mock.patch.object(imm, "VERCEL_BLEND", False):
             why, inp = g(40, 50)
             self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "bid_edge"))
-        # blended, 45 - 0.26 x 5 = 43.7c: its edge 40.7c clears the 40c bid
+        # blended, 45 - 0.26 x 5 = 43.7c: its edge 41.7c clears the 40c bid
         self.assertEqual(g(40, 50), ("", {}))
         why, inp = g(44, 46)                                      # blend 43.7c, bid 44
         self.assertEqual((why, inp["side_out"], inp["reason"]), ("", "bid", "bid_edge"))

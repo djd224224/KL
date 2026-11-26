@@ -11240,3 +11240,20 @@ Register-ScheduledTask -TaskName 'KL vercel-blend-fit' -Force `
   +1.2 pp high, weekday -1.1 pp low); the blend shrinks what that costs, it does not correct it (log space for
   DEEPVREQ scored 0.182 in the replay; not built). The w are in-sample on 24-27 events; DEEPVREQ's 90% band is
   0.03-0.55. The logger's touch includes thin placeholder quotes.
+- **2026-11-26: the bid-edge margin 3c -> 2c** (Jack: "Re-tune it", then "Move to 2c"). On a tight book with the model
+  over the mid, the blend made the 3c rule bite harder: on DEEPVREQ the model had to sit 9.6c over the mid, not 2.5c.
+  That took the bid off KXDEEPVREQ-28NOV26 T13P6/T13P7/T14P1.
+  - That case is only 326 of DEEPVREQ's 8,086 pre-D hours. On books 3c or wider the blend is looser (bid out 1,193
+    vs 2,776 hours).
+  - The 11/23 replay re-run three ways since 10/01, outside the tail rule's hours, net of the bid's modelled reward:
+
+    | Rule | 0c | 1c | 2c | 3c | 4c | 5c |
+    |---|---|---|---|---|---|---|
+    | Blend | +$217 | +$190 | **+$241** | +$209 | +$183 | +$58 |
+    | Raw model | — | — | — | +$138 | — | — |
+
+  - 2c skips the same losing fills as 3c ($458) and gives up $32 less reward. No fill sat in the 2-3c band, and the
+    w are in-sample.
+  - On DEEPVREQ, 2c needs the model 5.8c over a 1c book's mid.
+  - Scripts and output: `KL-data\vercel-logger\analysis-2026-11-26-blend-edge\` (`vb_rule_blend.py`).
+  - `IMM_VERCEL_BID_EDGE_C` still overrides it.

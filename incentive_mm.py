@@ -15399,7 +15399,8 @@ _CONFIG_CODE_KNOBS = (
     "VERCEL_BID_ONLY",                           # bid only on an ask breach (2026-10-30)
     # no YES bid on a tail strike (2026-11-23)
     "VERCEL_TAIL_BID", "VERCEL_TAIL_BID_MID_C", "VERCEL_TAIL_BID_SERIES",
-    # no YES bid under a touch over the fair less 3c, lab series (2026-11-23)
+    # no YES bid under a touch over the fair less 2c, lab series (2026-11-23;
+    # 3c -> 2c on the blend 2026-11-26)
     "VERCEL_BID_EDGE", "VERCEL_BID_EDGE_C",
     "VERCEL_ASKS_ONLY_SERIES",    # series quoting asks only (2026-11-24)
     # the model fair blended with the book's mid (2026-11-25)
@@ -21996,8 +21997,16 @@ def vercel_tail_bid_reason(ticker: str, ext_bid: Optional[float],
 # under 5 min after a move (-$170) are only partly caught.
 # IMM_VERCEL_BID_EDGE=0 turns it off (env => task-level restart);
 # IMM_VERCEL_BID_EDGE_C tunes the margin.
+# 3c -> 2c (2026-11-26, Jack: "Move to 2c"), re-tuned once the fair it reads
+# became the VERCEL FAIR BLEND: the same replay since 10/01 (KL-data\
+# vercel-logger\analysis-2026-11-26-blend-edge\vb_rule_blend.py), outside
+# the tail rule's hours, net of the bid's modelled reward: on the blend 0 /
+# 1 / 2 / 3 / 4 / 5c +$217 / +$190 / +$241 / +$209 / +$183 / +$58, on the
+# raw model at 3c +$138. 2c skips the same losing fills as 3c ($458) and
+# gives up $32 less reward; no fill sat in the 2-3c band (the blend's
+# weights are in-sample on that window).
 VERCEL_BID_EDGE = os.environ.get("IMM_VERCEL_BID_EDGE", "1") == "1"
-VERCEL_BID_EDGE_C = _env_float("IMM_VERCEL_BID_EDGE_C", 3.0)
+VERCEL_BID_EDGE_C = _env_float("IMM_VERCEL_BID_EDGE_C", 2.0)
 # VERCEL ASKS ONLY (2026-11-24, Jack: "do 1 - 3", on "give KXOPENSOURCESHARE
 # one week under the cheap-strike rule, then decide: if it's still negative
 # next week with the rule on, go asks-only on it"). A VERCEL_ASKS_ONLY_SERIES
