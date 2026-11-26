@@ -47,7 +47,9 @@ category is listed and each SNOW-named series no other snow family claims
 (KX<CITY>SNOWM monthlies, KX<RESORT>SNOW resorts, Big Sky) is read on its open
 markets: one whose every market parses as this contract (parse_market) joins
 ("series" in the file, which enrolls it in the bot); one that does not waits
-RETRY_SECS ("rejected", with why).
+RETRY_SECS ("rejected", with why), one with no open market yet only until
+the next pass (2026-11-26: Kalshi creates a series before its markets open;
+rain_wknd_fair's LISTED BEFORE IT OPENS).
 
 Writes SNOW_DAYS_FILE for incentive_mm in the weather loaders' shape: markets
 {ticker: {p, event, fetched_at, ...}}, missing {ticker: why}.
@@ -88,6 +90,7 @@ MAX_HIST_READS = 40          # new ACIS reads a pass
 EVENTS_TTL_SECS = 3600
 DISCOVER_SECS = 3600
 RETRY_SECS = 6 * 3600
+NO_OPEN_MARKET = "no open market"     # read again at every pass, not after RETRY_SECS
 HTTP_TIMEOUT = 30
 USER_AGENT = "KL-IMM-snow-days-fair/1.0"
 # the other snow families' names (theirs, not this one's)
@@ -297,7 +300,7 @@ def classify(markets: List[dict]) -> Tuple[Optional[dict], str]:
     """({'sample'}, '') when every open market is the snow-day scalar, else
     (None, why)."""
     if not markets:
-        return None, "no open market"
+        return None, NO_OPEN_MARKET
     for m in markets:
         spec, why = parse_market(m)
         if spec is None:
@@ -310,7 +313,7 @@ def discover(old: dict, now_ts: float, get_json: Optional[Callable] = None
     """(joined {series: {sample, at}}, rejected {series: {at, why}}, listed
     at): the file's until DISCOVER_SECS has passed, then the weather category
     re-listed and each unclaimed SNOW series re-read once its verdict is
-    RETRY_SECS old (AUTO-ENROLL)."""
+    RETRY_SECS old (AUTO-ENROLL), one with no open market at every pass."""
     found = dict(old.get("series") or {})
     rejected = dict(old.get("rejected") or {})
     at = float(old.get("discovered_at") or 0.0)
@@ -325,7 +328,8 @@ def discover(old: dict, now_ts: float, get_json: Optional[Callable] = None
         if "SNOW" not in s or s in SERIES or _OTHER_SNOW_RE.fullmatch(s):
             continue
         last = found.get(s) or rejected.get(s) or {}
-        if last and now_ts - float(last.get("at") or 0.0) < RETRY_SECS:
+        if last and last.get("why") != NO_OPEN_MARKET \
+                and now_ts - float(last.get("at") or 0.0) < RETRY_SECS:
             if s in found:
                 out[s] = found[s]
             continue

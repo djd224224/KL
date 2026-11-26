@@ -231,5 +231,33 @@ class TestWrite(unittest.TestCase):
         self.assertEqual(ok, 2)
 
 
+    def test_a_series_listed_before_its_markets_open_is_read_at_the_next_pass(self):
+        # 2026-11-26 (KXSNOWCHRISTMAS): a series Kalshi lists before its
+        # markets open is not held out for RETRY_SECS
+        calls, opened = [], {"KXSNOWDAYSB": False}
+
+        def get_json(path, params):
+            calls.append((path, params.get("series_ticker")))
+            if path == "/series":
+                return {"series": [{"ticker": t} for t in ("KXSNOWDAYSB", "KXSNOWCITIES")]}
+            if params.get("series_ticker") == "KXSNOWCITIES":
+                return {"markets": [dict(market(), ticker="KXSNOWCITIES-26-NYC",
+                                         rules_primary="Will NYC see more snow than Boston?")]}
+            return {"markets": [market("BOS", 11, 31)] if opened["KXSNOWDAYSB"] else []}
+        ts = self.NOW.timestamp()
+        found, rej, at = s.discover({}, ts, get_json)
+        self.assertEqual(found, {})
+        self.assertEqual(rej["KXSNOWDAYSB"]["why"], s.NO_OPEN_MARKET)
+        self.assertIn("KXSNOWCITIES", rej)
+        opened["KXSNOWDAYSB"] = True
+        calls.clear()
+        old = {"series": found, "rejected": rej, "discovered_at": at}
+        found, rej, _ = s.discover(old, ts + s.DISCOVER_SECS + 1, get_json)
+        self.assertEqual(sorted(found), ["KXSNOWDAYSB"])
+        self.assertNotIn("KXSNOWDAYSB", rej)
+        # the real rejection waits RETRY_SECS as before
+        self.assertEqual({t for p, t in calls if p == "/markets"}, {"KXSNOWDAYSB"})
+
+
 if __name__ == "__main__":
     unittest.main()

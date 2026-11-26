@@ -420,6 +420,31 @@ class TestAutoDaySeries(unittest.TestCase):
         with mock.patch.object(r, "AUTO_DAY_ENABLE", False):
             self.assertEqual(r.discover_day_series(old, ts + 1e6, get, skip)[0], {})
 
+    def test_a_series_listed_before_its_markets_open_is_read_at_the_next_pass(self):
+        # 2026-11-26: the 00:19:55Z pass read KXSNOWCHRISTMAS 14 minutes before
+        # its markets opened; the 6-hour retry kept it out until ~06:20Z
+        calls = []
+        by = {"KXRAINDNYC": [self.market("KXRAINDNYC-261126-0",
+                                         self.ONE.format(name="NYC", code="NYC"))]}
+        get = self.fake(by, calls)
+        ts = self.NOW.timestamp()
+        found, rej, at = r.discover_day_series({}, ts, get)
+        self.assertEqual(found, {})
+        self.assertEqual(rej["KXRAINTURKEY"]["why"], r.NO_OPEN_MARKET)
+        self.assertIn("per city", rej["KXRAINDNYC"]["why"])
+        old = {"day_series": found, "day_rejected": rej, "day_discovered_at": at}
+        by["KXRAINTURKEY"] = self.turkey()           # its markets open
+        calls.clear()
+        self.assertEqual(r.discover_day_series(old, ts + 60, get)[0], {})
+        self.assertEqual(calls, [])                    # inside the hour
+        found, rej, _ = r.discover_day_series(old, ts + r.DAY_DISCOVER_SECS + 1, get)
+        self.assertEqual(set(found), {"KXRAINTURKEY"})
+        self.assertNotIn("KXRAINTURKEY", rej)
+        # a real rejection still waits DAY_RETRY_SECS: KXRAINDNYC was not re-read
+        read = [t for p, t in calls if p == "/markets"]
+        self.assertIn("KXRAINTURKEY", read)
+        self.assertNotIn("KXRAINDNYC", read)
+
     def test_a_new_series_is_priced_on_its_rules_window_in_the_same_pass(self):
         path = os.path.join(tempfile.mkdtemp(), "rain_wknd_fair.json")
         calls = []

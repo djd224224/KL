@@ -61,7 +61,8 @@ CLIxxx", "strictly greater than 0 inches", over a named day or a span of up to
 MAX_SPAN_DAYS. Its window comes from the rules, not the ticker (whose date
 Kalshi writes either way round). The file's "day_series" names it for the
 bot; a series that is not the contract waits DAY_RETRY_SECS before it is read
-again ("day_rejected", with why). A city whose station the writer can't read
+again ("day_rejected", with why); one with no open market yet, at the next
+pass (LISTED BEFORE IT OPENS). A city whose station the writer can't read
 stands aside alone, named in the row's "skipped" (2026-11-22: Honolulu's
 "(PHNL)" had rejected all 51 Thanksgiving cities); the series is rejected only
 when no city reads.
@@ -250,6 +251,16 @@ SERIES_CATEGORY = "Climate and Weather"
 AUTO_DAY_ENABLE = os.environ.get("IMM_RAIN_DAY_AUTO", "1") == "1"
 DAY_DISCOVER_SECS = EVENTS_TTL_SECS
 DAY_RETRY_SECS = 6 * 3600
+# LISTED BEFORE IT OPENS (Jack 2026-11-26: "KXSNOWCHRISTMAS should auto quote
+# as part of weather family"). Kalshi creates a series before its markets
+# open: KXSNOWCHRISTMAS was created 23:45Z 11/25 and its 23 markets opened
+# 00:33:49Z 11/26 (KXRAINCHRISTMAS's 00:28:43Z). The 00:19:55Z pass read
+# both in between and rejected them "no open market", and DAY_RETRY_SECS
+# would have kept both out until ~06:20Z. That verdict says nothing about
+# the contract, so such a series is read again at every pass (hourly,
+# DAY_DISCOVER_SECS): one /markets read each. A real rejection still waits
+# DAY_RETRY_SECS.
+NO_OPEN_MARKET = "no open market"
 # bump when classify_day_markets / rules_span learn new wording: every
 # rejection an older one wrote is re-read at the next pass (2 = 2026-11-14,
 # "on <day> is"; 3 = 2026-11-20, the snow contract: SNOW DAYS; 4 = 2026-11-22,
@@ -977,7 +988,7 @@ def classify_day_markets(markets: List[dict]) -> Tuple[Optional[dict], str]:
     'skipped': {ticker: why} for the cities with no readable station, else
     (None, why)."""
     if not markets:
-        return None, "no open market"
+        return None, NO_OPEN_MARKET
     events: Dict[str, list] = {}
     kinds = set()
     skipped: Dict[str, str] = {}
@@ -1033,7 +1044,8 @@ def discover_day_series(old: dict, now_ts: float, get_json: Optional[Callable] =
     {'at', 'why'}}, listed at): the file's until DAY_DISCOVER_SECS has passed,
     then Kalshi's weather category re-listed and each unclaimed rain series
     read again once its last verdict is DAY_RETRY_SECS old (AUTO DAY
-    SERIES). A series whose read fails keeps its last verdict."""
+    SERIES), one with no open market at every pass (LISTED BEFORE IT
+    OPENS). A series whose read fails keeps its last verdict."""
     found = dict(old.get("day_series") or {})
     rejected = dict(old.get("day_rejected") or {})
     at = float(old.get("day_discovered_at") or 0.0)
@@ -1058,7 +1070,8 @@ def discover_day_series(old: dict, now_ts: float, get_json: Optional[Callable] =
                 or s in (SERIES, "KXRAIN") + DAY_SERIES or (skip and skip(s)):
             continue
         last = found.get(s) or rejected.get(s) or {}
-        if last and now_ts - float(last.get("at") or 0.0) < DAY_RETRY_SECS \
+        if last and last.get("why") != NO_OPEN_MARKET \
+                and now_ts - float(last.get("at") or 0.0) < DAY_RETRY_SECS \
                 and int(last.get("v") or 1) == DAY_CLASSIFY_VERSION:
             if s in found:
                 out[s] = found[s]
