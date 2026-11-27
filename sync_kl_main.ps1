@@ -4,8 +4,11 @@
 #
 # Runs from Windows Task Scheduler ('KL sync-kl-main', every 30 min) via
 # run_sync_kl_main.vbs so no console window flashes.
-
-$Repo = "C:\Users\jackd\Documents\KL"
+#
+# -Repo exists only for test_kl_sync_automerge.py's end-to-end test, which runs
+# this script against a scratch repository; the task passes nothing.
+param([string]$Repo = "C:\Users\jackd\Documents\KL")
+$LiveRepo = "C:\Users\jackd\Documents\KL"
 $Log = Join-Path $Repo "run-logs\sync-kl-main.log"
 New-Item -ItemType Directory -Force (Split-Path $Log) | Out-Null
 
@@ -27,9 +30,37 @@ if ($fetchRc -ne 0) {
 $branch = (git -C $Repo branch --show-current 2>&1 | ForEach-Object { "$_" }) -join ''
 $out = (git -C $Repo merge --ff-only origin/main 2>&1 | ForEach-Object { "$_" }) -join ' | '
 $mergeRc = $LASTEXITCODE
+# AUTO-MERGE (R-261125-02, Jack 2026-11-27: "Yes, build it"). The ff-only
+# merge above refuses whenever the box's main holds commits GitHub lacks and
+# GitHub main moved on too. The nightly high-temp digest did exactly that and
+# wedged this sync for hours (11/24, 11/26). kl_sync_automerge.py merges only
+# when every incoming path is under run-logs/ and the merge is clean: it
+# computes the merge off the live tree, then fast-forwards, and a merged run
+# logs "AUTO-MERGED" with no "!". Anything else (code on GitHub's side, a
+# conflict, a dirty incoming file) still fails loudly here. Off switch:
+# KL_SYNC_AUTO_MERGE=0, or the file run-logs\sync-auto-merge.off.
+$autoLine = $null
+if ($mergeRc -ne 0 -and $out -match 'Not possible to fast-forward') {
+    $py = "C:\Users\jackd\AppData\Local\Programs\Python\Python312\python.exe"
+    if (-not (Test-Path $py)) { $py = "python" }
+    try {
+        $amOut = (& $py (Join-Path $Repo "kl_sync_automerge.py") --repo $Repo 2>&1 | ForEach-Object { "$_" }) -join ' | '
+        $amRc = $LASTEXITCODE
+    } catch {
+        $amOut = "could not run kl_sync_automerge.py: $($_.Exception.Message)"
+        $amRc = 2
+    }
+    if ($amRc -eq 0) {
+        $out = "AUTO-MERGED: $amOut"
+        $mergeRc = 0
+    } else {
+        $autoLine = "$stamp ! AUTO-MERGE refused (exit $amRc): $amOut"
+    }
+}
 $mark = if ($mergeRc -ne 0) { "! MERGE FAILED (exit $mergeRc): " } else { "" }
 $onBranch = if ($branch -and $branch -ne 'main') { " [! KL is on branch '$branch', not main]" } else { "" }
 "$stamp $mark$out$onBranch" | Add-Content -Path $Log -Encoding utf8
+if ($autoLine) { $autoLine | Add-Content -Path $Log -Encoding utf8 }
 # what GitHub has vs what KL runs (a fetch that "worked" but left KL behind
 # shows up here too)
 $remoteLine = (git -C $Repo ls-remote origin refs/heads/main 2>&1 | ForEach-Object { "$_" }) -join ' | '
@@ -48,6 +79,10 @@ if ($lsRc -ne 0) {
         }
     }
 }
+
+# Everything below acts on this machine: its scheduled tasks and the bot. A
+# run against any other folder (the end-to-end test) stops here.
+if ($Repo -ne $LiveRepo) { exit 0 }
 
 # One-time bootstrap: the first sync after register_dashboard_task.ps1 lands,
 # register the daily 7 AM dashboard rebuild and kick its first run — so the
