@@ -29601,14 +29601,25 @@ def natnom_ask_floor(ticker: str, names: Dict[str, str],
 #     had 1-2 states trimmed.
 # $20k fits every name's wanted bids then.
 #
+# RAISED TO $50,000 (Jack 2026-11-27: "2x to get under $1 ones above the bar.
+# incrase $20k name bid to $50k"). On 11/27 the wave's markets pacing under the $1
+# payout floor rested bids x2 / asks x1.25 (pvd_wave_tune --side-mult-file), and the
+# $20k cap cut the doubled states to NO bid first (14:18Z: Harris wanted $26.6k,
+# Buttigieg $25.7k), so their bids went back to x1. At 23:37Z the cap bound 2 names:
+#   * AOC (KXDPRESPRIMARY) wanted $44,961, so 22 of 48 states rested no bid.
+#   * Newsom (KXDPRESPRIMARY GNEW) wanted $37,361, so 21 of 47 states rested no bid.
+# The under-$1 markets' sides then doubled again (bids x4 / asks x2.5) with the cap at
+# $50k. A dropout is still one bet across every state; the candidate breaker is its
+# guard.
+#
 # Knobs:
 #   * IMM_NAME_BID_CAP: "on" (default), "dry" (logged, nothing cut), "off".
-#   * IMM_NAME_BID_CAP_USD: the cap, default 20000 (1500 from 11/16 to 11/17,
-#     5000 from 11/17 to 11/18, 13000 from 11/18 to 11/19).
+#   * IMM_NAME_BID_CAP_USD: the cap, default 50000 (1500 from 11/16 to 11/17,
+#     5000 from 11/17 to 11/18, 13000 from 11/18 to 11/19, 20000 from 11/19 to 11/27).
 NAME_BID_CAP_MODE = os.environ.get("IMM_NAME_BID_CAP", "on").strip().lower()
 if NAME_BID_CAP_MODE not in ("on", "dry", "off"):
     NAME_BID_CAP_MODE = "on"
-NAME_BID_CAP_USD = max(0.0, _env_float("IMM_NAME_BID_CAP_USD", 20000.0))
+NAME_BID_CAP_USD = max(0.0, _env_float("IMM_NAME_BID_CAP_USD", 50000.0))
 
 
 def name_bid_cap(quotes: List["Quote"], value_per_day: Dict[str, float],
