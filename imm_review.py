@@ -5216,12 +5216,20 @@ def render_allocation(al: dict, a) -> None:
         if not d.get("n"):
             a(f"- {label}: no readout yet")
             continue
-        a(f"- {label}: {d['n']} readouts, resting {usd(d.get('d_rest'))} a day. Rewards predicted "
+        a(f"- {label}: {d['n']} readouts, resting {usd(d.get('d_rest'))} a day. In dollars, rewards predicted "
           f"{usd(d.get('pred_rew'))}, measured {usd(d.get('meas_rew'))} a day; trading predicted "
           f"{usd(d.get('pred_pnl'))}, measured {usd(d.get('meas_pnl'))}. Marginal net per $1k "
           f"{_fmt(d.get('marginal_per_1k'))} (their average before: {_fmt(d.get('average_per_1k'))}). "
-          + (f"Calibration used: rewards x{_fmt(d.get('c_rew'))}, trading x{_fmt(d.get('c_pnl'))}."
+          + (f"Each readout one vote, the book's ratio: rewards x{_fmt(d.get('pool_rew'))}, trading "
+             f"x{_fmt(d.get('pool_pnl'))}. By family, its readouts' own ratio, then the calibration used "
+             "(the own ratio shrunk toward the other families' by 5 readouts):"
              if d.get("calibrated") else "Too few to calibrate: the proportional model stands in."))
+        if d.get("calibrated"):
+            for f in (d.get("by_family") or [])[:6]:
+                a(f"  - {f['family']}: {f['n']} readouts ({usd(f.get('d_rest'))} resting), rewards "
+                  f"{usd(f.get('pred_rew'))} predicted vs {usd(f.get('meas_rew'))} measured; own x"
+                  f"{_fmt(f.get('own_rew'))} rewards / x{_fmt(f.get('own_pnl'))} trading -> used x"
+                  f"{_fmt(f.get('c_rew'))} / x{_fmt(f.get('c_pnl'))}")
         for m in (d.get("moves") or [])[:3]:
             a(f"  - {m.get('split')} x{_fmt(m.get('k'))} ({_fmt(m.get('rest_b'), 0)} -> {_fmt(m.get('rest_a'), 0)} "
               f"resting): rewards {_fmt(m.get('rew_b'), 0)} -> {_fmt(m.get('rew_a'), 0)}, trading "
@@ -5229,19 +5237,21 @@ def render_allocation(al: dict, a) -> None:
               + "; ".join(s for s in (m.get("subjects") or []) if s))
     a(f"THE MODEL (MODELLED): a step on one family, cut x{_fmt(stp.get('cut'))} or add x{_fmt(stp.get('add'))}: "
       "rewards by the bot's share model (rew x k / (k s + 1 - s), s our pool share), trading in proportion, each "
-      "times its direction's calibration; days and readouts resampled together. Net $/day change, "
-      "p50 [p10, p90]:")
+      "times the family's own calibration for that direction; days and readouts resampled together. Net $/day "
+      "change, p50 [p10, p90]:")
     rows = al.get("families") or []
     if rows:
         a("| Family | Resting share | Net per $1k (p10 to p90) | t | Pool share | Trading c/ct | "
-          "Cut: net $/day | Add: net $/day | Changed in 7 days |")
-        a("|---|---:|---:|---:|---:|---:|---:|---:|---|")
+          "Cut: net $/day | Add: net $/day | Add calibration (rewards / trading) | Changed in 7 days |")
+        a("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
         for r in rows:
             nq = r.get("net_per_1k_q") or {}
+            ca = ((r.get("cal") or {}).get("add")) or (None, None)
             rec = "; ".join(f"{c['day'][5:]} {c['key']}" for c in (r.get("recent") or [])[:2])
             a(f"| {r['family']} | {_fmt((r.get('rest_share') or 0) * 100, 1)}% | {_fmt(r.get('net_per_1k'))} "
               f"({_fmt(nq.get('p10'))} to {_fmt(nq.get('p90'))}) | {_fmt(r.get('t'))} | {_fmt(r.get('share'), 3)} | "
-              f"{_fmt(r.get('trade_c'))} | {_q_str(r.get('cut'))} | {_q_str(r.get('add'))} | {rec} |")
+              f"{_fmt(r.get('trade_c'))} | {_q_str(r.get('cut'))} | {_q_str(r.get('add'))} | "
+              f"x{_fmt(ca[0])} / x{_fmt(ca[1])} | {rec} |")
     props = al.get("proposals") or []
     a(f"PROPOSALS (p10 gain above zero, p50 at least {usd(ru.get('min_gain'))}/day, {ru.get('min_days')}+ days of "
       f"data, no registered change in the last {ru.get('recent_days')} days):")

@@ -16,25 +16,34 @@ section measures both and proposes only what clears the bar:
      every change after which a scope's resting $ moved MOVE_MIN x or more,
      with the programs' supply inside SUPPLY_BAND. Adds and cuts apart: the
      proportional prediction from the 7 days before against the 7 days
-     after, for rewards and for trading. The 11/26 back-fill (30 days): 21
-     adds (+$927k resting) earned -$511/day of rewards against +$2,686
-     predicted (marginal net per $1k -0.66; the average before +2.16), while
-     6 cuts lost rewards and saved trading as predicted (-$604 vs -$632 and
-     +$727 vs +$739). The proportional model holds for cuts, not for adds.
+     after, for rewards and for trading, BY FAMILY (each readout's series).
+     The 11/26 back-fill (30 days):
+       - 8 ELECTION adds earned -$612/day of rewards against +$1,586
+         predicted. Those programs were ending (R-261124-02's re-check), and
+         the supply check missed it.
+       - The 12 adds in every other family earned x0.47 of the predicted
+         rewards and x0.37 of the trading: marginal net per $1k +2.03,
+         against their +3.58 average.
+       - Cuts moved about as predicted.
   3. THE MODEL  a size step k on a family: rewards by the bot's share model,
-     rew x k / (k s + 1 - s) with s our share, and trading in proportion,
-     each scaled by its direction's measured realized / predicted ratio, kept
-     in CAL_CLIP (more size cannot cost rewards or trading volume: a negative
-     add ratio is confounding, not mechanism). Days and readouts are
-     resampled together: p10 / p50 / p90 of the change in net $ a day.
+     rew x k / (k s + 1 - s) with s our share, and trading in proportion.
+     Each is scaled by the family's own calibration:
+       - each readout's measured / predicted ratio, kept in CAL_CLIP (more
+         size cannot cost rewards or trading volume);
+       - the family's own mean, shrunk toward the mean of every OTHER
+         family's readouts by SHRINK_N readouts, so a family with none takes
+         the book's;
+       - every readout weighs the same. The first build (186f8da) pooled by
+         dollars, and 8 election readouts zeroed every family's adds.
+     Days and readouts are resampled together: p10 / p50 / p90 of the change
+     in net $ a day.
 
 PROPOSALS (at most MAX_PROPOSALS): a CUT or an ADD whose p10 gain is above
 zero and whose p50 is MIN_GAIN $/day or more, on a family that no
 registered change touched in the last RECENT_DAYS (such a family waits for
-that change's readout). With adds measured near zero at the margin, an add
-rarely qualifies, so the best-measured family (net per $1k p10 above zero,
-t >= EXP_MIN_T) is offered as an add EXPERIMENT instead: an EXP_STEP step,
-pre-registered, read out at 7 days.
+that change's readout). Where no add qualifies, the best-measured family
+(net per $1k p10 above zero, t >= EXP_MIN_T) is offered as an add
+EXPERIMENT: an EXP_STEP step, pre-registered, read out at 7 days.
 
 Every run appends what it proposed to moat/allocation.jsonl (kept forever,
 once a day; a "none" row when nothing clears the bar). The review files the
@@ -76,6 +85,8 @@ DUP_TOL = 0.01                # two readouts within 1% before and after are the 
 TRACK_DAYS = 120              # readouts whose split is this recent
 CAL_MIN_N = 5                 # fewer readouts: that direction is uncalibrated (ratio 1)
 CAL_CLIP = (0.0, 2.0)
+SHRINK_N = 5.0                # a family's own readouts weigh against this many of the book's
+RATIO_MIN_PRED = 1.0          # $/day: a readout predicting less has no ratio of its own
 BOOT = 1000
 MIN_GAIN = 5.0                # $/day
 MAX_PROPOSALS = 3
@@ -152,12 +163,6 @@ def _ratio(measured: float, predicted: float) -> Optional[float]:
     return min(max(measured / predicted, CAL_CLIP[0]), CAL_CLIP[1])
 
 
-def _c(x: Optional[float]) -> float:
-    """A calibration ratio, 1.0 (the proportional model) where there is none.
-    0.0 is a real ratio (the next dollar earns nothing): never `x or 1.0`."""
-    return 1.0 if x is None else x
-
-
 def capital_moves(day: date) -> List[dict]:
     """The registry's complete readouts in which the scope's resting $ moved
     MOVE_MIN x or more with the programs' supply steady, one per money (a
@@ -187,22 +192,71 @@ def capital_moves(day: date) -> List[dict]:
         k = ra / rb
         if abs(math.log(k)) < math.log(MOVE_MIN):
             continue
+        series = list(res.get("series_sample") or [])[:6]
+        fams = defaultdict(int)
+        for s in series:
+            fams[rv.family_of(s)[0]] += 1
         it = {"split": res.get("split"), "scope": str(res.get("scope") or "")[:80], "k": round(k, 3),
               "supply": sup, "rest_b": rb, "rest_a": ra,
               "rew_b": rv._f(b.get("rew")), "rew_a": rv._f(a.get("rew")),
               "pnl_b": rv._f(b.get("pnl")), "pnl_a": rv._f(a.get("pnl")),
-              "series": list(res.get("series_sample") or [])[:6],
+              "series": series, "family": max(sorted(fams), key=lambda f: fams[f]) if fams else None,
               "subjects": [subj.get(x, "")[:110] for x in (r.get("keys") or res.get("keys") or [])][:2]}
+        it["r_rew"], it["r_pnl"] = readout_ratios(it)
         if not any(_same(it, o) for o in out):
             out.append(it)
     return out
 
 
-def direction(moves: List[dict]) -> dict:
+def readout_ratios(m: dict) -> Tuple[Optional[float], Optional[float]]:
+    """One readout's measured / predicted change, for rewards and for trading,
+    kept in CAL_CLIP; None where it predicted under RATIO_MIN_PRED $/day."""
+    pr, pp = m["rew_b"] * (m["k"] - 1), m["pnl_b"] * (m["k"] - 1)
+    return (_ratio(m["rew_a"] - m["rew_b"], pr) if abs(pr) >= RATIO_MIN_PRED else None,
+            _ratio(m["pnl_a"] - m["pnl_b"], pp) if abs(pp) >= RATIO_MIN_PRED else None)
+
+
+def family_calibration(moves: List[dict], families) -> Dict[str, Tuple[float, float]]:
+    """{family: (c_rew, c_pnl)} for one direction.
+    - Each readout is one vote: its ratio, clipped.
+    - A family's own mean is shrunk toward the mean of every OTHER family's
+      readouts by SHRINK_N readouts; a family with none takes the book's mean.
+    - Equal votes, so one big wave cannot set every family's ratio: in the
+      first build's dollar-weighted pool, 8 election readouts zeroed all the
+      adds.
+    - (1.0, 1.0), the proportional model, while the direction has fewer than
+      CAL_MIN_N readouts."""
+    want = set(families) | {m.get("family") or "?" for m in moves}
+    if len(moves) < CAL_MIN_N:
+        return {f: (1.0, 1.0) for f in want}
+    S = ({}, {})
+    N = ({}, {})
+    for m in moves:
+        f = m.get("family") or "?"
+        for j, r in enumerate((m["r_rew"], m["r_pnl"])):
+            if r is not None:
+                S[j][f] = S[j].get(f, 0.0) + r
+                N[j][f] = N[j].get(f, 0) + 1
+    tot = [(sum(S[j].values()), sum(N[j].values())) for j in (0, 1)]
+    out = {}
+    for f in want:
+        cs = []
+        for j in (0, 1):
+            s_f, n_f = S[j].get(f, 0.0), N[j].get(f, 0)
+            s_o, n_o = tot[j][0] - s_f, tot[j][1] - n_f
+            pool = s_o / n_o if n_o else (s_f / n_f if n_f else 1.0)
+            cs.append(round((s_f + SHRINK_N * pool) / (n_f + SHRINK_N), 4))
+        out[f] = (cs[0], cs[1])
+    return out
+
+
+def direction(moves: List[dict], cal: Dict[str, Tuple[float, float]]) -> dict:
     """Predicted (proportional, from the before-window) against measured, for
-    one direction's readouts; the calibration ratios once CAL_MIN_N exist."""
+    one direction's readouts: the dollar totals for the record, and by family
+    the readouts' own ratios beside the calibration the model uses."""
     n = len(moves)
     S = defaultdict(float)
+    by: Dict[str, dict] = {}
     for i in moves:
         S["pred_rew"] += i["rew_b"] * (i["k"] - 1)
         S["meas_rew"] += i["rew_a"] - i["rew_b"]
@@ -211,17 +265,37 @@ def direction(moves: List[dict]) -> dict:
         S["d_rest"] += i["rest_a"] - i["rest_b"]
         S["rest_b"] += i["rest_b"]
         S["net_b"] += i["rew_b"] + i["pnl_b"]
-    cal = n >= CAL_MIN_N
-    return {"n": n, "calibrated": cal,
+        f = i.get("family") or "?"
+        b = by.setdefault(f, {"family": f, "n": 0, "d_rest": 0.0, "pred_rew": 0.0, "meas_rew": 0.0,
+                              "r_rew": [], "r_pnl": []})
+        b["n"] += 1
+        b["d_rest"] += i["rest_a"] - i["rest_b"]
+        b["pred_rew"] += i["rew_b"] * (i["k"] - 1)
+        b["meas_rew"] += i["rew_a"] - i["rew_b"]
+        for key in ("r_rew", "r_pnl"):
+            if i[key] is not None:
+                b[key].append(i[key])
+    fams = []
+    for b in sorted(by.values(), key=lambda b: -abs(b["d_rest"])):
+        c = cal.get(b["family"]) or (1.0, 1.0)
+        fams.append({"family": b["family"], "n": b["n"], "d_rest": round(b["d_rest"], 0),
+                     "pred_rew": round(b["pred_rew"], 2), "meas_rew": round(b["meas_rew"], 2),
+                     "own_rew": round(sum(b["r_rew"]) / len(b["r_rew"]), 3) if b["r_rew"] else None,
+                     "own_pnl": round(sum(b["r_pnl"]) / len(b["r_pnl"]), 3) if b["r_pnl"] else None,
+                     "c_rew": c[0], "c_pnl": c[1]})
+    pool = {j: [m[j] for m in moves if m[j] is not None] for j in ("r_rew", "r_pnl")}
+    return {"n": n, "calibrated": n >= CAL_MIN_N,
             "pred_rew": round(S["pred_rew"], 2), "meas_rew": round(S["meas_rew"], 2),
             "pred_pnl": round(S["pred_pnl"], 2), "meas_pnl": round(S["meas_pnl"], 2),
             "d_rest": round(S["d_rest"], 2),
-            "c_rew": (_ratio(S["meas_rew"], S["pred_rew"]) if cal else None),
-            "c_pnl": (_ratio(S["meas_pnl"], S["pred_pnl"]) if cal else None),
+            "pool_rew": round(sum(pool["r_rew"]) / len(pool["r_rew"]), 3) if pool["r_rew"] else None,
+            "pool_pnl": round(sum(pool["r_pnl"]) / len(pool["r_pnl"]), 3) if pool["r_pnl"] else None,
             "marginal_per_1k": (round(1000 * (S["meas_rew"] + S["meas_pnl"]) / S["d_rest"], 2)
                                 if S["d_rest"] else None),
             "average_per_1k": round(1000 * S["net_b"] / S["rest_b"], 2) if S["rest_b"] > 0 else None,
-            "moves": sorted(moves, key=lambda i: -abs(i["rest_a"] - i["rest_b"]))[:6]}
+            "by_family": fams,
+            "moves": [{k: v for k, v in m.items() if k not in ("r_rew", "r_pnl")}
+                      for m in sorted(moves, key=lambda i: -abs(i["rest_a"] - i["rest_b"]))[:6]]}
 
 
 # ---------------------------------------------------------------------------
@@ -272,21 +346,16 @@ def _pct(xs: List[float], q: float) -> float:
     return xs[min(len(xs) - 1, max(0, int(round(q * (len(xs) - 1)))))]
 
 
-def _cal_draws(moves: List[dict], d: dict, rnd: random.Random) -> List[Tuple[float, float]]:
-    """BOOT (c_rew, c_pnl) pairs: the direction's readouts resampled, or 1.0
-    while it is uncalibrated."""
-    if not d["calibrated"]:
-        return [(1.0, 1.0)] * BOOT
-    out = []
-    for _ in range(BOOT):
-        pick = [moves[rnd.randrange(len(moves))] for _ in moves]
-        pr = sum(i["rew_b"] * (i["k"] - 1) for i in pick)
-        mr = sum(i["rew_a"] - i["rew_b"] for i in pick)
-        pp = sum(i["pnl_b"] * (i["k"] - 1) for i in pick)
-        mp = sum(i["pnl_a"] - i["pnl_b"] for i in pick)
-        cr, cp = _ratio(mr, pr), _ratio(mp, pp)
-        out.append((_c(d["c_rew"]) if cr is None else cr, _c(d["c_pnl"]) if cp is None else cp))
-    return out
+def _cal_draws(moves: List[dict], families, rnd: random.Random) -> List[Dict[str, Tuple[float, float]]]:
+    """BOOT per-family calibrations from the direction's readouts resampled
+    (family_calibration on each resample); (1.0, 1.0) for every family while
+    the direction is uncalibrated."""
+    fams = list(families)
+    if len(moves) < CAL_MIN_N:
+        one = {f: (1.0, 1.0) for f in fams}
+        return [one] * BOOT
+    return [family_calibration([moves[rnd.randrange(len(moves))] for _ in moves], fams)
+            for _ in range(BOOT)]
 
 
 def _q(xs: List[float]) -> dict:
@@ -302,11 +371,13 @@ def sec_allocation(day: date, log: bool = True) -> dict:
     moves = capital_moves(day)
     adds_m = [m for m in moves if m["k"] > 1]
     cuts_m = [m for m in moves if m["k"] < 1]
-    adds, cuts = direction(adds_m), direction(cuts_m)
+    names = list(stats)
+    cal_pt = {"add": family_calibration(adds_m, names), "cut": family_calibration(cuts_m, names)}
+    adds, cuts = direction(adds_m, cal_pt["add"]), direction(cuts_m, cal_pt["cut"])
     rnd = random.Random(day.toordinal())         # the same day gives the same intervals
     n = len(days)
     idx = [[rnd.randrange(n) for _ in range(n)] for _ in range(BOOT)] if n else []
-    cal = {"add": _cal_draws(adds_m, adds, rnd), "cut": _cal_draws(cuts_m, cuts, rnd)}
+    cal = {"add": _cal_draws(adds_m, names, rnd), "cut": _cal_draws(cuts_m, names, rnd)}
     recent = recent_changes(day)
     rows, cands = [], []
     for f, st in sorted(stats.items(), key=lambda kv: -kv[1]["rest"]):
@@ -319,9 +390,10 @@ def sec_allocation(day: date, log: bool = True) -> dict:
             if rest > 0:
                 boot["net_per_1k"].append(1000.0 * (rew + pnl) / rest)
             for kind, k in (("cut", STEP_DOWN), ("add", STEP_UP)):
-                c_rew, c_pnl = cal[kind][b]
+                c_rew, c_pnl = cal[kind][b][f]
                 boot[kind].append(gain(rew, pnl, st["share"], k, c_rew, c_pnl))
         row = dict(st, family=f, recent=recent.get(f) or [],
+                   cal={"add": cal_pt["add"][f], "cut": cal_pt["cut"][f]},
                    cut=_q(boot["cut"]) if boot["cut"] else None,
                    add=_q(boot["add"]) if boot["add"] else None,
                    net_per_1k_q=_q(boot["net_per_1k"]) if boot["net_per_1k"] else None)
@@ -334,7 +406,8 @@ def sec_allocation(day: date, log: bool = True) -> dict:
                 cands.append({"family": f, "kind": kind, "k": round(k, 3), **q,
                               "capital": round(st["rest"] * (k - 1), 0), "rest": round(st["rest"], 0),
                               "net_per_1k": st["net_per_1k"], "t": st["t"], "share": st["share"],
-                              "days": st["days"], "recent": row["recent"]})
+                              "days": st["days"], "recent": row["recent"],
+                              "cal": {"rew": cal_pt[kind][f][0], "pnl": cal_pt[kind][f][1]}})
     waits = [c for c in cands if c["recent"]]
     props = sorted((c for c in cands if not c["recent"]), key=lambda c: -c["p50"])[:MAX_PROPOSALS]
     experiment = None
@@ -343,8 +416,9 @@ def sec_allocation(day: date, log: bool = True) -> dict:
                 and r["net_per_1k_q"]["p10"] > 0 and (r.get("t") or 0) >= EXP_MIN_T]
         if best:
             r = max(best, key=lambda r: r["net_per_1k_q"]["p10"])
-            ca, cp = (_c(adds["c_rew"]), _c(adds["c_pnl"])) if adds["calibrated"] else (1.0, 1.0)
+            ca, cp = cal_pt["add"][r["family"]]
             experiment = {"family": r["family"], "kind": "experiment", "k": EXP_STEP,
+                          "cal": {"rew": ca, "pnl": cp},
                           "capital": round(r["rest"] * (EXP_STEP - 1), 0), "rest": round(r["rest"], 0),
                           "net_per_1k": r["net_per_1k"], "net_per_1k_p10": r["net_per_1k_q"]["p10"],
                           "t": r["t"], "share": r["share"],
@@ -371,13 +445,13 @@ def log_day(day: date, sec: dict) -> int:
     iso = day.isoformat()
     if any(r.get("day") == iso for r in rv._iter_jsonl(path)):
         return 0
-    cal = {k: {x: sec["track"][k].get(x) for x in ("n", "calibrated", "c_rew", "c_pnl", "marginal_per_1k")}
-           for k in ("adds", "cuts")}
-    rows = [dict({k: v for k, v in p.items() if k != "recent"}, day=iso, cal=cal) for p in sec["proposals"]]
+    book = {k: {x: sec["track"][k].get(x) for x in ("n", "calibrated", "pool_rew", "pool_pnl", "marginal_per_1k")}
+            for k in ("adds", "cuts")}
+    rows = [dict({k: v for k, v in p.items() if k != "recent"}, day=iso, book_cal=book) for p in sec["proposals"]]
     if sec.get("experiment"):
-        rows.append(dict(sec["experiment"], day=iso, cal=cal))
+        rows.append(dict(sec["experiment"], day=iso, book_cal=book))
     if not rows:
-        rows = [{"day": iso, "kind": "none", "cal": cal, "families": len(sec["families"])}]
+        rows = [{"day": iso, "kind": "none", "book_cal": book, "families": len(sec["families"])}]
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
         for r in rows:

@@ -19,6 +19,13 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
   - **So the model is asymmetric:** confident about cuts, and an add is a pre-registered experiment until adds measure positive at the margin.
   - **The loop:** proposals go to moat/allocation.jsonl. Taken ones become `allocation` findings, the registry reads each shipped one out at 7 days, and that readout recalibrates the next proposal.
   - **The first live run (11/25 data):** no move cleared the bar. The closest was a Carbon Arc cut, whose p10 was -$0.51/day.
+  - **Corrected the same night (11/27 ~00:40Z), before any review ran it.** Jack asked "what else", and the review's own R-261124-02 re-check had blamed one election reward drop on the Democratic primary program ending. So the adds were split by family.
+    - The zero was the ELECTION waves: 8 readouts, rewards -$612 measured vs +$1,586 predicted.
+    - Every other family's 12 adds earned x0.47 of predicted rewards: marginal +$2.03 per $1k vs a +$3.58 average.
+    - The dollar-weighted pool had let 8 election readouts zero every family.
+    - **Fix:** per-family calibration, each readout one vote, shrunk toward the other families' votes by 5 readouts.
+    - **On 11/25 data after the fix:** adds clear the bar for RT (+$40/day), Econ & rates (+$25) and Commodities (+$17), but each waits on a change from the last 7 days.
+    - **Lesson:** a pooled before/after margin is only as good as its largest scope. Split it by family before believing it, and wave programs that end look exactly like size that didn't pay.
 - **The fair-model scorecard (11/26):** Jack asked "is the data im logging improving my algorithm and trading strategy". The audit found:
   - the bot reads back none of the 29 streams it logs;
   - the monitors, the reward calibration and the review's priors reach it only through people;

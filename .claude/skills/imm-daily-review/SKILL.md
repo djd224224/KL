@@ -212,13 +212,14 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 - **The snapshotter stale or never run** (the section's first line) is P1 (kind `ops`): no model history accrues while it is down.
 
 **The allocation (evidence section 14): where should the next dollar of size go?** Size is set by hand, one family at a time, on a family's average return. Section 14 measures the MARGINAL return and models one step per family on it:
-- **The margin** comes from the change registry: every readout in which a scope's resting capital moved 1.3x or more with steady supply, adds and cuts apart.
-- **The model** is a step per family: cut x0.67 or add x1.5. Rewards follow the share model, trading moves in proportion, each is calibrated on that margin, and the result is bootstrapped.
-- **Read the measured margin first.** The 11/26 back-fill:
-  - adds (21 readouts, +$927k resting) earned -$511/day of rewards against +$2,686 predicted from their averages;
-  - cuts lost rewards and saved trading almost exactly as predicted.
+- **The margin** comes from the change registry: every readout in which a scope's resting capital moved 1.3x or more with steady supply. Adds and cuts are taken apart, and each readout is attributed to a family by its series.
+- **The model** is a step per family: cut x0.67 or add x1.5. Rewards follow the share model and trading moves in proportion. Each is calibrated on the FAMILY's own readouts (each readout one vote), shrunk toward the other families' by 5 readouts, and the result is bootstrapped.
+- **Read the measured margin first, by family.** The 11/26 back-fill:
+  - **Election-wave adds (8 readouts)** earned -$612/day of rewards against +$1,586 predicted. Those programs were ending (R-261124-02's re-check), and the supply check misses that.
+  - **Every other family's adds (12)** earned x0.47 of the predicted rewards and x0.37 of the trading: about 57% of their average rate at the margin.
+  - **Cuts** moved about as predicted.
 
-  So the model gives added size the adds' calibration: about nothing. Quote the section's own numbers, which move as readouts accrue.
+  The first build (186f8da) pooled adds by dollars, so the election waves zeroed every family. Quote the section's own per-family numbers, which move as readouts accrue. A family's own ratio near 0 on a handful of readouts is a hint about that family, not a law.
 - **A PROPOSAL** clears the bar when P10 gain > 0, P50 >= $5/day, the family has 10+ days of data and no change touched it in 7 days. Before filing one, check:
   1. **The family's recent history:** section 12's changes, the memory notes and git log. A regime change makes the 30-day history the wrong guide. On 11/25, for example, the Carbon Arc unwinds were turned off (a83dab0).
   2. **Jack's sizing rules:** size to target, not past it. On 11/19, trimming FX cost more than it freed.
@@ -230,10 +231,11 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   - `expect`, pre-registering the 7-day readout (the family's net $/day change).
 
   At most one allocation decision a day. It competes for the 3 cards on $/day x confidence like any other finding.
-- **An ADD EXPERIMENT** is the only add to offer while the adds' measured margin is at or below zero. It is an x1.25 step on the best-measured family (net per $1k p10 > 0, t >= 2, unchanged for 7 days). File it as kind `experiment`, with:
+- **An ADD EXPERIMENT** is offered when no add clears the bar. It is an x1.25 step on the best-measured family (net per $1k p10 > 0, t >= 2, unchanged for 7 days). File it as kind `experiment`, with:
   - a stop rule: revert if the family's net per $1k is under its p10 for 3 straight days;
   - its expectation stated as a range;
-  - a plain statement that past adds earned about nothing at the margin.
+  - the family's own add calibration, and how many readouts it rests on.
+- **Election and wave families:** before/after readouts cannot tell "size didn't pay" from "the program was ending". R-261124-02's split test (half the names at one bid cap) is the clean measurement there. Prefer such a split to a before/after move.
 - **WAITS:** a family that clears the bar but changed in the last 7 days gets one line and no finding. Read that change out first.
 - **"None clears the bar" is the usual and honest state.** Never manufacture a move. When the measured margin moved materially, give it a line in "The moat" in review.md.
 - **Losses from a known one-off** (an unwind, a wave's last day, a bad print) are not a reason to cut. Check whether the one-off sits in the window before proposing.
