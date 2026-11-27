@@ -492,7 +492,17 @@ if ($Probe) {
     # were about even (+1c/ct). The normal two-sided quotes still trade both
     # sides as before. Cost: the near-$1-floor credit the unwind side earned.
     # BACK OUT: drop both here, then restart_imm.ps1 -Task.
-    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=12000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=3000000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1500&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=3.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-11&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=8000&& set IMM_NET_LOSS_LIMIT=0&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=600&& set IMM_SWEEP_HOLDOUT=0&& set IMM_TAPE_TRIGGER=ab&& set IMM_TAPE_AB_FRAC=1&& set IMM_WS_CANDIDATES=on&& set IMM_WS_FAST_MIN_GAP_C=10&& set IMM_CA_UNWIND=0&& set IMM_CA_FAMILY_UNWIND=0&&"
+    # NIGHT FAMILY ADDS (Jack 2026-11-27: "add the passing ones to tonight", after "be more
+    # permissive when evaluating. ok for night makers to still lose as long as rewards are
+    # better, books are quiet"). 17 unenrolled series join the MLB next team nights family
+    # (IMM_ASTEST_MLB_SERIES): quoted 00:00-07:00 ET only at x3 (150 a market, 450 an event),
+    # under its $100/day family loss halt (budget ASTEST:MLB, shared), 15-min event pause,
+    # burst breaker and stop file (run-logs\incentive-mm\astest_mlb_stop.txt), to its
+    # 12/03 05:00Z end. Each passed a 45-day tape test of the 00-07 ET block: modelled night
+    # rewards beat the trading at the bot's measured fill share, quiet night books, a program
+    # live tonight (run-logs\incentive-mm\report_tools\night_tape_2026-11-27).
+    # BACK OUT: drop the IMM_ASTEST_MLB_SERIES entry here, then restart_imm.ps1 -Task.
+    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_ASTEST_MLB_SERIES=KXMLBNEXTTEAM,KXUSACOMPANYSTAKE,KXAIMILLENNIUM,KXHORMUZMAX,KXVOICERANK,KXGTA6UNITS,KXUSHOME,KXNFCI,KXPCEHEAD,KXNVDABOARDTESTIFY,KXMULLINANNOUNCEOUT,KXAGICO,KXHOUSECONTEMPTANY,KXCBDECISIONKOREA,KXDUFFYANNOUNCEOUT,KXNVDACHARGE,KXFAOFPI,KXALBUMSTREAMS&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=12000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=3000000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1500&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=3.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-11&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=8000&& set IMM_NET_LOSS_LIMIT=0&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=600&& set IMM_SWEEP_HOLDOUT=0&& set IMM_TAPE_TRIGGER=ab&& set IMM_TAPE_AB_FRAC=1&& set IMM_WS_CANDIDATES=on&& set IMM_WS_FAST_MIN_GAP_C=10&& set IMM_CA_UNWIND=0&& set IMM_CA_FAMILY_UNWIND=0&&"
 }
 
 # SIZE OVERRIDES BY TEXT (Jack 2026-11-08: "allow sizing adjustments too", for
