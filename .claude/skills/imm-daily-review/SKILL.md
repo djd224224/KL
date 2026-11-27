@@ -215,7 +215,7 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 - **The margin** comes from the change registry: every readout in which a scope's resting capital moved 1.3x or more with steady supply. Adds and cuts are taken apart, and each readout is attributed to a family by its series.
 - **The model** is a step per family: cut x0.67 or add x1.5. Rewards follow the share model and trading moves in proportion. Each is calibrated on the FAMILY's own readouts (each readout one vote), shrunk toward the other families' by 5 readouts, and the result is bootstrapped.
 - **Read the measured margin first, by family.** The 11/26 back-fill:
-  - **Election-wave adds (8 readouts)** earned -$612/day of rewards against +$1,586 predicted. Those programs were ending (R-261124-02's re-check), and the supply check misses that.
+  - **Election-wave adds (8 readouts)** earned -$612/day of rewards against +$1,586 predicted. That came inside a live program: the Democratic primary pool ran unchanged 11/10-11/25. The cause is unmeasured: other makers matching our size (the size race), or the added size scoring little. Treat election adds as unpaid at the margin until a split test says otherwise.
   - **Every other family's adds (12)** earned x0.47 of the predicted rewards and x0.37 of the trading: about 57% of their average rate at the margin.
   - **Cuts** moved about as predicted.
 
@@ -235,7 +235,8 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   - a stop rule: revert if the family's net per $1k is under its p10 for 3 straight days;
   - its expectation stated as a range;
   - the family's own add calibration, and how many readouts it rests on.
-- **Election and wave families:** before/after readouts cannot tell "size didn't pay" from "the program was ending". R-261124-02's split test (half the names at one bid cap) is the clean measurement there. Prefer such a split to a before/after move.
+- **Election and wave families:** before/after readouts cannot tell "size didn't pay" from "others sized up too" or from a program's start or end. R-261124-02's split test (half the names at one bid cap) is the clean measurement there. Prefer such a split to a before/after move.
+- **The supply check's blind spot:** program_history's `total_reward_raw` is each program's listed total. It stays the same through a period and stays listed after the program ends (11/09: no active market, the full total still there). A readout that spans a program's start or end can therefore read as steady supply. Check `n_active` around the split before naming a cause.
 - **WAITS:** a family that clears the bar but changed in the last 7 days gets one line and no finding. Read that change out first.
 - **"None clears the bar" is the usual and honest state.** Never manufacture a move. When the measured margin moved materially, give it a line in "The moat" in review.md.
 - **Losses from a known one-off** (an unwind, a wave's last day, a bad print) are not a reason to cut. Check whether the one-off sits in the window before proposing.

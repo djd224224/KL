@@ -25,7 +25,12 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
     - The dollar-weighted pool had let 8 election readouts zero every family.
     - **Fix:** per-family calibration, each readout one vote, shrunk toward the other families' votes by 5 readouts.
     - **On 11/25 data after the fix:** adds clear the bar for RT (+$40/day), Econ & rates (+$25) and Commodities (+$17), but each waits on a change from the last 7 days.
-    - **Lesson:** a pooled before/after margin is only as good as its largest scope. Split it by family before believing it, and wave programs that end look exactly like size that didn't pay.
+    - **Lesson:** a pooled before/after margin is only as good as its largest scope. Split it by family before believing it.
+  - **And the cause corrected again (11/27 ~01:00Z), still before the first run.**
+    - The Democratic primary program did not end inside those windows. A 2.6x larger period ran 11/10-11/25 at a constant pool, and R-261124-02's re-check was about its 11/25 end.
+    - So the election drop came inside a live program. Likely causes: other makers matching our size, or added size that scores little. That is a real margin, and the per-family calibration stands either way.
+    - **The supply check's actual gap:** program_history's `total_reward_raw` is a program's listed total, constant through its period and still listed after it ends (11/09: n_active 0, full total). Readouts across a program boundary read as steady supply.
+    - **Lesson:** check the program calendar (`n_active`, starts, ends) before naming a cause.
 - **The fair-model scorecard (11/26):** Jack asked "is the data im logging improving my algorithm and trading strategy". The audit found:
   - the bot reads back none of the 29 streams it logs;
   - the monitors, the reward calibration and the review's priors reach it only through people;
