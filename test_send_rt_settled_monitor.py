@@ -179,5 +179,38 @@ class TestReport(unittest.TestCase):
         self.assertIn("<li>", rs.render_html(ctx))
 
 
+class TestStoreOnly(unittest.TestCase):
+    """--store-only (Jack 2026-11-27: the email is not needed; the daily review still
+    reads the store): the day lands in rt_settled_report.json, no email, no marker."""
+
+    def test_writes_the_store_and_sends_nothing(self):
+        from unittest import mock
+        path = os.path.join(imm.STATUS_DIR, rs.STORE_FILE)
+        before = open(path, encoding="utf-8").read() if os.path.exists(path) else None
+        markers = set(os.listdir(imm.STATUS_DIR))
+        ctx = {"store": {"days": {"2026-10-30": {"net": 3.0, "level": "OK"}}}}
+        try:
+            with mock.patch.object(rs, "build_report", return_value=ctx), \
+                 mock.patch.object(rs, "render_text", return_value="text"), \
+                 mock.patch.object(rs, "render_html", return_value="<p>html</p>"), \
+                 mock.patch.object(rs, "subject_for", return_value="subject"), \
+                 mock.patch.object(rs.lm, "low_priority"), \
+                 mock.patch.object(imm, "Alerter", side_effect=AssertionError("emailed")):
+                self.assertEqual(rs.main(["--store-only"]), 0)
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["days"]["2026-10-30"]["net"], 3.0)
+            new = set(os.listdir(imm.STATUS_DIR)) - markers - {rs.STORE_FILE}
+            self.assertFalse([n for n in new if n.startswith("imm_rt_settled_sent_")])
+        finally:
+            if before is None:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(before)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -512,6 +512,12 @@ def main(argv=None) -> int:
     ap.add_argument("--dry", action="store_true",
                     help="build and print only; no email, no marker, no store")
     ap.add_argument("--day", help="ET day to report (YYYY-MM-DD); default yesterday")
+    # NO EMAIL, STORE KEPT (Jack 2026-11-27: "dont need 'RT settled strikes 11/26: net
+    # +$0.00 ...' email"): the daily review (imm_review.py MONITORS) still reads the
+    # day's row from rt_settled_report.json, so the task runs with this flag and writes it
+    ap.add_argument("--store-only", action="store_true",
+                    help="build the day and write it to rt_settled_report.json; "
+                         "no email, no marker")
     args = ap.parse_args(argv)
     lm.low_priority()
     now_utc = datetime.now(timezone.utc)
@@ -519,13 +525,21 @@ def main(argv=None) -> int:
     day = (datetime.strptime(args.day, "%Y-%m-%d").date() if args.day
            else today_et - timedelta(days=1))
     marker = os.path.join(imm.STATUS_DIR, f"imm_rt_settled_sent_{today_et}.marker")
-    if not (args.test or args.dry or args.day) and os.path.exists(marker):
+    if not (args.test or args.dry or args.day or args.store_only) and os.path.exists(marker):
         log(f"rt settled email already sent for {today_et}; exiting")
         return 0
     ctx = build_report(day, now=now_utc)
     text, html, subject = render_text(ctx), render_html(ctx), subject_for(ctx)
     log("rt settled email: " + subject + "\n" + text)
     if args.dry:
+        return 0
+    if args.store_only:
+        try:
+            save_store(ctx["store"])
+        except OSError as e:
+            log(f"! {STORE_FILE} not written ({e!r})")
+            return 1
+        log(f"rt settled: stored {day} in {STORE_FILE} (--store-only: no email)")
         return 0
     alerter = imm.Alerter("IMM-RT", live=True)
     if not alerter.enabled:
