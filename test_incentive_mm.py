@@ -51762,3 +51762,65 @@ class TestNearTermElections(unittest.TestCase):
         import inspect
         src = inspect.getsource(IncentiveMarketMaker.refresh_universe)
         self.assertIn("near_election_refresh(metas + [mm for mm, _m in scan_metas], now_utc)", src)
+
+
+class TestEndorsementBlock(unittest.TestCase):
+    """ENDORSEMENTS (Jack 2026-11-26: "going forward, endorsements like
+    KXMACRONENDORSE27-27APR18 should not quote as part of politics since they
+    can be picked off easily")."""
+
+    def test_endorsement_series_are_blocked_by_name(self):
+        for t in ("KXMACRONENDORSE27-27APR18-BRET",       # election family, swept 11/26
+                  "KXTRUMPENDORSEMENTS-26NOV27-A1",       # the politics x2 family
+                  "KXFIRSTENDORSENOMD-28-AFT",
+                  "KXTRUMPFIRSTENDORSE-28-VANCE",
+                  "KXENDORSEPRATT-26-X",                  # ENDORSE anywhere in the name
+                  "KXTRUMPCOLLINS-26-YES",                # "Will Trump endorse Mike Collins?"
+                  "KXCORNYNTALARICO-26-YES"):
+            s = t.split("-")[0]
+            self.assertTrue(imm.endorsement_series(s), s)
+            self.assertTrue(imm.series_pattern_blocked(s), s)
+            self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+            self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+        # the name rule is a full match on the SERIES, nothing looser
+        for s in ("KXTRUMPAPPROVE", "KXAIPACLOSEPRIMARY", "KXDSAWINS",
+                  "KXAOCMAMDANICOMBO", "KXTRUMPCOLLINSX", "KXDENVERMAYOR"):
+            self.assertFalse(imm.endorsement_series(s), s)
+        self.assertFalse(IncentiveMarketMaker._blocked("KXDENVERMAYOR-27-ABC"))
+        self.assertIn(imm._ENDORSE_NAME_RE, imm.SERIES_BLOCK_PATTERNS)
+        for k in ("ENDORSE_BLOCK", "ENDORSE_TITLE_SERIES"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def test_the_title_rule(self):
+        yes = (("Politics", "Will Trump endorse Netanyahu?"),
+               ("Elections", "Who will be endorsed in the Texas Senate Republican runoff?"),
+               ("Elections", "Haley Stevens rescinds El-Sayed endorsement"),
+               ("Politics", "Musk endorses Democrat for President"),
+               ("Elections", "Who will Murkowski endorse in Alaska senate?"))
+        for cat, title in yes:
+            self.assertTrue(imm.endorsement_title(cat, title), title)
+        no = (("Elections", "How many Trump-endorsed candidates will lose their primaries?"),
+              ("Elections", "How many AIPAC-endorsed candidates will lose their primaries?"),
+              ("Elections", "DSA endorsed candidate wins"),
+              ("Sports", "Steph Curry Endorsement Deal"),       # not politics
+              ("Politics", "Will Trump's approval be above 45%?"),
+              ("Elections", None), (None, "Will Trump endorse Netanyahu?"))
+        for cat, title in no:
+            self.assertFalse(imm.endorsement_title(cat, title), title)
+
+    def test_the_open_scan_refuses_an_endorsement_title(self):
+        with mock.patch.object(imm, "SCAN_EXCLUDE_CATEGORIES", frozenset()):
+            self.assertEqual(imm.scan_series_meta_verdict(
+                {"category": "Politics", "title": "Will John Cornyn endorse James Talarico?"}),
+                (False, "endorsement", "Politics"))
+            self.assertEqual(imm.scan_series_meta_verdict(
+                {"category": "Politics", "title": "Will the Senate confirm X?"}),
+                (True, "", "Politics"))
+            self.assertEqual(imm.scan_series_meta_verdict(
+                {"category": "Sports", "title": "Steph Curry Endorsement Deal"}),
+                (True, "", "Sports"))
+
+    def test_the_kill_switch(self):
+        with mock.patch.object(imm, "ENDORSE_BLOCK", False):
+            self.assertFalse(imm.endorsement_series("KXMACRONENDORSE27"))
+            self.assertFalse(imm.endorsement_title("Politics", "Will Trump endorse Netanyahu?"))

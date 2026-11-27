@@ -507,6 +507,8 @@ def classify_series(series: str, sample_ticker: str):
         return "skip", "fleet monthly crypto"
     if imm.series_blocklisted(series):      # exact-series cuts too (2026-11-01)
         return "skip", "blocklisted (cloud fleet / manual)"
+    if imm.endorsement_series(series):      # ENDORSEMENTS (2026-11-26)
+        return "skip", "endorsement (not quoted, 2026-11-26)"
     if "MENTION" in series:
         return "enroll", "mention family (tailed variant)"
     if CRYPTO_YEARLY_RE.match(series):
@@ -631,6 +633,14 @@ def enroll_new_series(client, dry: bool):
     still_review = []
     for s, why, sample in review:
         se = series_meta(client, s)
+        # an endorsement by its Kalshi title (Jack 2026-11-26: "endorsements
+        # ... should not quote as part of politics since they can be picked off
+        # easily"): never enrolled, whatever its name -- the bot's scan refuses
+        # it too (incentive_mm.endorsement_title)
+        if imm.endorsement_title(se.get("category"), se.get("title")):
+            log(f"not enrolled, an endorsement market (2026-11-26): {s} -- "
+                f"{se.get('title') or ''}")
+            continue
         gfam, gwhy = graduate_auto_family(s, sample, se)
         if s not in imm.ELECTION_EXCLUDE and se.get("category") == "Elections":
             elec_additions.append(s)
@@ -695,7 +705,9 @@ def enroll_new_series(client, dry: bool):
     for s, sample in list_only:
         if s in imm.ELECTION_EXCLUDE:
             continue
-        if series_meta(client, s).get("category") == "Elections":
+        se = series_meta(client, s)
+        if se.get("category") == "Elections" and \
+                not imm.endorsement_title(se.get("category"), se.get("title")):
             elec_additions.append(s)
             enrolled.append((s, ELECTION_LISTED_ENROLL_WHY, sample))
     if elec_additions and not dry:

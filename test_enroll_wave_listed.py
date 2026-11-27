@@ -106,6 +106,40 @@ class WaveListedElectionsEnroll(unittest.TestCase):
         self.assertEqual(enrolled2, [])
         self.assertEqual(reads2, ["KXLISTEDPOLZZ"])             # the one list-only series left
 
+    def test_endorsements_are_never_enrolled(self):
+        # Jack 2026-11-26: "endorsements ... should not quote as part of
+        # politics": by name (skipped before any read) or by Kalshi title
+        cats = {"KXZZCOLLINSPICK": ("Elections", "Will Trump endorse Mike Collins?"),
+                "KXZZPOLPICK": ("Politics", "Who will Obama endorse before the midterms?"),
+                "KXFOOELECTIONZZ": ("Elections", "Who will win the Foo election?")}
+        tickers = ["KXZZENDORSEMACRON-27APR18-A", "KXZZCOLLINSPICK-26-YES",
+                   "KXZZPOLPICK-26-A", "KXFOOELECTIONZZ-26DEC06-A"]
+        reads = []
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [{"market_ticker": t} for t in tickers]}
+                if path.startswith("/series/"):
+                    reads.append(path[8:])
+                    c, ttl = cats.get(path[8:], ("", ""))
+                    return {"series": {"category": c, "title": ttl}}
+                raise AssertionError(path)
+        self.assertEqual(ieo.classify_series("KXZZENDORSEMACRON", tickers[0])[0], "skip")
+        logs = []
+        with mock.patch.dict(imm.PVD_MARKETS, {}, clear=True), \
+                mock.patch.object(ieo, "log", lambda m, *a, **k: logs.append(m)):
+            enrolled, review = ieo.enroll_new_series(_Client(), dry=False)
+        got = {s for s, _w, _x in enrolled}
+        self.assertEqual(got, {"KXFOOELECTIONZZ"})               # an ordinary election still joins
+        rev = {s for s, _w, _x in review}
+        for s in ("KXZZENDORSEMACRON", "KXZZCOLLINSPICK", "KXZZPOLPICK"):
+            self.assertNotIn(s, rev)
+        self.assertNotIn("KXZZENDORSEMACRON", reads)             # by name: no read at all
+        with open(imm.election_extra_path(), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["series"], ["KXFOOELECTIONZZ"])
+        self.assertTrue(any("KXZZCOLLINSPICK" in m and "endorsement" in m for m in logs))
+
     def test_dry_run_writes_nothing(self):
         with mock.patch.object(ieo, "log", lambda *a, **k: None):
             enrolled, _ = ieo.enroll_new_series(self.client([]), dry=True)

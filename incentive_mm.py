@@ -6513,6 +6513,61 @@ _TREASURY_TOUCH_LIVE = os.environ.get("IMM_TREASURY_GATE_ENABLE", "1") == "1"
 _TREASURY_TOUCH_RE = re.compile(r"KX(2|5|7|10|30)YRDIR[HL][MW]")
 if not _TREASURY_TOUCH_LIVE:
     SERIES_BLOCK_PATTERNS = SERIES_BLOCK_PATTERNS + (_TREASURY_TOUCH_RE,)
+# ENDORSEMENTS (Jack 2026-11-26: "going forward, endorsements like
+# KXMACRONENDORSE27-27APR18 should not quote as part of politics since they
+# can be picked off easily"). An endorsement is one announcement -- a post, a
+# rally line, a statement -- that moves its market most of the way in a
+# minute, and whoever reads it first takes the resting side. Both series
+# paying on 11/26 lost to that flow: KXMACRONENDORSE27 (the election family,
+# by Kalshi's Elections category file) was swept on three strikes from
+# 06:39Z 11/26 -- 360 contracts at ~11c, -$36 marked against $2 of rewards --
+# and KXTRUMPENDORSEMENTS ("How many people will Trump endorse this week?",
+# the politics x2 family) earned $140 of rewards and lost $196 trading in
+# November, -7.3c a contract 30 minutes after the fill. Taken by NAME: every
+# series whose name carries ENDORSE (38 of the 17,148 in the 11/26 catalog,
+# all endorsement markets; KXTRUMPENDORSELOSS, a count of endorsed primary
+# losers with no program since the primaries, goes with them) plus the seven
+# "Will X endorse Y?" series whose names do not (ENDORSE_TITLE_SERIES). A
+# future one named without the word is caught by its Kalshi title
+# (endorsement_title, Politics / Elections only) in the open scan's series
+# screen and in the new-series pass, which then never enrolls it. Not taken:
+# the results counts whose titles say only "endorsed candidate(s)"
+# (KXAIPACLOSEPRIMARY, KXDSAWINS), sponsorship deals (Sports), and
+# KXAOCMAMDANICOMBO, already enrolled (Jack 2026-11-13). Standard block
+# semantics: no new orders, resting quotes cancelled next cycle, positions
+# ride to settlement. ENDORSE_SIZE_MULT and its family entry stay for a
+# one-line un-block (the KXTRUEV convention). IMM_ENDORSE_BLOCK=0 lifts it
+# all (the name block at a task-level restart).
+ENDORSE_BLOCK = os.environ.get("IMM_ENDORSE_BLOCK", "1") == "1"
+ENDORSE_TITLE_SERIES = frozenset(
+    s.strip() for s in os.environ.get(
+        "IMM_ENDORSE_TITLE_SERIES",
+        "KXTRUMPGA14,KXMILLSPLATNER,KXCORNYNTALARICO,KXTRUMPFLAVIO,"
+        "KXSCHOLTENROGERS,KXTRUMPCOLLINS,KXSTEVENSRESCIND").split(",") if s.strip())
+_ENDORSE_NAME_RE = re.compile(r".*ENDORSE.*")
+# "endorse(s/ing/ment/ments)", and "endorsed" unless it names candidates (a
+# results count: "How many AIPAC-endorsed candidates will lose ...")
+_ENDORSE_TITLE_RE = re.compile(
+    r"\bendors(?:e|es|ing|ement|ements)\b|\bendorsed\b(?![\s-]+candidates?\b)",
+    re.IGNORECASE)
+ENDORSE_TITLE_CATEGORIES = frozenset(("Politics", "Elections"))
+if ENDORSE_BLOCK:
+    SERIES_BLOCK_PATTERNS = SERIES_BLOCK_PATTERNS + (_ENDORSE_NAME_RE,) + tuple(
+        re.compile(re.escape(s)) for s in sorted(ENDORSE_TITLE_SERIES))
+
+
+def endorsement_series(series: str) -> bool:
+    """An endorsement series by name (ENDORSEMENTS above)."""
+    return ENDORSE_BLOCK and (bool(_ENDORSE_NAME_RE.fullmatch(series or ""))
+                              or series in ENDORSE_TITLE_SERIES)
+
+
+def endorsement_title(category, title) -> bool:
+    """An endorsement market by its Kalshi /series title, in Politics or
+    Elections -- the screen for one named without ENDORSE."""
+    return (ENDORSE_BLOCK
+            and str(category or "").strip() in ENDORSE_TITLE_CATEGORIES
+            and bool(_ENDORSE_TITLE_RE.search(str(title or ""))))
 
 
 def series_pattern_blocked(series: str) -> bool:
@@ -10236,6 +10291,8 @@ def scan_series_meta_verdict(series_obj: dict) -> Tuple[bool, str, str]:
         return False, "category:unknown", cat     # fail closed, not open
     if cat in SCAN_EXCLUDE_CATEGORIES:
         return False, f"category:{cat}", cat
+    if endorsement_title(cat, series_obj.get("title")):
+        return False, "endorsement", cat          # ENDORSEMENTS (2026-11-26)
     if sources_are_live(series_source_blobs(series_obj)):
         return False, "live_source", cat
     return True, "", cat
@@ -15839,6 +15896,8 @@ _CONFIG_CODE_KNOBS = (
     "MORT_FAIR_REFRESH_SECS", "MORT_CUTOFF_BUFFER_DAYS", "MORT_SIZE_MULT",
     # hand-named events (2026-11-26)
     "NAMED_EVENTS_ENABLE", "NAMED_EVENTS",
+    # endorsements blocked (2026-11-26)
+    "ENDORSE_BLOCK", "ENDORSE_TITLE_SERIES",
     # near-term elections x3 for a week (2026-11-26)
     "NEAR_ELECTION_SIZE_MULT", "NEAR_ELECTION_DAYS", "NEAR_ELECTION_UNTIL",
     # Zillow home value gate (2026-11-12); zillow_home_fair's model knobs
@@ -51099,6 +51158,12 @@ class IncentiveMarketMaker:
                 f"{ev} x{m:g} {lo}-{hi}c to {stop:%m/%d %H:%M}Z"
                 for ev, (m, stop, lo, hi) in sorted(NAMED_EVENTS.items()))
                 + " -- past the pattern block and the allowlist, no leads")
+        if ENDORSE_BLOCK:
+            log("endorsements blocked (2026-11-26): every series named *ENDORSE* and "
+                f"{len(ENDORSE_TITLE_SERIES)} named 'Will X endorse Y?' series "
+                f"({','.join(sorted(ENDORSE_TITLE_SERIES))}); an endorsement title "
+                "in Politics / Elections is refused by the open scan and never "
+                "enrolled -- positions ride")
         if near_election_on():
             log(f"near-term elections (2026-11-26): x{NEAR_ELECTION_SIZE_MULT:g} in place "
                 f"of the family x{ELECTION_SIZE_MULT:g} on an election series whose every "
