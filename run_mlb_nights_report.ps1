@@ -1,12 +1,14 @@
-# Launcher for the MLB next team nights pilot's morning email (Jack
-# 2026-11-26: "give email daily report"). Task Scheduler job
+# Launcher for the nights pilot's morning email (Jack 2026-11-26: "give
+# email daily report", for MLB next team; 2026-11-27: "Yes, extend it", to
+# every series in the night family). Task Scheduler job
 # "KL imm mlb-nights", daily 07:15 ET through 2026-12-03, through
 # run_mlb_nights_report_hidden.vbs (no console window).
 #
-# send_mlb_nights_report.py reads the bot's sinks (fills, cycle log, guard
-# sink, bot state) read-only, prices the pilot's fills at Kalshi's last
-# trade, and emails the night (00:00-07:00 ET) and the total since the
-# first night. One email a day (a sent-marker in
+# send_mlb_nights_report.py reads the bot's sinks (run config, fills, cycle
+# log, selection snapshot, guard sink, bot state) read-only, takes the
+# family's members from the bot's own run config, prices the fills at
+# Kalshi's last trade, and emails the night (00:00-07:00 ET) and the total
+# since each series' first night, series by series. One email a day (a sent-marker in
 # run-logs\incentive-mm\mlb_nights\); its lines and any traceback go to
 # task.log there. The exit code passes through to Task Scheduler's Last
 # Run Result: 0 sent / nothing to send / already sent, 1 the send failed.
