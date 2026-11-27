@@ -49393,6 +49393,98 @@ class TestGoodreadsBand(unittest.TestCase):
         self.assertAlmostEqual(on["bid"] / off["bid"], 5.0, delta=0.1, msg=(on, off))
         self.assertAlmostEqual(on["ask"] / off["ask"], 3.0, delta=0.1, msg=(on, off))
 
+    # GOODREADS CHEAP-ASK BLOCK (Jack 2026-11-27: "Build option 1", after
+    # KXGOODREADS-26HOR-TW's 2c ask, 300 at x3 overnight, was swept with the
+    # whole 2c level at 3:40 AM ET and the book went 7c x 58c)
+
+    # HOR-TW's book at the sweep: 1c x 2c, a 25k YES wall and 2.6k NO at 98c
+    _TW_BOOK = ("0.0100", "0.0200", [["0.01", "25000"]], [["0.98", "2600"]])
+
+    def test_the_cheap_ask_block(self):
+        self.assertEqual((imm.GOODREADS_CHEAP_ASK_MODE, imm.GOODREADS_CHEAP_ASK_MAX_C),
+                         ("on", 10.0))
+        for k in ("GOODREADS_CHEAP_ASK_MODE", "GOODREADS_CHEAP_ASK_MAX_C"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        Q = imm.Quote
+        t = "KXGOODREADS-26HOR-TW"
+        self.assertTrue(imm.goodreads_cheap_ask("KXGOODREADS", 10))
+        self.assertFalse(imm.goodreads_cheap_ask("KXGOODREADS", 11))
+        self.assertFalse(imm.goodreads_cheap_ask("KXGOODREADS", None))
+        self.assertFalse(imm.goodreads_cheap_ask("KXGAMEAWARDS", 2))
+        qs = [Q(t, "bid", 1, 500), Q(t, "ask", 10, 100), Q(t, "ask", 2, 300),
+              Q(t, "ask", 11, 100), Q(t, "ask", 94, 300)]
+        # flat or short: every ask at 10c or under goes, the rest as built
+        for pos in (0.0, -300.0):
+            kept, dropped = imm.goodreads_cheap_ask_quotes("KXGOODREADS", qs, pos)
+            self.assertEqual(kept, [qs[0], qs[3], qs[4]])
+            self.assertEqual(dropped, [qs[1], qs[2]])
+        # long 350.6: the cheapest closes first (2c x300), then 10c trimmed to 50
+        kept, dropped = imm.goodreads_cheap_ask_quotes("KXGOODREADS", qs, 350.6)
+        self.assertEqual(kept, [qs[0], Q(t, "ask", 10, 50), qs[2], qs[3], qs[4]])
+        self.assertEqual(dropped, [Q(t, "ask", 10, 50)])
+        # a long under one whole contract closes nothing in the block
+        kept, dropped = imm.goodreads_cheap_ask_quotes("KXGOODREADS", qs, 0.4)
+        self.assertEqual(dropped, [qs[1], qs[2]])
+        # the exact price decides, and another series passes untouched
+        sub = Q(t, "ask", 10, 100, price_exact=10.4)
+        self.assertEqual(imm.goodreads_cheap_ask_quotes("KXGOODREADS", [sub], 0.0), ([sub], []))
+        self.assertEqual(imm.goodreads_cheap_ask_quotes("KXGAMEAWARDS", qs, 0.0), (qs, []))
+
+    def test_the_estimate_and_floor_projection_count_no_cheap_ask(self):
+        t = self.DEBUT[0]
+        now = datetime.now(timezone.utc)
+        b0, a0 = imm.side_size_mults(t, now)
+        self.assertGreater(a0, 0)
+        self.assertEqual(imm.side_size_mults(t, now, touch=(1, 2)), (b0 * 5.0, 0.0))
+        self.assertEqual(imm.side_size_mults(t, now, touch=(1, 11)), (b0 * 5.0, a0))
+        for mode in ("dry", "off"):
+            with mock.patch.object(imm, "GOODREADS_CHEAP_ASK_MODE", mode):
+                self.assertEqual(imm.side_size_mults(t, now, touch=(1, 2)), (b0 * 5.0, a0))
+        for (_m, _pb, pa), _w in imm.floor_size_profile("KXGOODREADS", t, now, 2.0,
+                                                         touch=(1, 2)):
+            self.assertEqual(pa, 0.0)
+
+    def test_a_flat_market_rests_no_cheap_ask(self):
+        t = self.DEBUT[0]
+        with mock.patch.object(imm, "GOODREADS_CHEAP_ASK_MODE", "off"):
+            _b, rest, _l = self._cycle(self.DEBUT, *self._TW_BOOK)
+        self.assertIn(("ask", 2), rest)              # what the bot rested before
+        _clean_persist()
+        bot, rest, lines = self._cycle(self.DEBUT, *self._TW_BOOK)
+        mine = [s for s in lines if t in s]
+        self.assertIn(t, bot.state.selected, [s for s in lines if "universe:" in s][-3:])
+        self.assertIn(("bid", 1), rest, mine[-10:])  # the bid side still quotes
+        self.assertFalse([r for r in rest if r[0] == "ask"], rest)
+        self.assertTrue(any("goodreads cheap-ask" in s and "not resting ask" in s
+                            for s in mine), mine[-10:])
+
+    def test_dry_logs_and_rests_the_cheap_ask(self):
+        t = self.DEBUT[0]
+        with mock.patch.object(imm, "GOODREADS_CHEAP_ASK_MODE", "dry"):
+            _b, rest, lines = self._cycle(self.DEBUT, *self._TW_BOOK)
+        self.assertIn(("ask", 2), rest)
+        self.assertTrue(any("goodreads cheap-ask (dry)" in s for s in lines if t in s))
+
+    def test_a_long_closes_through_the_block_up_to_its_position(self):
+        # long 40 at 1c: its 2c ask closes it, trimmed to the 40. The position
+        # goes in as _cycle builds its bot (the helper itself stays as it is:
+        # its body has a copy in another class, which a patch can land in)
+        t = self.DEBUT[0]
+        real = IncentiveMarketMaker
+
+        def held(*a, **k):
+            bot = real(*a, **k)
+            bot.pnl.pos[t], bot.pnl.avg[t] = 40.0, 1.0
+            bot.client.positions[t] = 40.0
+            return bot
+        with mock.patch.dict(globals(), {"IncentiveMarketMaker": held}):
+            bot, rest, lines = self._cycle(self.DEBUT, *self._TW_BOOK)
+        self.assertIs(type(bot), real)
+        asks = {o["yes_price"]: o["remaining_count"] for o in bot.state.sim_orders.values()
+                if o["ticker"] == t and o["book_side"] == "ask"}
+        self.assertTrue(asks, [s for s in lines if t in s][-10:])
+        self.assertEqual(sum(n for px, n in asks.items() if px <= 10), 40, asks)
+
 
 class TestCarbonArcTikTokShop(unittest.TestCase):
     """Jack 2026-11-13: "they should quote as part of carbon arc auto-quoting

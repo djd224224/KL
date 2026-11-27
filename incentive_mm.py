@@ -15967,6 +15967,7 @@ _CONFIG_CODE_KNOBS = (
     "OSCAR_PRICE_MIN", "OSCAR_PRICE_MAX",                # KXOSCAR* 1-99c (2026-11-13)
     "GOODREADS_PRICE_MIN", "GOODREADS_PRICE_MAX",        # KXGOODREADS 1-99c (2026-11-26)
     "GOODREADS_COST_TIERS_BID", "GOODREADS_COST_TIERS_ASK",   # its cost tiers (2026-11-26)
+    "GOODREADS_CHEAP_ASK_MODE", "GOODREADS_CHEAP_ASK_MAX_C",  # its cheap-ask block (2026-11-27)
     "ART_BOOST_SIDE_CAP", "ART_BOOST_CHEAP_C", "ART_BOOST_CHEAP_SIDE_CAP",
     "ART_EVENT_CAP",                                     # ART FLOOR BOOST (2026-11-11)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
@@ -20911,14 +20912,20 @@ def side_size_mults(ticker: str, now_utc: datetime,
     and, given the YES mid, the event long-shot cut, and given the (bid, ask)
     `touch`, the COST TIERS (cost_side_mults), with
     asks zeroed for a bid-only family (a quake ask strike keeps its ask side;
-    quake_cap_quotes sizes and floors it) and bids zeroed for a NO-side-only
-    market (no_side_only)."""
+    quake_cap_quotes sizes and floors it), for a Goodreads YES touch ask in
+    the CHEAP-ASK BLOCK (goodreads_cheap_ask), and bids zeroed for a
+    NO-side-only market (no_side_only)."""
     bm, am = ca_late_month_mults(ticker, now_utc)
     sb, sa = market_side_mults(ticker)
     lb, la = longshot_side_mults(series_of(ticker), yes_mid)
     cb, ca = cost_side_mults(series_of(ticker), *(touch or (None, None)))
     bm, am = bm * sb * lb * cb, am * sa * la * ca
     if series_bid_only(series_of(ticker)) and not quake_ask_strike(ticker):
+        am = 0.0
+    # the GOODREADS CHEAP-ASK BLOCK: a YES touch ask at 10c or under is a side
+    # the quote loop rests nothing on (bar a long's close)
+    if (touch is not None and GOODREADS_CHEAP_ASK_MODE == "on"
+            and goodreads_cheap_ask(series_of(ticker), touch[1])):
         am = 0.0
     if no_side_only(ticker):
         bm = 0.0
@@ -26080,6 +26087,70 @@ def cost_side_mults(series: str, ext_bid: Optional[float],
     return (_cost_tier_mult(GOODREADS_COST_TIERS_BID, ext_bid),
             _cost_tier_mult(GOODREADS_COST_TIERS_ASK,
                             None if ext_ask is None else 100.0 - ext_ask))
+
+
+# GOODREADS CHEAP-ASK BLOCK (Jack 2026-11-27: "Build option 1"). A KXGOODREADS
+# YES ask at GOODREADS_CHEAP_ASK_MAX_C (10c) or under -- a side that ties up 90c+
+# a contract to make 10c or less -- rests nothing, unless it closes a LONG
+# position: then its asks, cheapest first, rest up to the position's whole
+# contracts. Why: on 11/26 8-9:30 PM ET another maker dropped three finalists'
+# placeholder asks with no trades (HOR-TW 81c -> 2c, AUDIO-MHW 42c -> 3c,
+# FIC-WHI 23c -> 5c); the bot joined after its join wait, the 0-8 ET x3 took
+# each to 300, and between 1:44 and 3:40 AM ET one buyer swept each whole cheap
+# level (2,400-2,900 contracts from the same 6-8 makers). MHW and WHI closed
+# -$37.67 at our prices; HOR-TW (Trad Wife) is short 300 at 2c, -$294 if it
+# wins. The 71 such asks then resting earned ~$47/day (modelled: the share walk
+# on the live books), ~$0.33/day a 2c ask, for 98c of risk a contract.
+# The quote loop drops the rungs (the last step before EARN ONLY); the reward
+# estimate and the $1 floor projection (side_size_mults) count no ask while
+# the market's YES touch ask sits in the block. Bids, and asks over 10c (the
+# 90c+ asks' cost tiers included), are untouched.
+# IMM_GOODREADS_CHEAP_ASK = on | dry (logged, everything rests) | off;
+# IMM_GOODREADS_CHEAP_ASK_MAX_C moves the line.
+GOODREADS_CHEAP_ASK_MODE = os.environ.get("IMM_GOODREADS_CHEAP_ASK", "on").strip().lower()
+GOODREADS_CHEAP_ASK_MAX_C = _env_float("IMM_GOODREADS_CHEAP_ASK_MAX_C", 10.0)
+
+
+def goodreads_cheap_ask(series: str, ask_yes_c: Optional[float]) -> bool:
+    """A KXGOODREADS YES ask at `ask_yes_c` (cents) is in the CHEAP-ASK BLOCK
+    (whatever GOODREADS_CHEAP_ASK_MODE says)."""
+    return (series == GOODREADS_BAND_SERIES and ask_yes_c is not None
+            and float(ask_yes_c) <= GOODREADS_CHEAP_ASK_MAX_C + 1e-9)
+
+
+def goodreads_cheap_ask_quotes(series: str, quotes: List["Quote"], own_pos: float
+                               ) -> Tuple[List["Quote"], List["Quote"]]:
+    """(kept, dropped) under the CHEAP-ASK BLOCK, in the quotes' own order:
+    every ask in the block is dropped, but on a long position (own_pos > 0),
+    where the block's asks, cheapest first, keep up to the position's whole
+    contracts (a rung past that is trimmed, its excess dropped). Bids, asks
+    over the line and any other series pass untouched."""
+    if series != GOODREADS_BAND_SERIES:
+        return list(quotes), []
+
+    def px(q: "Quote") -> float:
+        return float(q.price_exact if q.price_exact is not None else q.price_cents)
+
+    room = int(math.floor(own_pos + 1e-9)) if own_pos > 0 else 0
+    allow: Dict[int, int] = {}
+    for i in sorted((i for i, q in enumerate(quotes)
+                     if q.book_side == "ask" and goodreads_cheap_ask(series, px(q))),
+                    key=lambda i: px(quotes[i])):
+        n = max(0, min(int(quotes[i].count), room))
+        allow[i] = n
+        room -= n
+    kept: List["Quote"] = []
+    dropped: List["Quote"] = []
+    for i, q in enumerate(quotes):
+        n = allow.get(i)
+        if n is None or n >= q.count:
+            kept.append(q)
+        elif n > 0:
+            kept.append(replace(q, count=n))
+            dropped.append(replace(q, count=int(q.count) - n))
+        else:
+            dropped.append(q)
+    return kept, dropped
 
 # FAMILY x2, 2026-10-11 (Jack: "do 1,2,6,8" -- #2 and #6 of the consolidated
 # recommendations): Rotten Tomatoes, Trump endorsements, the strait / port
@@ -31638,6 +31709,10 @@ class IncentiveMarketMaker:
         self._earn_only_noted: Dict[str, tuple] = {}
         self._earn_cyc: Dict[str, int] = {}
         self._earn_only_err_logged = False
+        # GOODREADS CHEAP-ASK BLOCK: each market's last-logged dropped asks, and
+        # the once-only failure note
+        self._gr_cheap_noted: Dict[str, tuple] = {}
+        self._gr_cheap_err_logged = False
         self._lowt_stood: Set[str] = set()        # low-temperature gate stand-asides
         self._hight_stood: Set[str] = set()       # high-temperature gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
@@ -40698,6 +40773,37 @@ class IncentiveMarketMaker:
             self._earn_only_noted[t] = sig
         return mq if EARN_ONLY_MODE == "dry" else kept
 
+    def _goodreads_cheap_ask(self, t: str, mq: List["Quote"], own_pos: float,
+                             ext_bid, ext_ask) -> List["Quote"]:
+        """The GOODREADS CHEAP-ASK BLOCK on one market's quotes
+        (goodreads_cheap_ask_quotes), logged when what it holds off changes;
+        dry logs and keeps them all. A failure drops every ask: the block
+        fails closed (a long's close waits a cycle)."""
+        dry = GOODREADS_CHEAP_ASK_MODE == "dry"
+        try:
+            kept, dropped = goodreads_cheap_ask_quotes(GOODREADS_BAND_SERIES, mq, own_pos)
+        except Exception as e:  # noqa: BLE001
+            if not self._gr_cheap_err_logged:
+                self._gr_cheap_err_logged = True
+                log(f"{self.tag} ! goodreads cheap-ask failed on {t} ({e!r}); its asks "
+                    f"do not rest (logged once)")
+            return mq if dry else [q for q in mq if q.book_side != "ask"]
+        px = lambda q: q.price_exact if q.price_exact is not None else q.price_cents  # noqa: E731
+        sig = tuple(sorted((round(float(px(q)), 2), int(q.count)) for q in dropped))
+        if sig != self._gr_cheap_noted.get(t, ()):
+            if dropped:
+                closes = [q for q in kept if q.book_side == "ask"
+                          and goodreads_cheap_ask(GOODREADS_BAND_SERIES, px(q))]
+                log(f"{self.tag} goodreads cheap-ask{' (dry)' if dry else ''} {t}: not resting "
+                    + ", ".join(f"ask {q.count} @ {px(q):g}c" for q in dropped)
+                    + f" -- a YES ask at {GOODREADS_CHEAP_ASK_MAX_C:g}c or under ties up "
+                    f"{100 - GOODREADS_CHEAP_ASK_MAX_C:g}c+ a contract (book {ext_bid}x{ext_ask})"
+                    + (f"; kept as the close of {own_pos:+.0f}: "
+                       + ", ".join(f"ask {q.count} @ {px(q):g}c" for q in closes)
+                       if closes else ""))
+            self._gr_cheap_noted[t] = sig
+        return mq if dry else kept
+
     def _earn_only_summary(self) -> None:
         """One line per full cycle: what EARN ONLY kept off the book."""
         c = self._earn_cyc
@@ -47350,6 +47456,13 @@ class IncentiveMarketMaker:
             # and its BID CEILING (NATNOM_BID_CEIL_MODE): an adding YES bid at
             # most the national YES ask + NATNOM_BID_CEIL_C
             mq = self._natnom_floor(t, meta, mq, now_ts, own_pos)
+            # GOODREADS CHEAP-ASK BLOCK (GOODREADS_CHEAP_ASK_MODE): no KXGOODREADS
+            # YES ask at 10c or under (a side tying up 90c+) rests, but the close
+            # of a long, up to the position -- after every path that builds a
+            # rung, so none can put one back
+            if mq and meta.series == GOODREADS_BAND_SERIES and \
+                    GOODREADS_CHEAP_ASK_MODE in ("on", "dry"):
+                mq = self._goodreads_cheap_ask(t, mq, own_pos, ext_bid, ext_ask)
             # EARN ONLY (EARN_ONLY_MODE): the very last step -- no rung the
             # program's walk would not pay rests, but for the unwind -- a
             # purposeful one (UNWIND REACH: reduce-only, the cheap at-cap
@@ -51488,6 +51601,13 @@ class IncentiveMarketMaker:
                "position the earning ones leave uncovered (the unwind)"
                + (" -- DRY: logged, everything rests" if EARN_ONLY_MODE == "dry" else "")
                if EARN_ONLY_MODE in ("on", "dry") else " -- every rung rests as built"))
+        log(f"goodreads cheap-ask block (2026-11-27): {GOODREADS_CHEAP_ASK_MODE}"
+            + (f" -- no KXGOODREADS YES ask at {GOODREADS_CHEAP_ASK_MAX_C:g}c or under "
+               f"rests (a side tying up {100 - GOODREADS_CHEAP_ASK_MAX_C:g}c+ a contract), "
+               "but the close of a long, up to the position; the estimate and the $1 "
+               "floor projection count no ask while the touch ask is in the block"
+               + (" -- DRY: logged, everything rests" if GOODREADS_CHEAP_ASK_MODE == "dry" else "")
+               if GOODREADS_CHEAP_ASK_MODE in ("on", "dry") else " -- every Goodreads ask rests as built"))
         log(f"fair lead (2026-10-29): {FAIR_LEAD_MODE}"
             + (f" -- {', '.join(FAIR_LEAD_SERIES) or 'no series'}: a side whose touch "
                f"sits ahead of a wall leads with target/5 at the cheapest price "
