@@ -19,18 +19,28 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
   - **So the model is asymmetric:** confident about cuts, and an add is a pre-registered experiment until adds measure positive at the margin.
   - **The loop:** proposals go to moat/allocation.jsonl. Taken ones become `allocation` findings, the registry reads each shipped one out at 7 days, and that readout recalibrates the next proposal.
   - **The first live run (11/25 data):** no move cleared the bar. The closest was a Carbon Arc cut, whose p10 was -$0.51/day.
-  - **Corrected the same night (11/27 ~00:40Z), before any review ran it.** Jack asked "what else", and the review's own R-261124-02 re-check had blamed one election reward drop on the Democratic primary program ending. So the adds were split by family.
+  - **Corrected the same night (11/27 ~00:50Z, d36aeb7), before any review ran it.** Jack asked "what else", and the review's own R-261124-02 re-check had blamed one election reward drop on the Democratic primary program ending. So the adds were split by family.
     - The zero was the ELECTION waves: 8 readouts, rewards -$612 measured vs +$1,586 predicted.
     - Every other family's 12 adds earned x0.47 of predicted rewards: marginal +$2.03 per $1k vs a +$3.58 average.
     - The dollar-weighted pool had let 8 election readouts zero every family.
     - **Fix:** per-family calibration, each readout one vote, shrunk toward the other families' votes by 5 readouts.
     - **On 11/25 data after the fix:** adds clear the bar for RT (+$40/day), Econ & rates (+$25) and Commodities (+$17), but each waits on a change from the last 7 days.
     - **Lesson:** a pooled before/after margin is only as good as its largest scope. Split it by family before believing it.
-  - **And the cause corrected again (11/27 ~01:00Z), still before the first run.**
-    - The Democratic primary program did not end inside those windows. A 2.6x larger period ran 11/10-11/25 at a constant pool, and R-261124-02's re-check was about its 11/25 end.
-    - So the election drop came inside a live program. Likely causes: other makers matching our size, or added size that scores little. That is a real margin, and the per-family calibration stands either way.
+  - **And the cause corrected again (11/27 ~01:40Z, 01c8206), still before the first run.**
+    - No primary program ended inside the readouts' after windows. A second period with a 2.6x larger listed total ran about 11/10-11/25, and R-261124-02's re-check was about its 11/25 end.
+    - So the election drop came inside live programs. Likely causes: other makers matching our size, or added size that scores little. The per-family calibration stands either way.
     - **The supply check's actual gap:** program_history's `total_reward_raw` is a program's listed total, constant through its period and still listed after it ends (11/09: n_active 0, full total). Readouts across a program boundary read as steady supply.
     - **Lesson:** check the program calendar (`n_active`, starts, ends) before naming a cause.
+  - **Checked per readout (11/27 ~12:40Z), after Jack said "be way more careful":** the 01:40Z text overstated it. No review email carried the overstatement.
+    - **Inside live programs: holds.** The 11/27 run's 7 election adds split 11/15-11/18. In the four biggest, every D and R primary program was active on every daily snapshot of the after windows.
+    - **The one boundary** is the primaries' period change: the first period ended 11/08, and the 11/09 snapshot showed 0 active.
+      - It falls in the before windows of the 11/15 and 11/16 readouts, on days Elections rested little: $24-$122 of rewards a day, against $1,362-$2,707 on 11/11-11/14.
+      - So it lowered the before side and cannot explain the drop.
+    - **"A real margin, not an artifact": overstated.**
+      - The rewards are the dashboard's modelled estimate, with credits unchecked since 11/18.
+      - Two small readouts do sit on the blind spot: KXPRESPARTY (no active program from 11/12, still listed) and KXSCOTUSPOWER (none active 11/21).
+    - **Also per period:** a listed total covers its whole period (the bot divides `period_reward` by its days). The primary's daily pool fell between periods while its listed total rose 2.6x.
+    - **Lesson:** a correction is a claim too. Check it per readout, against `n_active` and the daily numbers, before writing it down.
 - **The fair-model scorecard (11/26):** Jack asked "is the data im logging improving my algorithm and trading strategy". The audit found:
   - the bot reads back none of the 29 streams it logs;
   - the monitors, the reward calibration and the review's priors reach it only through people;

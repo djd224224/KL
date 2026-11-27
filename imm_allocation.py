@@ -19,10 +19,14 @@ section measures both and proposes only what clears the bar:
      after, for rewards and for trading, BY FAMILY (each readout's series).
      The 11/26 back-fill (30 days):
        - 8 ELECTION adds earned -$612/day of rewards against +$1,586
-         predicted, inside a live program: the Democratic primary pool ran
-         unchanged 11/10-11/25. The cause is unmeasured: other makers
-         matching our size, or added size that scores little. Either way it
-         is a real margin, not an artifact.
+         predicted. Not a program ending: in the 11/27 run's 7 election
+         readouts, the big ones' after windows sat inside active primary
+         programs (program_history n_active). The cause is unmeasured:
+         other makers matching our size, or added size that scores little.
+         Two caveats: the rewards are the dashboard's MODELLED estimate
+         (credits unchecked since 11/18), and two small readouts
+         (KXPRESPARTY, KXSCOTUSPOWER) sit on the supply check's blind spot
+         (a listed program total stays listed after its programs end).
        - The 12 adds in every other family earned x0.47 of the predicted
          rewards and x0.37 of the trading: marginal net per $1k +2.03,
          against their +3.58 average.
