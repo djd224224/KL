@@ -55,7 +55,28 @@ $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 # handle and holds the log open, and every later ">> log" pass then fails.
 $LogFile = Join-Path $KL 'run-logs\pvd-scan\waves-task.log'
 function Say($m) { try { Add-Content -Path $LogFile -Value $m -ErrorAction Stop } catch {} ; $m }
+# THE OFF LIST (Jack 2026-11-27, the box out of RAM: "the only wave dashboards i need are
+# http://localhost:8778/, http://127.0.0.1:8782/"). A port in run-logs\pvd-scan\dash_off.txt
+# (one per line, # starts a comment) is never (re)started here, and a dashboard still running
+# on it is stopped. Its wave's tune pass then logs "bank sizing SKIPPED" and leaves sizes as
+# they are, and the $1-floor resize skips on the dead read. Delete the port's line to bring
+# its dashboard back at the next pass (every 15 min).
+$OffFile = Join-Path $KL 'run-logs\pvd-scan\dash_off.txt'
+$OffPorts = @()
+if (Test-Path $OffFile) {
+    $OffPorts = @(Get-Content $OffFile | ForEach-Object { ($_ -replace '#.*$', '').Trim() } |
+        Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ })
+}
 foreach ($d in $Dash) {
+    if ($OffPorts -contains [int]$d.Port) {
+        $offScript = if ($d.Script) { $d.Script } else { 'imm_pvd_watch.py' }
+        $running = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+            Where-Object { $_.CommandLine -like "*$([IO.Path]::GetFileNameWithoutExtension($offScript))*" -and $_.CommandLine -like "*--port*$($d.Port)*" })
+        foreach ($x in $running) { Stop-Process -Id $x.ProcessId -Force -Confirm:$false -ErrorAction SilentlyContinue }
+        $stopped = if ($running.Count) { " -> stopped pid $(($running | ForEach-Object { $_.ProcessId }) -join ',')" } else { '' }
+        Say "$stamp keepalive :$($d.Port) off (dash_off.txt)$stopped"
+        continue
+    }
     $dir = Join-Path $KL ('run-logs\' + $d.Dir)
     $hist = Join-Path $dir 'history.json'
     $listening = [bool](Get-NetTCPConnection -LocalPort $d.Port -State Listen -ErrorAction SilentlyContinue)
