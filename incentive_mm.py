@@ -2783,8 +2783,23 @@ def size_test_mult(series: str, now_ts: Optional[float] = None) -> float:
 # (pvd_side_sizes). The set is rebuilt at each universe refresh
 # (near_election_refresh), logged when it changes. IMM_NEAR_ELECTION_SIZE_MULT=0
 # turns it off (an env change = task-level restart).
+#
+# ...ON EVERY ELECTION, ANY VOTE DATE (Jack 2026-11-27: "thought i raised
+# elections to 3x yesterday, KXPRESWINNERREGION-28, KXPRESWINNERGEN-28,
+# KXPRESWINNERRACE-28 arent 3x. solve root issue" -- "3x on all elections that
+# aren't included in waves and thus have different multipliers"). The date test
+# above left every year-only, undated or far election at the family x2 (the
+# 2028 winner-by-group series, the delegate counts, KXSENMAJ, the debate
+# series), so it is OFF by default: NEAR_ELECTION_DAYS 0 = any date
+# (IMM_NEAR_ELECTION_DAYS=180 restores the near-term-only set). In its place, a
+# series with a LIVE market on a wave's post-vote list (pvd_entry: the 2028
+# primaries, KXPRESSTATE, the nominees, KXHOUSERACE) is left out whole: those
+# books rest the wave's own sizes, and the family multiple would still widen
+# their event cap and skew knees. A series with its own size (KXPRESRUN,
+# CONTROLS x6, the seat ladders x4) and an election night session keep theirs,
+# as before. Same end, NEAR_ELECTION_UNTIL; same kill switch.
 NEAR_ELECTION_SIZE_MULT = _env_float("IMM_NEAR_ELECTION_SIZE_MULT", 3.0)
-NEAR_ELECTION_DAYS = _env_float("IMM_NEAR_ELECTION_DAYS", 180.0)
+NEAR_ELECTION_DAYS = _env_float("IMM_NEAR_ELECTION_DAYS", 0.0)
 
 
 def _near_election_until() -> datetime:
@@ -2818,9 +2833,11 @@ def near_election_candidate(series: str) -> bool:
 
 
 def near_election_refresh(metas, now_utc: datetime) -> frozenset:
-    """Rebuild the NEAR-TERM ELECTIONS set from the universe's market metas
-    (every market of a series a dated vote within NEAR_ELECTION_DAYS); logs a
-    change. Returns the set."""
+    """Rebuild the ELECTIONS x3 set from the universe's market metas: every
+    election series at the family size (near_election_candidate) none of whose
+    markets is live on a wave's post-vote list -- and, only with
+    NEAR_ELECTION_DAYS > 0, every market a dated vote within that many days;
+    logs a change. Returns the set."""
     new: frozenset = frozenset()
     if near_election_on(now_utc.timestamp()):
         horizon = now_utc + timedelta(days=NEAR_ELECTION_DAYS)
@@ -2831,13 +2848,19 @@ def near_election_refresh(metas, now_utc: datetime) -> frozenset:
                 continue
             if not near_election_candidate(s):
                 continue
+            if pvd_entry(mm.ticker, now_utc) is not None:
+                ok[s] = False                             # on a wave: its own sizes
+                continue
+            if NEAR_ELECTION_DAYS <= 0:
+                ok[s] = True                              # any vote date (2026-11-27)
+                continue
             td = parse_event_date(mm.event_ticker)        # the vote's own date
             ok[s] = td is not None and now_utc - timedelta(days=2) <= td <= horizon
         new = frozenset(s for s, v in ok.items() if v)
     old = _near_election["series"]
     if new != old:
         add, gone = sorted(new - old), sorted(old - new)
-        log(f"[IMM] near-term elections x{NEAR_ELECTION_SIZE_MULT:g}: {len(new)} series"
+        log(f"[IMM] elections x{NEAR_ELECTION_SIZE_MULT:g}: {len(new)} series"
             + (f"; + {', '.join(add[:12])}" + (f" (+{len(add) - 12} more)" if len(add) > 12 else "")
                if add else "")
             + (f"; - {', '.join(gone[:12])}" + (f" (+{len(gone) - 12} more)" if len(gone) > 12 else "")
@@ -2865,7 +2888,7 @@ def applied_mention_mult(series: str) -> float:
     if ov and ov.size_mult is not None:
         # (the strait weeklies' nights without the 10/31 shipping step)
         m *= ov.size_mult / shipping_night_step(series)
-        # ...x3 in place of the family x2 on a near-term election (to 12/04)
+        # ...x3 in place of the family x2 on an election no wave lists (to 12/04)
         if series in _near_election["series"] and near_election_on():
             m *= NEAR_ELECTION_SIZE_MULT / ov.size_mult
     # ...an international rain daily's base (RAIN_DAILY_INTL_BASE, 2026-10-31)
@@ -15898,7 +15921,7 @@ _CONFIG_CODE_KNOBS = (
     "NAMED_EVENTS_ENABLE", "NAMED_EVENTS",
     # endorsements blocked (2026-11-26)
     "ENDORSE_BLOCK", "ENDORSE_TITLE_SERIES",
-    # near-term elections x3 for a week (2026-11-26)
+    # elections x3 for a week (2026-11-26; any vote date, not on a wave, 2026-11-27)
     "NEAR_ELECTION_SIZE_MULT", "NEAR_ELECTION_DAYS", "NEAR_ELECTION_UNTIL",
     # Zillow home value gate (2026-11-12); zillow_home_fair's model knobs
     # ride in its status file's "model" block
@@ -51278,10 +51301,12 @@ class IncentiveMarketMaker:
                 "in Politics / Elections is refused by the open scan and never "
                 "enrolled -- positions ride")
         if near_election_on():
-            log(f"near-term elections (2026-11-26): x{NEAR_ELECTION_SIZE_MULT:g} in place "
-                f"of the family x{ELECTION_SIZE_MULT:g} on an election series whose every "
-                f"market is a dated vote within {NEAR_ELECTION_DAYS:g}d, to "
-                f"{NEAR_ELECTION_UNTIL:%m/%d %H:%M}Z; wave and post-vote books keep "
+            log(f"elections x{NEAR_ELECTION_SIZE_MULT:g} (2026-11-26, widened 2026-11-27): in place "
+                f"of the family x{ELECTION_SIZE_MULT:g} on every election series at the family "
+                f"size with no market live on a wave's list, "
+                + (f"every market a dated vote within {NEAR_ELECTION_DAYS:g}d, "
+                   if NEAR_ELECTION_DAYS > 0 else "any vote date, ")
+                + f"to {NEAR_ELECTION_UNTIL:%m/%d %H:%M}Z; wave and post-vote books keep "
                 f"their own sizes")
         if SNOW_DAYS_ENABLE:
             log(f"snow-day counts (2026-11-14): {','.join(sorted(SNOW_DAYS_SERIES))}"

@@ -51799,6 +51799,10 @@ class TestNearTermElections(unittest.TestCase):
             "KXPRESRUN": imm.SeriesOverride(size_mult=6.0)}))
         st.enter_context(mock.patch.dict(imm._near_election, {"series": frozenset()}))
         st.enter_context(mock.patch.object(imm, "log", lambda *_a, **_k: None))
+        # the 2028 primaries rest a wave's list (its own sizes)
+        st.enter_context(mock.patch.object(
+            imm, "pvd_entry", lambda t, now_utc=None: (
+                {"size": 300} if t in ("KXDPRESPRIMARY-28-X", "KXRPRESPRIMARY-28IA-X") else None)))
         return st
 
     def _metas(self):
@@ -51818,10 +51822,40 @@ class TestNearTermElections(unittest.TestCase):
                 self._meta("KXFOO-26DEC01-X", "KXFOO", d(3))]       # not an election
 
     def test_the_near_term_family_members_and_no_other(self):
-        with self._ctx():
+        # (the 11/26 near-term-only set, now behind IMM_NEAR_ELECTION_DAYS=180)
+        with self._ctx(), mock.patch.object(imm, "NEAR_ELECTION_DAYS", 180.0), \
+                mock.patch.object(imm, "pvd_entry", lambda t, now_utc=None: None):
             got = imm.near_election_refresh(self._metas(), self.NOW)
             self.assertEqual(got, {"KXKEELUNGMAYOR", "KXINDONESIAVP"})
             self.assertEqual(imm._near_election["series"], got)
+
+    def test_every_election_any_date_not_on_a_wave(self):
+        """Jack 2026-11-27: "3x on all elections that aren't included in waves and thus
+        have different multipliers" -- KXPRESWINNERREGION-28 & co. sat at the family x2."""
+        self.assertEqual(imm.NEAR_ELECTION_DAYS, 0.0)
+        wave = {"KXDPRESPRIMARY-28-X", "KXRPRESPRIMARY-28IA-X"}
+        fam = {"KXKEELUNGMAYOR", "KXINDONESIAVP", "KXDPRESPRIMARY", "KXPRESRUN", "KXSTATELEG",
+               "KXRPRESPRIMARY", "KXFRENCHPRES", "KXLAMAYORMOV", "KXPRESWINNERREGION"}
+        metas = self._metas() + [self._meta("KXPRESWINNERREGION-28-MW", "KXPRESWINNERREGION",
+                                            self.NOW + timedelta(days=700))]
+        with self._ctx(), \
+                mock.patch.dict(imm.SERIES_OVERRIDES, {
+                    "KXPRESWINNERREGION": imm.SeriesOverride(size_mult=imm.ELECTION_SIZE_MULT)}), \
+                mock.patch.object(imm, "election_series", lambda s: s in fam), \
+                mock.patch.object(imm, "pvd_entry",
+                                  lambda t, now_utc=None: {"size": 300} if t in wave else None):
+            before = imm.applied_mention_mult("KXPRESWINNERREGION")
+            wave_before = imm.applied_mention_mult("KXDPRESPRIMARY")
+            got = imm.near_election_refresh(metas, self.NOW)
+            # any vote date -- year-only, far, past or mixed -- but never a wave's
+            # series, one with its own size (KXPRESRUN) or a non-election (KXFOO)
+            self.assertEqual(got, {"KXKEELUNGMAYOR", "KXINDONESIAVP", "KXSTATELEG", "KXFRENCHPRES",
+                                   "KXLAMAYORMOV", "KXPRESWINNERREGION"})
+            self.assertAlmostEqual(imm.applied_mention_mult("KXPRESWINNERREGION"), before * 1.5)
+            self.assertAlmostEqual(imm.applied_mention_mult("KXDPRESPRIMARY"), wave_before)
+            # one live wave market keeps its whole series out
+            wave.add("KXFRENCHPRES-27-X")
+            self.assertNotIn("KXFRENCHPRES", imm.near_election_refresh(metas, self.NOW))
 
     def test_x3_in_place_of_the_family_x2_to_the_end_of_the_week(self):
         self.assertEqual(imm.NEAR_ELECTION_SIZE_MULT, 3.0)
