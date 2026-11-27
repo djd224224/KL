@@ -267,5 +267,107 @@ class CostMultTests(unittest.TestCase):
 
 
 
+class SideMultTests(unittest.TestCase):
+    """--side-mult-file (Jack 2026-11-27 on the 2028 wave's markets pacing under $1: "raise bids
+    2x, asks by 1.25"): {ticker: {"bid": X, "ask": Y}}, applied last to what the side rests."""
+    R1, R2 = "KXRPRESPRIMARY-28NM-TCAR", "KXRPRESPRIMARY-28TX-TCAR"
+    TIERS = ("--cheap-tiers", "2:15,7.5:15,15:6.75", "--side-cap", "ALL:90.01:300",
+             "--cost-mult", "KXRPRESPRIMARY:bid:1:5")
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.lst = os.path.join(self.d, "list.json")
+        ents = {}
+        for t in (self.R1, self.R2):
+            e = entry(size=285)
+            e.pop("bid_size")
+            ents[t] = e
+        json.dump({"markets": ents}, open(self.lst, "w"))
+        self.mf = os.path.join(self.d, "mult.json")
+        json.dump({self.R1: 2.5}, open(self.mf, "w"))       # R2 stays x1
+        self.sf = os.path.join(self.d, "side.json")
+        self.side({self.R1: {"bid": 2, "ask": 1.25}})
+        self.touch = {self.R1: (1.0, 8.0, 0.0), self.R2: (1.0, 7.0, 0.0)}
+
+    def side(self, d):
+        with open(self.sf, "w") as fh:
+            fh.write(d if isinstance(d, str) else json.dumps(d))
+
+    def run_tune(self, extra=(), env=None, tiers=None):
+        mod = load()
+        mod.LIST, mod.LOCK = self.lst, os.path.join(self.d, "scan.lock")
+        mod.read_touches = lambda ts_: (dict(self.touch), 0)
+        old, sys.argv = sys.argv, ["x", "--series", "KXRPRESPRIMARY", "--since", "2026-11-13T17:30:00Z",
+                                   "--write", "--size-mult-file", self.mf, "--side-mult-file", self.sf,
+                                   *(self.TIERS if tiers is None else tiers), *extra]
+        old_env = os.environ.get("PVD_SIDE_MULT")
+        if env is not None:
+            os.environ["PVD_SIDE_MULT"] = env
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                self.assertEqual(mod.main(), 0)
+        finally:
+            sys.argv = old
+            if env is not None:
+                if old_env is None:
+                    os.environ.pop("PVD_SIDE_MULT", None)
+                else:
+                    os.environ["PVD_SIDE_MULT"] = old_env
+        with open(self.lst) as fh:
+            return json.load(fh)["markets"], buf.getvalue()
+
+    def test_bids_x2_and_the_capped_ask_x1_25_on_the_listed_market_only(self):
+        L, out = self.run_tune()
+        # R1 x2.5 own: 712 a side; 1c bid as x5 = 21,360, x2 = 42,720; the 92c ask: cap 300 x 1.25
+        self.assertEqual((L[self.R1]["bid_size"], L[self.R1]["ask_size"]), (42720, 375))
+        self.assertEqual((L[self.R2]["bid_size"], L[self.R2]["ask_size"]), (21375, 300))
+        self.assertIn("side x2", L[self.R1]["cheap"])
+        self.assertIn("side x1.25", L[self.R1]["cheap"])
+        self.assertIn("side multiples (--side-mult-file, 1 markets): 2 side(s) of 1 markets", out)
+        L, _ = self.run_tune()                                              # idempotent
+        self.assertEqual((L[self.R1]["bid_size"], L[self.R1]["ask_size"]), (42720, 375))
+
+    def test_dropping_the_ticker_or_the_kill_switch_takes_it_back(self):
+        self.run_tune()
+        L, out = self.run_tune(env="0")
+        self.assertEqual((L[self.R1]["bid_size"], L[self.R1]["ask_size"]), (21360, 300))
+        self.assertIn("off (PVD_SIDE_MULT=0)", out)
+        self.run_tune()
+        self.side({"_note": "emptied"})
+        L, _ = self.run_tune()
+        self.assertEqual((L[self.R1]["bid_size"], L[self.R1]["ask_size"]), (21360, 300))
+
+    def test_a_plain_side_rests_its_size_times_x_and_goes_back(self):
+        self.touch[self.R2] = (40.0, 60.0, 0.0)                            # no tier, under the cap
+        self.side({self.R2: {"bid": 2, "ask": 1.25}})
+        L, _ = self.run_tune()
+        self.assertEqual((L[self.R2]["bid_size"], L[self.R2]["ask_size"]), (570, 356))
+        self.side({})
+        L, _ = self.run_tune()
+        self.assertNotIn("bid_size", L[self.R2])
+        self.assertNotIn("ask_size", L[self.R2])
+        self.assertEqual(L[self.R2]["size"], 285)
+
+    def test_an_off_cap_stays_off_and_a_pin_is_left_alone(self):
+        L, _ = self.run_tune(tiers=("--cheap-tiers", "2:15", "--side-cap", "ALL:90.01:0"))
+        self.assertEqual(L[self.R1]["ask_size"], 0)                        # 0 is OFF: x1.25 is still 0
+        self.assertEqual(L[self.R1]["bid_size"], 712 * 15 * 2)
+        L, _ = self.run_tune(extra=("--pin", f"{self.R1}:200"))
+        self.assertEqual(L[self.R1]["size"], 200)
+        self.assertEqual(L[self.R1]["ask_size"], 300)                      # the cap holds on a pin, unscaled
+        self.assertNotIn("bid_size", L[self.R1])
+
+    def test_a_side_with_no_touch_and_an_unreadable_file(self):
+        self.touch[self.R1] = (0.0, 8.0, 0.0)                              # no YES bid on the book
+        L, _ = self.run_tune()
+        self.assertNotIn("bid_size", L[self.R1])
+        self.assertEqual(L[self.R1]["ask_size"], 375)
+        self.side("{not json")
+        L, out = self.run_tune()
+        self.assertEqual(L[self.R1]["ask_size"], 300)
+        self.assertIn("unreadable", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -81,6 +81,16 @@ after --since, series in --series), idempotently:
                      --size-mult (base, bank and kept sizes; the cheap tiers multiply it),
                      so dropping a ticker from the file scales it back. X = 0 is OFF:
                      pinned at 0 a side (only a position's closing order rests). Unreadable: x1.
+  --side-mult-file PATH
+                     PER-MARKET SIDE MULTIPLES (Jack 2026-11-27, on the 2028 wave's ~300
+                     markets pacing under the $1 payout floor: "raise bids 2x, asks by
+                     1.25"): PATH = {ticker: {"bid": X, "ask": Y}} (keys starting "_" are
+                     notes). Applied LAST, to what the side rests now: a tiered or cost-
+                     multiplied side rests its size x its multiple x X; a --side-cap side
+                     rests N x X (the cap rises with it on that market only; a 0 -- off, a
+                     twin block -- stays 0); a plain side rests its size x X. A pinned market
+                     (a stand-down) is left alone. Dropping a ticker, or PVD_SIDE_MULT=0,
+                     takes it back to its usual size on the next run. Unreadable: none.
   --tier-file PATH   PER-MARKET TIER REACH (Jack 2026-11-19, on the FX walls stepping past
                      the 15c tier: "Up to 25c on cheap tier multiplier if needed"): PATH =
                      {"to": C, "markets": {ticker: ...}}. A side of a market in it that no
@@ -266,6 +276,10 @@ def main() -> int:
                     help="a side whose touch jumped this c+ toward the taker since the last run keeps its limit (0 = off)")
     ap.add_argument("--size-mult-file",
                     help="{ticker: X}: that market's sizes are --size-mult x X (applied once per entry)")
+    ap.add_argument("--side-mult-file",
+                    help='{ticker: {"bid": X, "ask": Y}}: that side rests X x what it rests now (tiers, cost '
+                         "multiple and a --side-cap's N included); last step, never on a pinned market. "
+                         "PVD_SIDE_MULT=0 turns it off")
     ap.add_argument("--tier-file",
                     help='{"to": C, "markets": {ticker: ...}}: a side of a market in it that no tier fits but '
                          "costs <= C c rests the last --cheap-tiers multiple (the floor check's per-market reach)")
@@ -369,6 +383,26 @@ def main() -> int:
         except (OSError, ValueError, TypeError, AttributeError) as ex:
             tier_why = f"; tier file unreadable ({ex}): no reach"
             tier_ext = {}
+    # PER-MARKET SIDE MULTIPLES (--side-mult-file, Jack 2026-11-27 on the 2028 wave's markets
+    # pacing under $1: "raise bids 2x, asks by 1.25"): {ticker: {"bid_size": X, "ask_size": Y}}
+    smults, smult_why = {}, ""
+    if a.side_mult_file and os.environ.get("PVD_SIDE_MULT", "1").strip().lower() in ("0", "off", "false", "no"):
+        smult_why = " off (PVD_SIDE_MULT=0)"
+    elif a.side_mult_file:
+        try:
+            with open(a.side_mult_file, encoding="utf-8") as fh:
+                _sd = json.load(fh) or {}
+            for k_, v_ in _sd.items():
+                if str(k_).startswith("_") or not isinstance(v_, dict):
+                    continue
+                xs_ = {sd_ + "_size": float(v_[sd_]) for sd_ in ("bid", "ask")
+                       if v_.get(sd_) is not None and float(v_[sd_]) > 0 and abs(float(v_[sd_]) - 1.0) > 1e-9}
+                if xs_:
+                    smults[str(k_)] = xs_
+        except (OSError, ValueError, TypeError, AttributeError) as ex:
+            smult_why = f" unreadable ({ex}): none"
+            smults = {}
+    n_smult_sides, smult_mk = 0, set()
     # FAIR LIMITS (--fair-file): None = off; {} = on with no usable fair (floors only)
     fair_map, fair_base, fair_extra, fair_why = None, {}, {}, ""
     fair_floor = a.fair_floor
@@ -459,14 +493,15 @@ def main() -> int:
         B = int(round(a.bank_size * a.size_mult)) if a.bank_size else 0
         M = int(round(a.bank_max * a.size_mult)) if a.bank_max else 0
 
-        def caps_for(t: str, e: dict) -> dict:
+        def caps_for(t: str, e: dict, side_x: dict | None = None) -> dict:
             """{side key: N} for the sides --side-cap holds, by the touch. SERIES "ALL"
             caps every in-scope market (Jack 2026-11-07: "turn off quoting 90c+"). A
             capped side that reduces our position (the wave dashboard's "pos") still
             clears it: with flip-through the bot adds the position to N; without, the
             side rests the position. N = 0 is OFF (Jack 2026-11-08: "why even have a
             probe?"): 0 is written as is, and the bot sizes the order that closes a
-            position from the live position each cycle (1b58188)."""
+            position from the live position each cycle (1b58188). side_x ({side key: X},
+            --side-mult-file) raises an N >= 1 to N x X on this market; a 0 stays 0."""
             out: dict = {}
             capwhy.clear()
             if t not in touch:
@@ -492,9 +527,11 @@ def main() -> int:
                             if k in out:
                                 continue        # already blocked by the twin rule
                             reduces = (k == "bid_size" and pos_c <= -1) or (k == "ask_size" and pos_c >= 1)
+                            n_ = (max(1, int(round(cn_ * side_x[k])))
+                                  if cn_ >= 1 and side_x and k in side_x else cn_)
                             # (N = 0 is OFF: the bot sizes the closing order live, 1b58188)
-                            out[k] = (max(cn_, int(abs(pos_c)))
-                                      if cn_ >= 1 and reduces and not e.get("flip_through") else cn_)
+                            out[k] = (max(n_, int(abs(pos_c)))
+                                      if n_ >= 1 and reduces and not e.get("flip_through") else n_)
             return out
         capwhy: dict = {}
         for t, e in (cur.get("markets") or {}).items():
@@ -761,7 +798,7 @@ def main() -> int:
                             n_up += 1
                         else:
                             n_down += 1
-            if (tiers or stiers or side_caps or a.twin_block or cmults) and t in touch:
+            if (tiers or stiers or side_caps or a.twin_block or cmults or smults) and t in touch:
                 # CHEAP SIDES by tier (--cheap-tiers C:X,...): a side whose fill ties up c
                 # a contract -- a bid at its touch, an ask at 100 - its touch -- rests X x
                 # the market's size for the first tier with c <= C (Jack 2026-11-07:
@@ -798,11 +835,20 @@ def main() -> int:
                 if cm_by:
                     cmult_mk.add(t)
                     n_cmult_sides += len(cm_by)
+                # ...then this market's own side multiple (--side-mult-file, Jack 2026-11-27:
+                # "raise bids 2x, asks by 1.25"), last: x X on what the side rests now
+                sx_ = {k: x_ for k, x_ in (smults.get(t) or {}).items() if cost.get(k) is not None}
                 # SIDE CAP (--side-cap SERIES:C:N, Jack 2026-11-07 on the House sweep: "its ok to
                 # quote if it's 5c of cash held but not if its 95c of cash held"): a side of SERIES
                 # whose fill ties up >= C c a contract rests N (0 = off since 1b58188). With
                 # flip-through, the side that reduces a position still rests N + the position.
-                capk = caps_for(t, e)
+                capk = caps_for(t, e, sx_)
+                for k, x_ in sx_.items():
+                    if k not in capk:
+                        mult[k] = mult.get(k, 1.0) * x_
+                if sx_:
+                    smult_mk.add(t)
+                    n_smult_sides += len(sx_)
                 now_c = set(mult) | set(capk)
                 prev_c = set(e.get("cheap_sides") or [])
                 ch = now_c != prev_c
@@ -827,10 +873,13 @@ def main() -> int:
                     n_cheap += 1
                     e["cheap"] = (f"{stamp}: touch {yb:g}x{ya:g} -> "
                                   + (", ".join(f"{k.split('_')[0]} {e.get(k, e.get('size'))} "
-                                               + ((f"(cap: {capwhy[k]})" if k in capwhy else f"(cap: {cost[k]:g}c a contract)")
+                                               + ((f"(cap: {capwhy[k]})" if k in capwhy else
+                                                   f"(cap: {cost[k]:g}c a contract"
+                                                   + (f", side x{sx_[k]:g}" if k in sx_ and int(capk[k]) >= 1 else "") + ")")
                                                   if k in capk else
                                                   f"(x{mult[k]:g}" + (f", tier to {tier_ext[t]:g}c" if k in reach else "")
                                                   + (f", <= {cm_by[k][0]:g}c as x{cm_by[k][1]:g}" if k in cm_by else "")
+                                                  + (f", side x{sx_[k]:g}" if k in sx_ else "")
                                                   + ")")
                                                for k in sorted(now_c)) or "none cheap")
                                   + f" {a.note}").strip()
@@ -935,6 +984,9 @@ def main() -> int:
                     + ", ".join(f"{s_}:{k_.split('_')[0]}:<={c_:g}c:x{m_:g}" for (s_, k_), (c_, m_) in sorted(cmults.items()))
                     + f"): {n_cmult_sides} side(s) of {len(cmult_mk)} markets"
                     if cmults else "; cost multiple: off (PVD_COST_MULT=0)")
+        if a.side_mult_file:
+            msg += (f"; side multiples (--side-mult-file, {len(smults)} markets): "
+                    f"{n_smult_sides} side(s) of {len(smult_mk)} markets" + smult_why)
         if abs(a.size_mult - 1.0) > 1e-9 or n_scaled or tmult:
             msg += f"; sizes x{a.size_mult:g}" + (f" ({len(tmult)} markets with their own multiple)" if tmult else "") \
                 + f": {n_scaled} re-scaled" + tmult_why
