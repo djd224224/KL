@@ -111,6 +111,11 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   Evidence is in `fills_<utc>.jsonl`, `marks_<utc>.jsonl`, `toxic_halts_*` and book_depth around the fill (reference section 3).
 - **Check git log before calling a gap open:** `git log --since=<date> --format="%h %ad %s" | grep -i <word>`, then grep the code for the knob (lesson 11/24).
 - **Propose the rule that would have stopped it, with its cost:** the rewards it gives up, measured with `python imm_review.py measure --pattern <regex> --split <date>` or from the family table. Show "$/day saved vs $/day forgone". Before cutting size anywhere, state the $/day given up against the collateral freed (Jack, 11/19).
+- **How `measure` treats the split day** (R-261126-05). Since 11/27 it always prints that day on its own, under `split_day`.
+  - A plain date holds the day out of both windows, because the change may have gone live mid-day.
+  - The day counts as after when the scope had no market before (it began that day), when you pass `THH:MM` as 00:00, or with `--split-day after`. Pass the live time when you know it (`--split 2026-11-26T15:19`): a bare time is ET.
+  - A window whose days hold no market of the scope says so in `note`. Read its zeros as no exposure.
+  - On 11/26 it printed "after: days 0" for the day Goodreads lost -$236.
 
 **Step 5. Missed markets** (counterfactual; every estimate is MODELLED). Rank by the NET estimate: reward x realisation x (1 - the family's trading tax, from the priors). A $10/day miss in a family that gives back 80% of its rewards is worth $2; quote it as such.
 - **Not enrolled with a real pool:** read the imm_unquoted call. An ADD or ADD WITH CARE whose tape makers are at or above zero and whose x1 clears $5/day is an enrollment suggestion. Name the file (extra_allow_series.json) and the cutoff rule it needs.
@@ -132,6 +137,10 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 - **(a)** Each NEW signature and SPIKE: Grep the message text in incentive_mm.py or the emitting script, read the code, then decide: bug, expected, or external. Root-cause it and write the fix. Sweep the class: ask what else the same mechanism breaks (Jack 7/19: "be more diligent").
 - **(b)** Chronic signatures that hide degradation: 429s skipping the balance-floor check; `state save failed` WinError 5; `unmarkable (valued at cost)`; muted sinks.
 - **(c)** Failing scheduled tasks and task-log errors: map each to its cause. Is it new or chronic? Is it IMM-relevant?
+  - Each failing task carries the line from its own log that says why ("says why"), and the day it was first seen failing ("failing since", tracked from 11/27). Read that line before you name a severity.
+  - On 11/27 the review filed "KL remote-control check 0x1 (chronic)" as P3 hygiene. Its log said the claude login had been dead since 11/10: the box had been unreachable from Jack's phone for 17 days.
+  - A task for a finished experiment (it exits at its end date) gets disabled, not fixed. The q15 and temp shadow collectors ran every 10 minutes for a month after they ended, until 11/27.
+  - A task Jack disabled is listed under "Disabled", not as failing. Leave it alone unless he asks.
 - **(d)** Health-alert DOWN lines that coincide with bot restarts are a monitor bug, not an outage.
 - **(e)** Repo:
   - a sync failure streak above 2;
@@ -142,6 +151,9 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   For uncommitted files, raise only the ones untouched for 24h+ (`dirty_stale_24h`), naming the commit they belong in. An edit made today is probably a session at work: committing it would sweep up that session's in-flight hunks (the 9/09 incident). The plan for a stale file is to commit exactly those paths in the live tree after their own tests pass, then push at once.
 - **Check the claim, not the label.** The first run called the 429 balance skip a "$1 payout floor" check when it is the account-value halt (`_check_balance_floor`). Read the emitting code before naming what a log line means.
 - **(f)** Machine: days-to-full under 60 is P1, under 21 is P0; research token older than 330 days is P1; memory pressure.
+  - **Remote Control** (the evidence's "Remote Control" line, from the hourly check's own logs; their stamps are local ET despite the Z). A claude login DEAD for over 6 hours is P1, kind `ops`: the box can't be reached from Jack's phone (Jack 10/12: "ensure that im never in a position where i cant access").
+  - Only Jack can fix it, by running `claude auth login` in a terminal on the PC. The fix goes in the decision card's text as that command; the review can't run it.
+  - The review and the daily recap run on the one-year research token, so they keep working while the login is dead (the check's own alert says so). Any job that uses the login itself does not.
   - Log retention (the evidence's "Log retention" line; `imm_log_retention.py`, R-261124-03) is P1 when any of these hold:
     - a file failed or a .gz conflicted (the original is kept, so nothing is lost, but the backlog stops);
     - the mode is `refused` (a reader lost its .gz support);
@@ -149,6 +161,9 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   - A dry run before 11/27 is expected.
   - Old days are `.gz` past 35 days: read them through `imm_logfiles`, never a plain glob.
 - **(g)** Data health: MISSING or LOW sinks; sinks not in IMM_LOGGING.md (a docs finding).
+  - An event-only sink (ws_cand, ws_group, ws_sweep) is checked against the bot log's own line for each event it writes. A day without its file is `quiet` (shown, not raised) when the log has none of those events. It is MISSING, a real write failure, only when the log has some.
+  - R-261126-06 called ws_cand MISSING on 11/26, a day with no candidate-breaker trip. It wrote 7 rows for 11/27's 7 trips.
+  - When you find another event-only sink, add its log line to `EVENT_SINK_MARKERS` (needs Jack) rather than raising it daily.
 - **(h)** Code review of D's commits that touch incentive_mm.py, biggest first: `git show <sha> -- incentive_mm.py`. Look for:
   - logic errors, inverted conditions, units (cents vs dollars, contracts vs $);
   - UTC vs ET dates;
@@ -194,6 +209,13 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
   - **a wrong scope:** fix the scope and leave the verdict. The next collect reads it out again under the new scope.
 - **A change that hurt** (a `hurt` verdict with a mechanism you can name) becomes a finding (kind `loss`) whose plan is the revert: `git revert <sha>` or the change's kill switch, the $/day at stake (measured), and the readout as evidence. Put that finding's fingerprint in the verdict's `finding`. It competes for a decision card like any finding.
 - **Early warnings** (a change down hard after 2+ days): look now. When the mechanism is clear, file the revert finding today rather than on day 7.
+- **Since it went live** (R-261126-07): every change live in the last 3 ET days, read from its live day. A row is its scope's whole days since (the live day included), against the scope's usual day.
+  - **LOSING:** it lost $50+ since live and did $50+ worse than usual.
+  - **PICKED OFF:** a to-date mark-out of -10c or worse on 20+ contracts.
+  - Judge every flagged row in this run, using the mechanism from the fills, marks and orders. Open a `loss` finding with the revert or the kill switch when it is the change; if it is the day, say so in a line.
+  - **The outside column** falling as much means the whole book moved: a holiday, a wave ending.
+  - **A small live-day share** (live late in the day) dilutes the row; the next run adds the first full day.
+  - The 11/26 Goodreads loss (-$236 on the afternoon its four changes went live) is the row this exists for. It was found by hand on 11/27; run on that morning's data, the block flags it LOSING. IMM_REVIEW_SINCE_LIVE=0 turns it off.
 - **A change that names a ledger id** (the `ids` in its details): evaluate that item above with these numbers. The registry verdict and the ledger evaluation must agree.
 - **The first run** back-fills 30 days at once and lists 15: the calls first, then the most suggestive by p. Judge those; the rest keep their provisional call.
   - On 11/25's data, 23 of 164 testable readouts passed |t| >= 2, where chance alone gives about 8.

@@ -1698,5 +1698,266 @@ class BackupStatusTests(Base):
         self.assertEqual(rv.backup_status()["state"], "off")
 
 
+class SplitDayMeasureTests(Base):
+    """R-261126-05: measure printed "after: days 0" for the day Goodreads lost
+    -$236 -- the split day was in neither window, and nothing said so."""
+
+    def test_a_scope_new_on_the_split_day_counts_it_after(self):
+        for i in range(1, 8):
+            self.archive(DAY - timedelta(days=i), {"KXZZ-B-1": _row(rew=99)})     # the scope did not exist
+        self.archive(DAY, {"KXGR-26X-A": _row(rew=58.85, pnl=-295.23, fills=37, rest=4327),
+                           "KXZZ-B-1": _row(rew=99)})
+        out = rv.measure("^KXGR", None, DAY.isoformat(), 7, 1)
+        self.assertEqual(out["split_day"]["counted"], "after")
+        self.assertEqual(out["after"]["days"], 1)
+        self.assertAlmostEqual(out["after"]["net_day"], -236.38)
+        self.assertEqual(out["after"]["markets"], 1)
+        self.assertEqual(out["before"]["markets"], 0)
+        self.assertIn("no exposure", out["before"]["note"])
+        self.assertAlmostEqual(out["delta_net_day"], -236.38)
+        self.assertIn("own net", out["delta_note"])
+
+    def test_an_existing_scope_holds_a_date_split_day_out_and_shows_it(self):
+        for i in range(1, 4):
+            self.archive(DAY - timedelta(days=i), {"KXRT-A-1": _row(rew=10, pnl=-5)})
+            self.archive(DAY + timedelta(days=i), {"KXRT-A-1": _row(rew=12, pnl=1)})
+        self.archive(DAY, {"KXRT-A-1": _row(rew=50, pnl=-100)})                  # the mixed day
+        out = rv.measure("^KXRT", None, DAY.isoformat(), 3, 3)
+        self.assertEqual(out["split_day"]["counted"], "out")
+        self.assertAlmostEqual(out["split_day"]["net_day"], -50)
+        self.assertEqual((out["before"]["days"], out["after"]["days"]), (3, 3))
+        self.assertAlmostEqual(out["after"]["net_day"], 13)                       # the mixed day is not in it
+        self.assertEqual(out["daily"]["split_day"], [(DAY.isoformat(), -50.0)])
+        # --split-day after, or an explicit 00:00, counts it
+        out2 = rv.measure("^KXRT", None, DAY.isoformat(), 3, 3, "after")
+        self.assertEqual([d for d, _ in out2["daily"]["after"]],
+                         [DAY.isoformat(), (DAY + timedelta(days=1)).isoformat(),
+                          (DAY + timedelta(days=2)).isoformat()])
+        self.assertEqual(rv.measure("^KXRT", None, DAY.isoformat() + "T00:00", 3, 3)["split_day"]["counted"],
+                         "after")
+        # "out" holds it out even for a new scope
+        self.assertEqual(rv.measure("^KXNEW", None, DAY.isoformat(), 3, 3, "out")["split_day"]["counted"], "out")
+
+    def test_a_bare_time_is_et_and_an_empty_window_says_so(self):
+        self.archive(DAY - timedelta(days=1), {"KXRT-A-1": _row(rew=10)})
+        self.archive(DAY, {"KXRT-A-1": _row(rew=10)})
+        # 02:00 ET is still DAY; read as UTC (the old way) it was 21:00 ET the day before
+        out = rv.measure("^KXRT", None, DAY.isoformat() + "T02:00", 1, 2)
+        self.assertEqual(out["split_day"]["day"], DAY.isoformat())
+        self.assertEqual(out["split_day"]["counted"], "out")                     # a mid-day time: mixed
+        self.assertEqual(out["after"]["days"], 0)
+        self.assertIn("archive ends " + DAY.isoformat(), out["after"]["note"])
+        self.assertEqual(rv.measure("^KXRT", None, DAY.isoformat() + "T02:00Z", 1, 2)["split_day"]["day"],
+                         (DAY - timedelta(days=1)).isoformat())                  # an explicit Z still honoured
+        with self.assertRaises(SystemExit):
+            rv.measure("^KXRT", None, "not-a-date", 1, 1)
+
+
+class EventSinkTests(Base):
+    """R-261126-06: ws_cand was called MISSING for a day with no candidate-breaker
+    trip; an event-only sink is checked against the bot log's own lines."""
+
+    BANNER = ("{d} 05:02:32Z candidate breaker (2026-11-15): on -- a maker fill of 200+ on a name in a "
+              "per-state series (KXDPRESPRIMARY-28AK-MKEL) holds that name's side in every state 10 min\n")
+    TRIP = ("{d} 13:57:12Z [IMM] candidate breaker (on): KXDPRESPRIMARY-28AK-MKEL ASK @ 2c hit (200) -> "
+            "holding MKEL ASKs across KXDPRESPRIMARY 10 min: 9 order(s) in 8 other state(s)\n")
+
+    def setUp(self):
+        super().setUp()
+        for i in range(1, 15):
+            d = (DAY - timedelta(days=i)).isoformat()
+            self.write(f"ws_cand_{d}.jsonl", '{"ev": "trip"}\n')
+        self.u = DAY.isoformat()
+
+    def sink_rows(self):
+        return {r["sink"]: r for r in rv.sec_data(DAY)["sinks"]}
+
+    def test_no_events_logged_is_quiet_not_missing(self):
+        self.write(f"incentive-mm-{self.u}.log", self.BANNER.format(d=self.u))   # a start banner is no trip
+        r = self.sink_rows()["ws_cand"]
+        self.assertEqual(r["status"], "quiet")
+        self.assertEqual(r["events_logged"], 0)
+        self.assertIn("no candidate-breaker trips", r["note"])
+        self.assertNotIn("ws_cand quiet", rv.sec_data(DAY)["alerts"])
+
+    def test_events_logged_with_no_rows_is_missing(self):
+        prev = (DAY - timedelta(days=1)).isoformat()
+        self.write(f"incentive-mm-{prev}.log", self.BANNER.format(d=self.u) + self.TRIP.format(d=self.u)
+                   + self.TRIP.format(d=prev))                                   # the day before does not count
+        r = self.sink_rows()["ws_cand"]
+        self.assertEqual((r["status"], r["events_logged"]), ("MISSING", 1))
+        self.assertIn("1 candidate-breaker trips in the bot log", r["note"])
+        self.assertIn("ws_cand MISSING", rv.sec_data(DAY)["alerts"])
+
+    def test_counts_cross_a_chunk_boundary(self):
+        filler = "".join(f"{self.u} 10:00:{i % 60:02d}Z noise line {i}\n" for i in range(3000))
+        self.write(f"incentive-mm-{self.u}.log", filler + self.TRIP.format(d=self.u) * 3 + filler)
+        for size in (97, 4096, 1 << 24):         # lines split across reads are joined first
+            with mock.patch.object(rv, "_LOG_CHUNK", size):
+                self.assertEqual(rv.event_log_counts(self.u, ["ws_cand", "ws_sweep"]),
+                                 {"ws_cand": 3, "ws_sweep": 0})
+
+    def test_a_sink_without_a_marker_keeps_the_plain_rule(self):
+        for i in range(1, 15):
+            self.write(f"orders_{(DAY - timedelta(days=i)).isoformat()}.jsonl", "x" * 1000)
+        self.assertEqual(self.sink_rows()["orders"]["status"], "MISSING")
+        md = rv.render_evidence({"day": self.u, "window_et": ["a", "b"], "generated": 0,
+                                 "data": rv.sec_data(DAY)})
+        self.assertIn("checked against the bot log", md)
+
+
+class TaskReasonTests(Base):
+    """R-261126-04: a failing task carries the line from its own log that says why."""
+
+    def test_failing_tasks_say_why_and_since_when(self):
+        log = os.path.join(self.root, "x-task.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("12:30:05Z [SCORE] ok line\n12:30:13Z [SCORE] send: FAILED to me@example.com\n"
+                     "12:31:00Z [SCORE] done\n")
+        rc = os.path.join(rv.RUN_LOGS, "remote-control")
+        os.makedirs(rc)
+        with open(os.path.join(rc, "check-2026-11-27.log"), "w", encoding="utf-8") as fh:
+            fh.write("2026-11-27 12:07:28Z login DEAD: exit 1: Failed to authenticate: OAuth session expired\n"
+                     "2026-11-27 12:07:28Z alert 'login' held (last sent 2026-11-27 16:07:21Z)\n")
+        os.makedirs(self.review, exist_ok=True)
+        rv._write_json(os.path.join(self.review, "task_state.json"),
+                       {"KL x": {"s": "Ready", "r": 2, "since": "2026-11-20"},
+                        "KL old": {"s": "Ready", "r": 5}})          # failing before tracking began
+        tasks = [{"n": "KL x", "s": "Ready", "r": 2, "l": "2026-11-27T07:30:01",
+                  "a": f'cmd.exe /c "set P=1&& python x.py --email >> "{log}" 2>&1"'},
+                 {"n": "KL remote-control check", "s": "Ready", "r": 1, "l": "2026-11-27T12:07:01",
+                  "a": "wscript.exe //B run_remote_control_check_hidden.vbs"},
+                 {"n": "KL off", "s": "Disabled", "r": 3, "l": "", "a": ""},
+                 {"n": "KL old", "s": "Ready", "r": 5, "l": "", "a": ""},
+                 {"n": "KL fine", "s": "Ready", "r": 0, "l": "", "a": ""}]
+        with mock.patch.object(rv, "_ps_json", return_value=tasks):
+            tk = rv.scheduled_tasks(today="2026-11-27")
+        f = {x["task"]: x for x in tk["failing"]}
+        self.assertEqual(sorted(f), ["KL old", "KL remote-control check", "KL x"])
+        self.assertEqual((f["KL old"]["chronic"], f["KL old"]["since"]), (True, None))   # start unknown, not today
+        self.assertEqual(tk["disabled"], ["KL off"])
+        self.assertTrue(f["KL x"]["chronic"])
+        self.assertEqual(f["KL x"]["since"], "2026-11-20")                        # carried
+        self.assertIn("send: FAILED to <email>", f["KL x"]["why"])                # the address masked
+        self.assertNotIn("example.com", f["KL x"]["why"])
+        self.assertEqual(f["KL remote-control check"]["log"], "check-2026-11-27.log")
+        self.assertIn("login DEAD", f["KL remote-control check"]["why"])
+        self.assertEqual(f["KL remote-control check"]["since"], "2026-11-27")    # first seen today
+        st = rv._load_json(os.path.join(self.review, "task_state.json"))
+        self.assertEqual(st["KL x"]["since"], "2026-11-20")
+        md = rv.render_evidence({"day": DAY.isoformat(), "window_et": ["a", "b"], "generated": 0,
+                                 "system": {"tasks": tk}})
+        self.assertIn("KL x says why (x-task.log)", md)
+        self.assertIn("failing since 2026-11-20", md)
+        self.assertIn("KL old 0x5 (last , chronic, start unknown", md)
+
+    def test_remote_control_login_state_and_since(self):
+        rc = os.path.join(rv.RUN_LOGS, "remote-control")
+        os.makedirs(rc)
+        with open(os.path.join(rc, "check-2026-11-09.log"), "w", encoding="utf-8") as fh:
+            fh.write("2026-11-09 22:07:13Z host up: pid 7\n2026-11-09 22:07:13Z login ok\n"
+                     "2026-11-09 23:07:22Z login ok\n")
+        with open(os.path.join(rc, "check-2026-11-10.log"), "w", encoding="utf-8") as fh:
+            fh.write("2026-11-10 00:07:11Z host up: pid 7\n"
+                     "2026-11-10 00:07:11Z login DEAD: exit 1: Failed to authenticate: OAuth session expired\n"
+                     "alert sent to me@example.com\n"
+                     "2026-11-10 01:07:00Z login probe inconclusive: probe timed out after 3 min\n"
+                     "2026-11-10 02:07:12Z login DEAD: exit 1: Failed to authenticate: OAuth session expired\n")
+        now = datetime(2026, 11, 27, 13, 0, tzinfo=rv.ET)
+        s = rv.remote_control_status(now=now)
+        self.assertEqual((s["login"], s["since"], s["since_known"], s["host"]),
+                         ("dead", "2026-11-10 00:07:11", True, "up"))
+        self.assertTrue(s["p1"])
+        self.assertAlmostEqual(s["hours"], 420.9, places=1)
+        md = rv.render_evidence({"day": DAY.isoformat(), "window_et": ["a", "b"], "generated": 0,
+                                 "system": {"remote_control": s}})
+        self.assertIn("the claude login is DEAD since 2026-11-10 00:07:11 ET (17.5 days)", md)
+        self.assertIn("`claude auth login`", md)
+        self.assertIn(("Phone access down 17.5d (claude login)", "red"),
+                      sr.health_checks({"system": {"remote_control": s}}))
+        # back to ok
+        with open(os.path.join(rc, "check-2026-11-27.log"), "w", encoding="utf-8") as fh:
+            fh.write("2026-11-27 12:07:28Z login ok\n")
+        s2 = rv.remote_control_status(now=now)
+        self.assertEqual((s2["login"], s2["since"], s2["p1"]), ("ok", "2026-11-27 12:07:28", False))
+        self.assertIn(("Phone access OK", "green"), sr.health_checks({"system": {"remote_control": s2}}))
+        # a window that starts dead cannot say when it began
+        os.remove(os.path.join(rc, "check-2026-11-09.log"))
+        os.remove(os.path.join(rc, "check-2026-11-27.log"))
+        self.assertFalse(rv.remote_control_status(now=now)["since_known"])
+
+
+class SinceLiveTests(Base):
+    """R-261126-07: the registry read a change only at day 7 (early warnings from
+    day 2); a change's own first day went unread."""
+
+    def setUp(self):
+        super().setUp()
+        for i in range(1, 8):          # the usual week: the RT scope earns, KXGR does not exist
+            self.archive(DAY - timedelta(days=i), {"KXRT-A-1": _row(rew=30, pnl=-5, rest=1000),
+                                                   "KXZZ-B-1": _row(rew=20, pnl=0)})
+        self.archive(DAY, {
+            "KXGR-26X-A": _row(rew=58.85, pnl=-295.23, fills=37, cts=4918, rest=4327, pos1=-595, mk1=78,
+                               fx=[0, 0, -148, 4918, 0, 0, -236, 4918]),
+            "KXRT-A-1": _row(rew=10, pnl=-30, rest=1000),
+            "KXZZ-B-1": _row(rew=20, pnl=0)})
+        mk = lambda k, hh, mm, sc, subj: {"key": k, "live_at": _ts(DAY, hh, mm), "scope": sc,   # noqa: E731
+                                          "metric": "net", "subject": subj, "ids": []}
+        self.st = {"aaa1111": mk("aaa1111", 15, 19, {"series": ["KXGR"]}, "imm: KXGR quotes 1-99c"),
+                   "bbb2222": mk("bbb2222", 16, 45, {"series": ["KXGR"]}, "imm: KXGR x5"),
+                   "ccc3333": mk("ccc3333", 9, 0, {"series": ["KXRT"]}, "imm: RT lean"),
+                   "ddd4444": mk("ddd4444", 9, 0, {"book": True}, "imm: state save retries"),
+                   "old5555": {**mk("old5555", 9, 0, {"series": ["KXZZ"]}, "imm: old"),
+                               "live_at": _ts(DAY - timedelta(days=5), 9, 0)}}
+
+    def run_it(self):
+        universe = {"KXGR", "KXRT", "KXZZ"}
+        return rv.since_live(DAY, self.st, self.st, universe, {})
+
+    def test_a_new_scope_losing_on_its_first_day_is_flagged(self):
+        sl = self.run_it()
+        self.assertEqual((sl["n"], sl["book_wide"], sl["flagged"]), (2, 1, 1))  # old5555 is outside 3 days
+        gr = sl["rows"][0]
+        self.assertEqual(gr["keys"], ["aaa1111", "bbb2222"])                     # same day, same scope: one row
+        self.assertEqual(gr["flags"], ["losing"])
+        self.assertTrue(gr["new"])
+        self.assertAlmostEqual(gr["net"], -236.38)
+        self.assertAlmostEqual(gr["vs_usual"], -236.38)
+        self.assertAlmostEqual(gr["mt_c"], -4.8, places=1)
+        self.assertEqual(gr["largest"]["ticker"], "KXGR-26X-A")
+        self.assertAlmostEqual(gr["largest"]["at_risk"], 130.9)                  # a short at 78c can lose 22c more
+        self.assertAlmostEqual(gr["live_share"], 0.36, places=2)
+        rt = sl["rows"][1]
+        self.assertEqual(rt["keys"], ["ccc3333"])
+        self.assertEqual(rt["flags"], [])                    # -$20 vs a $25 usual: a loss of $20 is under $50
+        self.assertAlmostEqual(rt["vs_usual"], -45.0)
+
+    def test_picked_off_and_render(self):
+        self.archive(DAY, {"KXRT-A-1": _row(rew=10, pnl=5, fills=3, cts=50, fx=[0, 0, 0, 0, 0, 0, -7.5, 50])})
+        rv._REG_DAYS.clear()
+        sl = self.run_it()
+        rt = [r for r in sl["rows"] if r["keys"] == ["ccc3333"]][0]
+        self.assertEqual(rt["flags"], ["picked off"])                            # -15c on 50 contracts
+        L = []
+        rv.render_since_live(sl, L.append)
+        md = "\n".join(L)
+        self.assertIn("**Since it went live**", md)
+        self.assertIn("PICKED OFF", md)
+        html = sr.render_since_live(sl)
+        self.assertIn("Losing since it went live", html)
+        self.assertIn("RT lean", html)
+        self.assertEqual(sr.render_since_live({"rows": [{"flags": []}]}), "")
+        self.assertIn(("1 new change(s) losing since live", "amber"),
+                      sr.health_checks({"registry": {"since_live": sl}}))
+
+    def test_off_switch_and_errors_stay_inside_the_section(self):
+        L = []
+        rv.render_since_live({"error": "boom"}, L.append)
+        self.assertIn("ERROR boom", L[0])
+        L = []
+        rv.render_since_live({}, L.append)
+        self.assertEqual(L, [])
+
+
 if __name__ == "__main__":
     unittest.main()

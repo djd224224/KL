@@ -499,6 +499,15 @@ def health_checks(ev: dict) -> List[Tuple[str, str]]:
             out.append((f"{len(imm)} IMM job(s) failing", "red"))
         else:
             out.append((f"{len(fails)} other job(s) failing", "gray"))
+    # Jack's way in from his phone (R-261126-04): it sat in "1 other job(s)
+    # failing" (gray) for 17 days while the claude login was dead
+    rc = sy.get("remote_control") or {}
+    if rc.get("present") and rc.get("login") == "dead":
+        h = rc.get("hours")
+        out.append(((f"Phone access down {rv._f(h) / 24:.1f}d (claude login)" if h is not None
+                     else "Phone access down (claude login)"), "red" if rc.get("p1") else "amber"))
+    elif rc.get("present") and rc.get("login") == "ok":
+        out.append(("Phone access OK", "green"))
     sn = sy.get("sync") or {}
     g = sy.get("git") or {}
     if sn or g:
@@ -533,6 +542,9 @@ def health_checks(ev: dict) -> List[Tuple[str, str]]:
         out.append((f"Changes at {rv.REGISTRY_DAYS} days: {worse} of {tot} worse" if worse
                     else f"Changes at {rv.REGISTRY_DAYS} days: none of {tot} worse",
                     "amber" if worse else "green"))
+    nsl = int(rv._f((rg.get("since_live") or {}).get("flagged")))
+    if nsl:
+        out.append((f"{nsl} new change(s) losing since live", "amber"))
     mo = ev.get("models") or {}
     if mo and not mo.get("error"):   # every fair model against the market (imm_fair_scorecard.py)
         h = mo.get("health") or {}
@@ -802,7 +814,40 @@ def render_changes(ctx: dict) -> str:
                                  f'{esc(w.get("metric"))} {_num(w.get("before"))} &rarr; {_num(w.get("after"))} '
                                  f'a day over {int(rv._f(w.get("after_days")))} days</div>' for w in warns[:5]),
                        AMBER))
+    P.append(render_since_live(rg.get("since_live") or {}))
     return "".join(P)
+
+
+def render_since_live(sl: dict) -> str:
+    """The changes live in the last few days that are losing or picked off from
+    their first day (evidence section 12 'Since it went live', R-261126-07): the
+    7-day readouts and the 2-day early warnings never look at the live day."""
+    flagged = [r for r in (sl.get("rows") or []) if r.get("flags")]
+    if not flagged:
+        return ""
+    lines = []
+    for r in flagged[:5]:
+        subjects = r.get("subjects") or [", ".join(r.get("keys") or [])]
+        title = esc(_change_title(subjects[0], 90))
+        more = len(r.get("keys") or []) - 1
+        if more > 0:
+            title += f" (+{more} more)"
+        chips = "".join(" " + id_chip(x) for x in (r.get("ids") or [])[:2])
+        first = " on its first day" if int(rv._f(r.get("days"))) == 1 else ""
+        detail = (f"Net {_num(r.get('net'))} since {esc(r.get('live'))} ET{first} "
+                  f"(usual {_num(r.get('usual_day'))} a day)")
+        if r.get("mt_c") is not None:
+            detail += f" &middot; fills marked {esc('%+.1fc' % rv._f(r['mt_c']))} a contract to date"
+        big = r.get("largest") or {}
+        if big:
+            detail += (f" &middot; biggest position {esc(big.get('ticker'))} "
+                       f"{esc('%+.0f' % rv._f(big.get('pos')))} @ {esc('%.0fc' % rv._f(big.get('mark_c')))}")
+        flags = esc(", ".join(r.get("flags") or []))
+        lines.append(f'<div style="padding:4px 0"><b>{title}</b>{chips}'
+                     f'<div style="font-size:14px">{detail} &middot; <b style="color:{AMBER}">{flags}</b>'
+                     f'</div></div>')
+    return _card(f'<div style="font-weight:700;margin-bottom:4px;color:{AMBER}">Losing since it went live '
+                 f'(changes from the last {rv.SINCE_LIVE_DAYS} days)</div>' + "".join(lines), AMBER)
 
 
 def render_html(ctx: dict, fallback_reason: str = "") -> str:

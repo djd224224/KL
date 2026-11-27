@@ -110,6 +110,18 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
       - the registry's headline totals double-counted the same money. The weekend-rain pair was half the "worse" total, and one TRUMPSAY launch counted twice. Hence the same-day clusters.
     - **The trap it exposed:** a Git Bash `tail -F` on run.log blocked every Add-Content line of the launcher's log (memory: reference-tail-f-blocks-add-content).
   - **Scope guesses are the weak link:** a family named next to its series widened KXHAUSTTS to all 149 Carbon Arc series, so a subject that names series is now those series only. Body-only series (a third of commits) are often examples, so the review re-scopes them when they go live.
+- **Fixing the 11/27 email's findings (11/27):** Jack said "fix these in daily performance email" (the sync P1 and R-261126-04 to -08), then "always look for and resolve the root issue when possible". Each finding's symptom differed from its root issue:
+  - **The sync P1 (R-261125-02)** was already cleared at 07:49 ET (3c787f7). Its root fix, the auto-merge (e5a2865), was pushed at 08:36 ET. Every sync since has logged "Already up to date". The box stays ahead by other sessions' unpushed commits until Jack approves a push.
+  - **"Four tasks failing" (R-261126-04) was three different things:**
+    - **The combo scorecard:** Jack disabled it on 11/27, among the cuts for the box's RAM.
+    - **The two shadow collectors:** experiments that ended on 10/23 and 10/30, still started every 10 minutes. Disabled 11/27, not deleted.
+    - **The Remote Control check:** its log said the claude login had been dead since 11/10 00:07 ET. The box had been unreachable from Jack's phone for 17 days, filed as P3 hygiene. The root fix in the review: each failing task now carries the line from its own log that says why, and section 6 gets a "Remote Control" line with a P1 rule and a red email chip. Before this it sat in a gray "1 other job(s) failing". The login itself is Jack's to fix: `claude auth login` on the PC.
+  - **ws_cand "MISSING" (R-261126-06)** was a false positive. The sink writes only on a candidate-breaker trip; 11/26 had none, and 11/27's 7 trips wrote 7 rows. Data health now checks the event-only sinks against the bot log's own lines. All three markers were verified on real data: ws_cand 7 = 7, ws_sweep 70 = 70, ws_group 1 = 1.
+  - **measure's split day (R-261126-05):** the day is shown on its own. It counts as after when the scope began that day; a bare `THH:MM` is ET, not UTC.
+  - **"Since it went live" (R-261126-07):** run on that morning's data, it flags Goodreads LOSING (-$236 on its first day) and Carbon Arc PICKED OFF (-12c). Its first version flagged on "$50 under the usual" alone, and the 11/26 Elections row (+$21 net on a $158 usual) showed a big family's swing passing as a loss. So it now needs a real loss as well.
+  - **The five self-applied watches (R-261126-08)** were checked against the bot's own log text (incentive_mm.py's "state save failed" and "floor check skipped" lines), the family names in family_daily.csv and the toxic_halts sink.
+    - All five evaluate cleanly on 11/26, none firing: 0 state-save failures, 3 floor skips, 24 toxic halts, Sports & awards +$67 over 3 days, Weather & quakes -$209 over 7.
+    - The Sports & awards one is diluted: the Grammys and the sports series share the family, so its 3-day net read +$67 with Goodreads' -$236 inside it. Goodreads itself is covered by "since it went live".
 
 ## 2026-11-25: what the survey found before the first run (the baseline)
 

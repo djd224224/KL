@@ -30,8 +30,8 @@ launcher (run_imm_daily_review.ps1) runs the three every morning.
     python imm_review.py changes add SHA | skip KEY --note "..." | verdict KEY worked|hurt|... --note "..."
     python imm_review.py changes scope KEY [--series A,B] [--family F] [--group G] [--event E] [--wave W]
                                  [--pattern RX] [--book] [--metric net|rew|pnl|...] [--expect "..."]
-    python imm_review.py measure (--pattern REGEX | --family NAME) --split YYYY-MM-DD[THH:MM]
-                                 [--before 7] [--after 7]
+    python imm_review.py measure (--pattern REGEX | --family NAME) --split YYYY-MM-DD[THH:MM ET]
+                                 [--before 7] [--after 7] [--split-day auto|after|out]
     python imm_review.py put findings.json|review.md --day D  < content   # the unattended run's writes
 
 Everything it writes lives under REVIEW_DIR (run-logs/incentive-mm/daily_review,
@@ -1591,6 +1591,10 @@ def sec_system(day: date, bootstrap_days: int = 14) -> dict:
     out["git"] = git_state()
     out["machine"] = machine_state(day)
     out["retention"] = retention_status()
+    try:
+        out["remote_control"] = remote_control_status()
+    except Exception as e:      # never fail the system section over it
+        out["remote_control"] = {"present": False, "error": f"{type(e).__name__}: {e}"}
     return out
 
 
@@ -1699,14 +1703,121 @@ TASKS_PS = (r"$ErrorActionPreference='SilentlyContinue'; "
             r"$i = $_ | Get-ScheduledTaskInfo; [pscustomobject]@{ n=$_.TaskName; s=[string]$_.State; "
             r"l= if ($i.LastRunTime) { $i.LastRunTime.ToString('s') } else { '' }; "
             r"r=$i.LastTaskResult; x= if ($i.NextRunTime) { $i.NextRunTime.ToString('s') } else { '' }; "
-            r"m=$i.NumberOfMissedRuns } } | ConvertTo-Json -Compress")
+            r"m=$i.NumberOfMissedRuns; "
+            r"a=(($_.Actions | ForEach-Object { [string]$_.Execute + ' ' + [string]$_.Arguments }) -join ' ;; ') } } "
+            r"| ConvertTo-Json -Compress")
+
+# Where a failing task says why (R-261126-04). The 11/27 review filed the
+# Remote Control check as a P3 "chronic 0x1": its own log said the claude
+# login had been dead since 11/10, so the box had been unreachable from Jack's
+# phone for 17 days. A task whose action redirects to a log (cmd /c ... >> "x.log")
+# names it itself; these name theirs here (relative to run-logs; * = the newest).
+TASK_LOG_HINTS = {
+    "KL remote-control check": "remote-control/check-*.log",
+    "KL remote-control": "remote-control/20??-??-??.log",      # the host, by launch date
+}
+_TASK_REDIRECT = re.compile(r'>>?\s*"?([A-Za-z]:\\[^"<>|]+?\.(?:log|txt))"?(?=\s|$|")')
+_TASK_WHY = re.compile(r"FAILED|Traceback|[Ee]rror|DEAD|exited with|timed out|MISSING|refused|denied|"
+                       r"[Nn]ot found|Exception|\bnot starting\b|past [A-Z_]+UNTIL")
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 
 
-def scheduled_tasks() -> dict:
+def _task_log(name: str, action: str) -> Optional[str]:
+    m = _TASK_REDIRECT.search(action or "")
+    if m:
+        return m.group(1)
+    hint = TASK_LOG_HINTS.get(name)
+    if hint:
+        files = glob.glob(os.path.join(RUN_LOGS, *hint.split("/")))
+        if files:
+            return max(files, key=lambda p: os.path.getmtime(p))
+    return None
+
+
+def _task_why(path: Optional[str]) -> Optional[str]:
+    """The last line of a task's own log that says what went wrong (else its
+    last line), from the log's last 64 KB; email addresses masked."""
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 65536))
+            lines = [x.strip() for x in fh.read().decode("utf-8", "replace").splitlines() if x.strip()]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    pick = next((x for x in reversed(lines) if _TASK_WHY.search(x)), lines[-1])
+    return _EMAIL.sub("<email>", pick)[:240]
+
+
+# Jack 2026-10-12: "i do want to use remote control when i dont have access to
+# PC. ensure that im never in a position where i cant access". The hourly check
+# (remote_control_check.ps1) logs the claude login's state. From 11/10 it said
+# DEAD every hour, while the review's evidence showed only "KL remote-control
+# check 0x1 (chronic)".
+RC_DEAD_P1_HOURS = 6.0
+_RC_LINE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})Z? (.*)")
+
+
+def remote_control_status(max_days: int = 90, now: Optional[datetime] = None) -> dict:
+    """The Remote Control host's claude login, from the hourly check's own logs
+    (run-logs/remote-control/check-YYYY-MM-DD.log): the latest verdict, and
+    since when it has held. The logs' stamps are LOCAL (ET) time despite their
+    Z: PowerShell's {0:u} of Get-Date. A dead login means the box cannot be
+    reached from Jack's phone, and only he can fix it, by running
+    `claude auth login` on the PC."""
+    files = sorted(glob.glob(os.path.join(RUN_LOGS, "remote-control", "check-*.log")))[-max_days:]
+    if not files:
+        return {"present": False}
+    state = since = last_at = host = why = last_ok = None
+    known = False                       # the current state's start is inside the window
+    for f in files:
+        try:
+            fh = open(f, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                m = _RC_LINE.match(line.strip())
+                if not m:
+                    continue
+                at, msg = m.groups()
+                last_at = at
+                if msg.startswith("login ok"):
+                    if state != "ok":
+                        since, known = at, state is not None
+                    state, last_ok = "ok", at
+                elif msg.startswith("login DEAD"):
+                    if state != "dead":
+                        since, known = at, state is not None
+                    state, why = "dead", _EMAIL.sub("<email>", msg)[:200]
+                elif msg.startswith("host up"):
+                    host = "up"
+                elif "no host process" in msg or "starting it" in msg or "restarting the task" in msg:
+                    host = "down"
+                elif "is Disabled" in msg:
+                    host = "disabled"
+    out = {"present": True, "login": state or "unknown", "since": since, "since_known": known,
+           "last_check": last_at, "last_ok": last_ok, "host": host, "why": why if state == "dead" else None}
+    if since:
+        now = now or datetime.now(ET)
+        try:
+            age = now - datetime.strptime(since, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ET)
+            out["hours"] = round(age.total_seconds() / 3600.0, 1)
+        except ValueError:
+            pass
+    out["p1"] = state == "dead" and _f(out.get("hours")) >= RC_DEAD_P1_HOURS
+    return out
+
+
+def scheduled_tasks(today: Optional[str] = None) -> dict:
     try:
         tasks = _ps_json(TASKS_PS)
     except Exception as e:
         return {"error": f"task query failed: {e}"}
+    today = today or datetime.now(ET).date().isoformat()
     prev = _load_json(os.path.join(REVIEW_DIR, "task_state.json"), {}) or {}
     failing, disabled, running = [], [], []
     now_state = {}
@@ -1721,9 +1832,16 @@ def scheduled_tasks() -> dict:
             continue
         if code not in OK_TASK_CODES:
             p = prev.get(name) or {}
+            chronic = bool(p) and int(_f(p.get("r"))) == code
+            # the day first seen failing with this code, tracked from 11/27; a
+            # streak already running then has no known start (None), not a wrong one
+            since = (p.get("since") if chronic else today)
+            now_state[name]["since"] = since
+            log_path = _task_log(name, t.get("a") or "")
             failing.append({"task": name, "result": code, "hex": hex(code & 0xFFFFFFFF),
-                            "last_run": t.get("l"),
-                            "chronic": bool(p) and int(_f(p.get("r"))) == code})
+                            "last_run": t.get("l"), "chronic": chronic, "since": since,
+                            "log": os.path.basename(log_path) if log_path else None,
+                            "why": _task_why(log_path)})
     _write_json(os.path.join(REVIEW_DIR, "task_state.json"), now_state)
     imm = [n for n in now_state if re.search(r"imm|incentive|portfolio|sync|sms|remote|pvd|cheap", n, re.I)]
     return {"count": len(tasks), "failing": failing, "disabled": sorted(disabled),
@@ -1928,6 +2046,73 @@ def machine_state(day: date) -> dict:
 SINK_NOISE_FLOOR_BYTES = 500_000      # usual day under 0.5 MB: event-driven, size is not health
 _SINK_FILE = re.compile(r"([a-z][a-z0-9_]*?)_(\d{4}-\d{2}-\d{2})(?:_[A-Za-z0-9.]+)?\.(?:jsonl|csv)$")
 
+# Sinks the bot writes only when an event happens, each with the bot-log line it
+# writes beside every such row: (literal to find, regex the line must match,
+# what the event is). R-261126-06: ws_cand was called MISSING for 11/26, a day
+# with no candidate-breaker trip in the log; it wrote 7 rows for 11/27's 7 trips.
+# A missing file is a broken sink only when the bot logged events it never
+# wrote, so a day without the file is "quiet" when the log has none. The
+# startup banners ("candidate breaker (2026-11-15): on -- ...") don't count.
+EVENT_SINK_MARKERS = {
+    "ws_cand": (b"candidate breaker (", re.compile(rb"candidate breaker \((?:on|dry)\): "),
+                "candidate-breaker trips"),
+    "ws_group": (b"group breaker (", re.compile(rb"group breaker \((?:on|dry)\): "),
+                 "group-breaker trips"),
+    "ws_sweep": (b"sweep breaker (", re.compile(rb"sweep breaker \((?:on|dry|control|exempt)\): "),
+                 "sweep-breaker trips"),
+}
+
+
+_LOG_CHUNK = 1 << 24
+
+
+def event_log_counts(u: str, sinks: Iterable[str]) -> Dict[str, int]:
+    """For each sink in EVENT_SINK_MARKERS, the bot-log lines on UTC day `u` of
+    the event it writes a row for. Reads every launch log that can hold the day
+    (launched up to 7 days before, written since its start) in 16 MB chunks,
+    finding the literal first: the day's logs run 100-200 MB."""
+    want = {s: EVENT_SINK_MARKERS[s] for s in sinks if s in EVENT_SINK_MARKERS}
+    out = {s: 0 for s in want}
+    if not want:
+        return out
+    d = date.fromisoformat(u)
+    lo = datetime.combine(d, dtime(0, 0), tzinfo=timezone.utc).timestamp()
+    prefix = u.encode() + b" "
+    for p in sorted(glob.glob(os.path.join(STATUS_DIR, "incentive-mm-*.log"))):
+        m = re.search(r"incentive-mm-(\d{4}-\d{2}-\d{2})\.log$", p)
+        if not m:
+            continue
+        fd = date.fromisoformat(m.group(1))
+        try:
+            if fd > d or fd < d - timedelta(days=7) or os.path.getmtime(p) < lo:
+                continue
+            fh = open(p, "rb")
+        except OSError:
+            continue
+        with fh:
+            tail = b""
+            while True:
+                chunk = fh.read(_LOG_CHUNK)
+                if not chunk:
+                    body, tail = tail, b""
+                else:
+                    buf = tail + chunk
+                    cut = buf.rfind(b"\n") + 1
+                    body, tail = buf[:cut], buf[cut:]
+                for s, (lit, rx, _what) in want.items():
+                    i = body.find(lit)
+                    while i >= 0:
+                        ls = body.rfind(b"\n", 0, i) + 1
+                        le = body.find(b"\n", i)
+                        le = len(body) if le < 0 else le
+                        line = body[ls:le]
+                        if line.startswith(prefix) and rx.search(line):
+                            out[s] += 1
+                        i = body.find(lit, le)
+                if not chunk:
+                    break
+    return out
+
 
 def sink_sizes(u: str) -> Dict[str, int]:
     out = defaultdict(int)
@@ -1958,15 +2143,29 @@ def sec_data(day: date) -> dict:
     prefixes = set(SINKS)
     for d in hist.values():
         prefixes |= set(d)
+    # an event-only sink missing on a day it usually writes: did the bot log the
+    # events it writes rows for? (one pass over the day's logs, only when needed)
+    ev_check = [p for p in prefixes if p in EVENT_SINK_MARKERS and not hist[u].get(p)
+                and sum(1 for d in hist if d != u and hist[d].get(p, 0) > 0) >= 10]
+    try:
+        ev_counts = event_log_counts(u, ev_check) if ev_check else {}
+    except Exception:       # a failed log read leaves the plain rule (MISSING) standing
+        ev_counts = {}
     for p in sorted(prefixes):
         cur = hist[u].get(p, 0)
         prior = [hist[d].get(p, 0) for d in hist if d != u]
         present = [x for x in prior if x > 0]
         med = statistics.median(present) if present else 0
         ratio = round(cur / med, 2) if med else None
-        status = "ok"
+        status, note = "ok", None
         if cur == 0 and len(present) >= 10:
             status = "MISSING"
+            if p in ev_counts:
+                what = EVENT_SINK_MARKERS[p][2]
+                if ev_counts[p] == 0:
+                    status, note = "quiet", f"no {what} in the bot log that day, so nothing to write"
+                else:
+                    note = f"{ev_counts[p]} {what} in the bot log that day, but no rows written"
         elif (ratio is not None and len(present) >= 5 and med >= SINK_NOISE_FLOOR_BYTES
               and (ratio < 0.3 or ratio > 3.0)):
             # (a sink whose usual day is under the noise floor is event-driven --
@@ -1975,9 +2174,14 @@ def sec_data(day: date) -> dict:
             status = "LOW" if ratio < 0.3 else "HIGH"
         elif cur == 0 and not present:
             continue
-        rows.append({"sink": p, "mb": round(cur / 1e6, 1), "median_mb": round(med / 1e6, 1),
-                     "ratio": ratio, "days_present_14": len(present), "status": status})
-        if status != "ok":
+        row = {"sink": p, "mb": round(cur / 1e6, 1), "median_mb": round(med / 1e6, 1),
+               "ratio": ratio, "days_present_14": len(present), "status": status}
+        if note:
+            row["note"] = note
+        if p in ev_counts:
+            row["events_logged"] = ev_counts[p]
+        rows.append(row)
+        if status not in ("ok", "quiet"):
             alerts.append(p + " " + status)
     doc = ""
     try:
@@ -3493,7 +3697,21 @@ NOT_BOT_FILES = ("imm_dashboard.py", "imm_review.py", "send_imm_review.py")
 CHANGE_VERDICTS = ("worked", "hurt", "no-effect", "inconclusive", "extend")
 CHANGE_METRICS = ("net", "rew", "pnl", "fills", "cts", "rest")
 _MONEY = ("net", "rew", "pnl")
-_AGG_KEYS = ("rew", "pnl", "fills", "cts", "rest", "mt", "mt_cts")
+_AGG_KEYS = ("rew", "pnl", "fills", "cts", "rest", "mt", "mt_cts", "m5", "m5_cts")   # append only: readers index 0-4
+
+# SINCE IT WENT LIVE (R-261126-07; Jack 2026-11-27: "fix these"): the readouts
+# above wait 7 full days, and the early warnings need 2 days after the live
+# day. Neither ever looks at the live day itself. On 11/26 Goodreads lost -$236
+# on the afternoon four changes went live, and it was found by hand. Every
+# change live in the last SINCE_LIVE_DAYS ET days is read from its live day: its
+# scope's whole ET days since, against the scope's usual day (the SINCE_LIVE_BASE
+# days before). IMM_REVIEW_SINCE_LIVE=0 turns it off.
+SINCE_LIVE_DAYS = 3
+SINCE_LIVE_BASE = 7
+SINCE_LIVE_FLAG_USD = 50.0           # flag: net since live a $50+ loss AND $50+ under the usual
+SINCE_LIVE_FLAG_MT_C = -10.0         # ... or a to-date mark-out of -10c a contract or worse
+SINCE_LIVE_MIN_CTS = 20.0            # ... on at least this many contracts
+SINCE_LIVE_SHOW = 15
 _KX_RX = re.compile(r"\bKX[A-Z0-9]{2,}\b")
 _WAVE_NAME_RX = re.compile(r"\bw\d{4}-[a-z0-9][a-z0-9-]*[a-z0-9]\b")
 _IMPORT_RX = re.compile(r"^[ \t]*(?:from[ \t]+([A-Za-z_]\w*)[ \t.]|import[ \t]+([A-Za-z_][\w \t,.]*))", re.M)
@@ -4178,6 +4396,95 @@ def _split_day(it: dict) -> Optional[date]:
     return datetime.fromtimestamp(it["live_at"], ET).date() if it.get("live_at") else None
 
 
+def _at_risk(pos: float, mark_c: float) -> float:
+    """$ a position can still lose from its mark: a long YES down to 0, a short
+    YES (pos < 0) up to 100."""
+    return abs(pos) * ((mark_c if pos > 0 else 100.0 - mark_c) / 100.0)
+
+
+def since_live(day: date, st: Dict[str, dict], live: Dict[str, dict], universe: set,
+               wave_events: Optional[dict] = None) -> dict:
+    """Every change live in the last SINCE_LIVE_DAYS ET days (to `day`), read
+    from its live day. Its scope's whole ET days since, the live day included
+    (that day also holds the hours before the change), against the scope's
+    usual day: the mean of the SINCE_LIVE_BASE days before. Changes live the
+    same ET day on the same scope share a row, whatever their metric (the day
+    archive cannot tell them apart). Whole-book changes are counted, not read.
+    Flagged "losing" when the scope lost SINCE_LIVE_FLAG_USD+ since live AND
+    did that much worse than its usual: a big family's daily swing alone does
+    not flag. Flagged "picked off" on a to-date mark-out of SINCE_LIVE_FLAG_MT_C
+    or worse. Rewards MODELLED, trading MEASURED at the last trade. An early
+    look for step 7, not a test: no p. Read-only."""
+    lo = day - timedelta(days=SINCE_LIVE_DAYS - 1)
+    groups: Dict[str, dict] = {}
+    for k, it in live.items():
+        sp = _split_day(it)
+        if not sp or not (lo <= sp <= day):
+            continue
+        sc = it.get("scope") or {"book": True}
+        g = groups.setdefault(f"{sp.isoformat()}|{scope_key(sc)}",
+                              {"split": sp, "scope": sc, "metric": it.get("metric") or "net", "keys": []})
+        g["keys"].append(k)
+    rows, n_book, end_rows = [], 0, None
+    for gk, g in sorted(groups.items()):
+        g["keys"].sort(key=lambda k: _f(st[k].get("live_at")))
+        sc = g["scope"]
+        if sc.get("book"):
+            n_book += len(g["keys"])
+            continue
+        sp = g["split"]
+        base = [(sp - timedelta(days=i)).isoformat() for i in range(SINCE_LIVE_BASE, 0, -1)]
+        since = [(sp + timedelta(days=i)).isoformat() for i in range((day - sp).days + 1)]
+        match = scope_matcher(sc, universe, wave_events)
+        rb, _hb = _scope_rows(match, base)
+        ra, ha = _scope_rows(match, since)
+        if not ra:
+            continue
+        n = len(ra)
+        usual = (sum(r["net"] for r in rb) / len(rb)) if rb else 0.0
+        usual_out = (sum(r["book_net"] - r["net"] for r in rb) / len(rb)) if rb else 0.0
+        net = sum(r["net"] for r in ra)
+        out_net = sum(r["book_net"] - r["net"] for r in ra)
+        mt, mt_cts = sum(r["mt"] for r in ra), sum(r["mt_cts"] for r in ra)
+        m5, m5_cts = sum(r["m5"] for r in ra), sum(r["m5_cts"] for r in ra)
+        mt_c = cpc(mt, mt_cts)
+        big = None
+        if end_rows is None:        # the last day's positions, read once
+            blob = load_archive(day.isoformat())
+            end_rows = list(market_rows(blob)) if blob else []
+        for t, v in end_rows:
+            pos, mk = v.get("pos1"), v.get("mk1")
+            if pos in (None, 0) or mk is None or not match(series_of(t), event_of(t)):
+                continue
+            risk = _at_risk(_f(pos), _f(mk))
+            if big is None or risk > big["at_risk"]:
+                big = {"ticker": t, "pos": _f(pos), "mark_c": _f(mk), "at_risk": round(risk, 2)}
+        live_at = min(st[k]["live_at"] for k in g["keys"])
+        s0, e0 = et_bounds(sp)
+        flags = []
+        excess = net - usual * n
+        if net <= -SINCE_LIVE_FLAG_USD and excess <= -SINCE_LIVE_FLAG_USD:
+            flags.append("losing")
+        if mt_c is not None and mt_c <= SINCE_LIVE_FLAG_MT_C and mt_cts >= SINCE_LIVE_MIN_CTS:
+            flags.append("picked off")
+        rows.append({
+            "keys": g["keys"], "live": et_str(live_at), "split": sp.isoformat(),
+            "live_share": round(max(0.0, min(1.0, (e0 - live_at) / max(1.0, e0 - s0))), 2),
+            "scope": scope_label(sc), "metric": g["metric"], "days": n, "new": not any(r["markets"] for r in rb),
+            "net": round(net, 2), "rew": round(sum(r["rew"] for r in ra), 2),
+            "pnl": round(sum(r["pnl"] for r in ra), 2), "usual_day": round(usual, 2),
+            "vs_usual": round(excess, 2), "outside_vs_usual": round(out_net - usual_out * n, 2),
+            "fills": int(sum(r["fills"] for r in ra)), "cts": round(sum(r["cts"] for r in ra), 1),
+            "m5_c": cpc(m5, m5_cts), "mt_c": mt_c, "mt_cts": round(mt_cts, 1),
+            "rest_day": round(sum(r["rest"] for r in ra) / n, 0), "markets": int(max(r["markets"] for r in ra)),
+            "series_hit": len(ha), "largest": big, "flags": flags,
+            "subjects": [(st[k].get("subject") or "")[:120] for k in g["keys"]][:4],
+            "ids": sorted({i for k in g["keys"] for i in st[k].get("ids") or []})})
+    rows.sort(key=lambda r: (not r["flags"], r["vs_usual"]))
+    return {"rows": rows[:SINCE_LIVE_SHOW], "n": len(rows), "flagged": sum(1 for r in rows if r["flags"]),
+            "book_wide": n_book, "days": SINCE_LIVE_DAYS, "from": lo.isoformat()}
+
+
 def _horizon(it: dict) -> int:
     return int(_f(it.get("horizon")) or REGISTRY_DAYS)
 
@@ -4483,6 +4790,12 @@ def sec_registry(day: date, now: Optional[float] = None) -> dict:
                           "delta": dv, "t": t, "supply_ratio": r.get("supply_ratio"),
                           "outside_delta": (r.get("outside") or {}).get("delta")})
     warns.sort(key=lambda w: w["delta"])
+    sl: dict = {}
+    if os.environ.get("IMM_REVIEW_SINCE_LIVE", "1") != "0":
+        try:
+            sl = since_live(day, st, live, universe, we)
+        except Exception as e_:      # never cost the registry section its readouts
+            sl = {"error": f"{type(e_).__name__}: {e_}"}
     went = sorted((it for it in st.values() if it.get("live_at") and s <= it["live_at"] < e),
                   key=lambda it: it["live_at"])
     went_rows = [{"key": it["key"], "at": et_str(it["live_at"]), "kind": it.get("kind"),
@@ -4502,7 +4815,7 @@ def sec_registry(day: date, now: Optional[float] = None) -> dict:
             # one call per cluster: a readout of the same money as another is listed, not counted
             "readout_calls": dict(Counter(r["call"] for r in readouts if not r.get("same_money_as"))),
             "n_merged": sum(1 for r in readouts if r.get("same_money_as")),
-            "warnings": warns[:10], "in_window": len(window),
+            "warnings": warns[:10], "in_window": len(window), "since_live": sl,
             "next_due": sorted(nxt.items())[:3],
             "not_live": [{"key": it["key"], "at": et_str(_f(it.get("ct"))), "kind": it.get("kind"),
                           "subject": it.get("subject")} for it in pend if _f(it.get("ct")) >= cutoff][:15],
@@ -4599,12 +4912,43 @@ def _supply(day_iso: str, series_rx) -> float:
     return tot
 
 
+MEASURE_SPLIT_DAY = ("auto", "after", "out")
+
+
 def measure(pattern: Optional[str], family: Optional[str], split: str,
-            before: int = 7, after: int = 7) -> dict:
-    split_ts = _ts_of(split if "T" in split else split + "T00:00:00-05:00")
-    if split_ts is None:
+            before: int = 7, after: int = 7, split_day_mode: str = "auto") -> dict:
+    """Before/after on the day archive for a selector, split at `split`.
+
+    The split day (R-261126-05). A plain date is ambiguous: the change may have
+    gone live mid-day. So by default that day is held out of both windows. It
+    is always shown on its own under "split_day", so it is never invisible
+    (on 11/27, measure printed "after: days 0" for the day Goodreads lost
+    -$236). The split day counts as AFTER when:
+      - the split is an explicit 00:00 ET;
+      - the scope has no market in an archived before window (it began that
+        day, so nothing from before the change is mixed in);
+      - or split_day_mode is "after".
+    "out" always holds it out. A window whose days hold no market of the
+    scope says so: its zeros mean no exposure, not a measured zero.
+
+    A bare time (2026-11-26T15:19) is ET, like every time the review writes.
+    Before 11/27 it was read as UTC, five hours early; a Z or an offset is
+    still honoured."""
+    if split_day_mode not in MEASURE_SPLIT_DAY:
+        raise SystemExit("bad --split-day (auto, after or out)")
+    timed = "T" in split
+    try:
+        if timed:
+            d0 = datetime.fromisoformat(split[:-1] + "+00:00" if split.endswith("Z") else split)
+            if d0.tzinfo is None:
+                d0 = d0.replace(tzinfo=ET)
+        else:
+            d0 = datetime.combine(date.fromisoformat(split), dtime(0, 0), tzinfo=ET)
+    except ValueError:
         raise SystemExit("bad --split")
-    split_day = datetime.fromtimestamp(split_ts, ET).date()
+    sdt = d0.astimezone(ET)
+    split_day = sdt.date()
+    at_midnight = timed and (sdt.hour, sdt.minute, sdt.second) == (0, 0, 0)
     rx = re.compile(pattern) if pattern else None
 
     def match(t: str) -> bool:
@@ -4618,8 +4962,8 @@ def measure(pattern: Optional[str], family: Optional[str], split: str,
         return family_of(s)[0].lower() == (family or "").lower()
 
     days = archive_days()
+    sd_iso = split_day.isoformat()
     pre = [d for d in days if split_day - timedelta(days=before) <= date.fromisoformat(d) < split_day]
-    post = [d for d in days if split_day < date.fromisoformat(d) <= split_day + timedelta(days=after)]
     hist = os.path.exists(os.path.join(STATUS_DIR, "program_history.jsonl"))
 
     def per_day(ds):
@@ -4631,43 +4975,72 @@ def measure(pattern: Optional[str], family: Optional[str], split: str,
             # every key present on an idle day too: summ() reads fills / rest / mt
             # directly (the 11/26 headless run's finding: measure died on an idle-day scope)
             a = defaultdict(float, {k: 0.0 for k in SUM_KEYS})
+            tick = set()
             for t, v in market_rows(b):
                 if match(t):
+                    tick.add(t)
                     for k in SUM_KEYS:
                         a[k] += _f(v.get(k))
             a["net"] = a["rew"] + a["pnl"]
             a["supply"] = _supply(d, ser_match) if hist else 0.0
+            a["tickers"] = tick
             out.append((d, dict(a)))
         return out
 
-    a, b = per_day(pre), per_day(post)
+    a = per_day(pre)
+    sd_rows = per_day([sd_iso]) if sd_iso in days else []
+    if split_day_mode == "after" or at_midnight:
+        counted, why = "after", ("the split is 00:00 ET" if at_midnight else "--split-day after")
+    elif split_day_mode == "out":
+        counted, why = "out", "--split-day out"
+    elif a and not any(r["tickers"] for _, r in a):
+        counted, why = "after", ("the scope has no market in the before window, so nothing from before "
+                                 "the change is mixed into its first day")
+    else:
+        counted, why = "out", ("a date split may be mid-day, so the day mixes before and after; pass "
+                               "--split-day after, or the live time as --split DATE THH:MM (ET)")
+    if counted == "after":
+        post = [d for d in days if split_day <= date.fromisoformat(d) < split_day + timedelta(days=after)]
+    else:
+        post = [d for d in days if split_day < date.fromisoformat(d) <= split_day + timedelta(days=after)]
+    b = per_day(post)
 
     def summ(rows):
         if not rows:
-            return {"days": 0}
+            return {"days": 0, "note": "no archived ET day in this window"
+                    + (f" (the archive ends {days[-1]})" if days else "")}
         n = len(rows)
         net = [r["net"] for _, r in rows]
         sup = sum(r.get("supply", 0.0) for _, r in rows)
         rew = sum(r["rew"] for _, r in rows)
-        return {"days": n, "rew_day": round(rew / n, 2),
+        mk = set().union(*(r["tickers"] for _, r in rows))
+        out_ = {"days": n, "markets": len(mk), "rew_day": round(rew / n, 2),
                 "pnl_day": round(sum(r["pnl"] for _, r in rows) / n, 2),
                 "net_day": round(sum(net) / n, 2), "net_sd": round(statistics.pstdev(net), 2) if n > 1 else None,
                 "fills_day": round(sum(r["fills"] for _, r in rows) / n, 1),
                 "rest_day": round(sum(r["rest"] for _, r in rows) / n, 0),
                 "mt_c": cpc(sum(r.get("mt", 0) for _, r in rows), sum(r.get("mt_cts", 0) for _, r in rows)),
                 "rew_per_supply": round(rew / sup * 1e6, 4) if sup > 0 else None}
+        if not mk:
+            out_["note"] = "no market of the scope in these days: its zeros are no exposure, not a measured zero"
+        return out_
 
     sa, sb = summ(a), summ(b)
-    out = {"selector": pattern or ("family=" + str(family)), "split": split,
+    sd = {"day": sd_iso, "counted": counted, "why": why}
+    sd.update(summ(sd_rows) if sd_rows else {"days": 0, "note": "the split day is not archived (yet)"})
+    out = {"selector": pattern or ("family=" + str(family)), "split": split, "split_day": sd,
            "before": sa, "after": sb, "basis": "before/after, not causal; rew MODELLED, pnl MEASURED"}
     if sa.get("days") and sb.get("days"):
         out["delta_net_day"] = round(sb["net_day"] - sa["net_day"], 2)
+        if not sa.get("markets"):
+            out["delta_note"] = "the scope had no market before: the delta is the scope's own net"
         va = [r["net"] for _, r in a]
         vb = [r["net"] for _, r in b]
         if len(va) > 1 and len(vb) > 1:
             se = math.sqrt(statistics.pvariance(va) / len(va) + statistics.pvariance(vb) / len(vb))
             out["t_stat"] = round(out["delta_net_day"] / se, 2) if se > 0 else None
     out["daily"] = {"before": [(d, round(r["net"], 2)) for d, r in a],
+                    "split_day": [(d, round(r["net"], 2)) for d, r in sd_rows],
                     "after": [(d, round(r["net"], 2)) for d, r in b]}
     return out
 
@@ -5034,9 +5407,29 @@ def render_evidence(ev: dict) -> str:
             a(f"Scheduled tasks: {tk['error']}")
         else:
             a(f"Scheduled tasks: {tk.get('count')} KL tasks, {tk.get('running')} running; failing: " + (
-                "; ".join(f"{x['task']} {x['hex']} (last {x['last_run']}{', chronic' if x['chronic'] else ''})"
-                          for x in tk.get("failing") or []) or "none"))
+                "; ".join(f"{x['task']} {x['hex']} (last {x['last_run']}"
+                          + ((", chronic, failing since " + x["since"] if x.get("since")
+                              else ", chronic, start unknown (before 11/27's tracking)") if x["chronic"] else "")
+                          + ")" for x in tk.get("failing") or []) or "none"))
+            for x in tk.get("failing") or []:
+                if x.get("why"):
+                    a(f"- {x['task']} says why ({x.get('log')}): {_cell(x['why'], 240)}")
             a(f"Disabled: {', '.join(tk.get('disabled') or []) or 'none'}")
+    rc = sy.get("remote_control") or {}
+    if rc.get("present"):
+        span = (f"since {rc['since']} ET" if rc.get("since_known") else f"at least since {rc.get('since')} ET") + (
+            f" ({_f(rc.get('hours')) / 24:.1f} days)" if rc.get("hours") is not None else "")
+        if rc.get("login") == "dead":
+            a(f"**Remote Control (Jack's way in from his phone): the claude login is DEAD {span}**; host process "
+              f"{rc.get('host') or '?'}; last check {rc.get('last_check')} ET: {_cell(rc.get('why'), 200)}. The box "
+              "cannot be reached from his phone. Only Jack can fix it: `claude auth login` in a terminal on the PC "
+              f"(P1 once over {RC_DEAD_P1_HOURS:.0f} h; Jack 10/12: \"ensure that im never in a position where i "
+              "cant access\").")
+        else:
+            a(f"Remote Control: login {rc.get('login')} {span}; host process {rc.get('host') or '?'}; "
+              f"last check {rc.get('last_check')} ET.")
+    elif rc.get("error"):
+        a(f"Remote Control: status unreadable ({rc['error']})")
     if sy.get("task_logs"):
         a("Task-log error lines (dated the day or this morning):")
         for t in sy["task_logs"]:
@@ -5096,7 +5489,10 @@ def render_evidence(ev: dict) -> str:
         a("| Sink | MB | 14d median MB | ratio | days present | status |")
         a("|---|---:|---:|---:|---:|---|")
         for x in dh["sinks"]:
-            a(f"| {x['sink']} | {x['mb']} | {x['median_mb']} | {x['ratio']} | {x['days_present_14']} | {x['status']} |")
+            st_ = x['status'] + (f" ({x['note']})" if x.get("note") else "")
+            a(f"| {x['sink']} | {x['mb']} | {x['median_mb']} | {x['ratio']} | {x['days_present_14']} | {st_} |")
+        a("An event-only sink (" + ", ".join(sorted(EVENT_SINK_MARKERS)) + ") is checked against the bot log: "
+          "a day without its file is 'quiet' when the log has none of its events, MISSING when it has some.")
     if dh.get("undocumented"):
         a(f"Sinks on disk not mentioned in IMM_LOGGING.md: {', '.join(dh['undocumented'])}")
     # 8 changes
@@ -5410,6 +5806,48 @@ def _cell(s, n: int = 100) -> str:
     return _one_line(str(s or "").replace("|", "/"), n)
 
 
+def _pos_str(big: Optional[dict]) -> str:
+    if not big:
+        return "none"
+    return f"{big['ticker']} {big['pos']:+,.0f} @ {big['mark_c']:.0f}c ({usd(big['at_risk'], False)} at risk)"
+
+
+def render_since_live(sl: dict, a) -> None:
+    if not sl:
+        return
+    if sl.get("error"):
+        a(f"**Since it went live:** ERROR {sl['error']}")
+        return
+    a(f"**Since it went live** ({sl.get('n')} changes live since {sl.get('from')}, read from their live day; "
+      f"{sl.get('flagged')} flagged; {sl.get('book_wide')} whole-book changes not read). Each row is the scope's "
+      f"whole ET days since it went live, the live day included (it also holds the hours before the change), "
+      f"against its usual day (the {SINCE_LIVE_BASE} days before). LOSING: it lost "
+      f"{usd0(SINCE_LIVE_FLAG_USD, False)}+ since live and did that much worse than usual. PICKED OFF: a to-date "
+      f"mark-out of {SINCE_LIVE_FLAG_MT_C:.0f}c or worse on {SINCE_LIVE_MIN_CTS:.0f}+ contracts. A live day mostly "
+      "before the change (a small share) dilutes its row; the next run adds the first full day. 'Outside' is the "
+      "rest of the book: when it fell as much, the day fell, not the change. An early look, not a test: judge "
+      "each flagged row today (step 7), and file the revert when the mechanism is clear.")
+    rows = sl.get("rows") or []
+    if not rows:
+        a("- none")
+        return
+    a("| Keys | Live (ET) | Scope | Days | Net since | Usual/day | vs usual | Outside vs usual | Fills / cts | "
+      "Mark-out 5m / to date | $ resting/day | Largest position | Flag |")
+    a("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+    for r in rows:
+        share = "" if r.get("live_share") in (None, 1.0) else f" (last {r['live_share']:.0%} of the day)"
+        a(f"| {', '.join(r['keys'])[:60]} | {r['live']}{share} | {_cell(r['scope'], 50)}{' (new)' if r.get('new') else ''} | "
+          f"{r['days']} | {usd(r['net'])} | {usd(r['usual_day'])} | {usd(r['vs_usual'])} | "
+          f"{usd(r['outside_vs_usual'])} | {r['fills']} / {r['cts']:,.0f} | {_c(r.get('m5_c'))} / {_c(r.get('mt_c'))} | "
+          f"{usd0(r['rest_day'], False)} | {_cell(_pos_str(r.get('largest')), 70)} | "
+          f"{', '.join(r['flags']).upper() or 'ok'} |")
+    for r in rows:
+        if r["flags"]:
+            a(f"- {', '.join(r['keys'])}: {' / '.join(_cell(s, 100) for s in r.get('subjects') or [])}"
+              f"{' (ledger ' + ', '.join(r['ids']) + ')' if r.get('ids') else ''}; rewards {usd(r['rew'])}, trading "
+              f"{usd(r['pnl'])} since live")
+
+
 def render_registry(rg: dict, a) -> None:
     a(f"\n## 12. Change registry (every IMM change, measured at {REGISTRY_DAYS} days)")
     if not rg:
@@ -5514,6 +5952,7 @@ def render_registry(rg: dict, a) -> None:
             a(f"- {', '.join(w['keys'])} live {w['split']} ({_cell(w['scope'], 50)}): {w['metric']} "
               f"{usd(w['before'])} -> {usd(w['after'])}/day over {w['after_days']} days (t {_fmt(w['t'])}); "
               f"supply x {_fmt(w.get('supply_ratio'))}; outside {usd(w.get('outside_delta'))}: {_cell(w['subject'], 100)}")
+    render_since_live(rg.get("since_live") or {}, a)
     nd = ", ".join(f"{d} ({n})" for d, n in rg.get("next_due") or [])
     a(f"In their window: {rg.get('in_window')} changes; next readouts: {nd or 'none scheduled'}.")
     nl = rg.get("not_live") or []
@@ -5681,6 +6120,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     m.add_argument("--split", required=True)
     m.add_argument("--before", type=int, default=7)
     m.add_argument("--after", type=int, default=7)
+    m.add_argument("--split-day", choices=MEASURE_SPLIT_DAY, default="auto",
+                   help="where the split day counts: auto (after for a scope new that day or an explicit "
+                        "00:00, else held out of both windows), after, out; it is always shown on its own")
     a = ap.parse_args(argv)
 
     if a.cmd == "collect":
@@ -5699,7 +6141,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.cmd == "measure":
         if not a.pattern and not a.family:
             ap.error("measure needs --pattern or --family")
-        print(json.dumps(measure(a.pattern, a.family, a.split, a.before, a.after), indent=1))
+        print(json.dumps(measure(a.pattern, a.family, a.split, a.before, a.after, a.split_day), indent=1))
         return 0
     if a.cmd == "watch":
         if a.action == "list":
