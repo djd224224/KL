@@ -545,6 +545,17 @@ def health_checks(ev: dict) -> List[Tuple[str, str]]:
             out.append((f"Models: {c['beats the market']} beat the market", "green"))
         else:
             out.append(("Model scorecard accumulating", "gray"))
+    al = ev.get("allocation") or {}
+    if al and not al.get("error"):   # where the next dollar of size goes (imm_allocation.py)
+        ps = al.get("proposals") or []
+        if ps:
+            out.append((f"Allocation: {len(ps)} move{'s' if len(ps) != 1 else ''}, "
+                        f"+${sum(rv._f(p.get('p50')) for p in ps):,.0f}/day modelled", "green"))
+        elif al.get("experiment"):
+            out.append((f"Allocation: no move clears the bar; {al['experiment']['family']} add experiment",
+                        "gray"))
+        else:
+            out.append(("Allocation: no move clears the bar", "gray"))
     bk = ((ev.get("moat") or {}).get("backup")) or {}
     if bk.get("state"):           # the moat's BigQuery copy (R-261124-20)
         s = bk["state"]

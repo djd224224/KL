@@ -206,8 +206,37 @@ Day D is the prior ET day, 00:00 to 24:00 America/New_York. Its folder is `run-l
 - **Fills against the model** (20%+ of a family's contracts at 3c+ against its own fair): the gate or lead tolerance lets the bot trade against what it believes. Raise it as a finding with the worst markets the section lists.
 - **Convergence** (the mid moving toward the model over the day) is the early signal while settlements accumulate. A slope near zero or negative for a week means the market ignores the model, or knows better.
 - **"accumulating" is the honest state for weeks.** Daily families (weekend rain, crypto and FX events) settle fastest; monthly ones take a month. Never call a model on fewer than 8 settled events.
-- **The other 15 fair files** (Vercel, Carbon Arc, OpenRouter, the temperature grids...) have shapes of their own. They are archived raw (`fair_raw_*.jsonl.gz`) until someone writes their extractor. Propose extractors in the order of the money those families trade (a `compound` answer).
+- **The raw-shaped fair files:** ten are priced by the bot's own functions since 0f537e1: Carbon Arc, Vercel (the model, not the blend), OpenRouter tokens and share, the KXRAIN dailies, the temperature dailies and periods, YouTube #1 and weekly. See IMM_LOGGING.md, "The bot's view".
+  - Still raw only, in `fair_raw_*.jsonl.gz`: datacenter (a count gate, no fair), gasbuddy (retired), Carbon Arc's array shadow, and the per-city rain dailies.
+  - A `bot view <family> FAILED` line in the fair-marks task log means that family went unmarked. It is P2 (kind `ops`) the first day, P1 if it persists.
 - **The snapshotter stale or never run** (the section's first line) is P1 (kind `ops`): no model history accrues while it is down.
+
+**The allocation (evidence section 14): where should the next dollar of size go?** Size is set by hand, one family at a time, on a family's average return. Section 14 measures the MARGINAL return and models one step per family on it:
+- **The margin** comes from the change registry: every readout in which a scope's resting capital moved 1.3x or more with steady supply, adds and cuts apart.
+- **The model** is a step per family: cut x0.67 or add x1.5. Rewards follow the share model, trading moves in proportion, each is calibrated on that margin, and the result is bootstrapped.
+- **Read the measured margin first.** The 11/26 back-fill:
+  - adds (21 readouts, +$927k resting) earned -$511/day of rewards against +$2,686 predicted from their averages;
+  - cuts lost rewards and saved trading almost exactly as predicted.
+
+  So the model gives added size the adds' calibration: about nothing. Quote the section's own numbers, which move as readouts accrue.
+- **A PROPOSAL** clears the bar when P10 gain > 0, P50 >= $5/day, the family has 10+ days of data and no change touched it in 7 days. Before filing one, check:
+  1. **The family's recent history:** section 12's changes, the memory notes and git log. A regime change makes the 30-day history the wrong guide. On 11/25, for example, the Carbon Arc unwinds were turned off (a83dab0).
+  2. **Jack's sizing rules:** size to target, not past it. On 11/19, trimming FX cost more than it freed.
+  3. **What the step is in the bot:** the knob that sets the family's size. That is SERIES_OVERRIDES `size_mult` through the launcher's `IMM_*_SIZE_MULT`. `env_overrides.txt` takes `*_SIZE_MULT` only, and there are the family's own caps.
+
+  Then file it as kind `allocation` with:
+  - `impact.usd_day` = the p50, `impact.basis` modelled, confidence from P(gain);
+  - a `plan` naming the exact knob, its value and the revert;
+  - `expect`, pre-registering the 7-day readout (the family's net $/day change).
+
+  At most one allocation decision a day. It competes for the 3 cards on $/day x confidence like any other finding.
+- **An ADD EXPERIMENT** is the only add to offer while the adds' measured margin is at or below zero. It is an x1.25 step on the best-measured family (net per $1k p10 > 0, t >= 2, unchanged for 7 days). File it as kind `experiment`, with:
+  - a stop rule: revert if the family's net per $1k is under its p10 for 3 straight days;
+  - its expectation stated as a range;
+  - a plain statement that past adds earned about nothing at the margin.
+- **WAITS:** a family that clears the bar but changed in the last 7 days gets one line and no finding. Read that change out first.
+- **"None clears the bar" is the usual and honest state.** Never manufacture a move. When the measured margin moved materially, give it a line in "The moat" in review.md.
+- **Losses from a known one-off** (an unwind, a wave's last day, a bad print) are not a reason to cut. Check whether the one-off sits in the window before proposing.
 
 **Step 8. Compound: what else should this review be doing?** Ask it in writing every run, and answer it: *What else should this review be doing, daily, to compound and improve itself?* (Jack 2026-11-26). Answer from evidence section 11 and from this run's own experience, never from a generic list: every answer cites a fact. Go through the lenses briefly; most days one or two produce something.
 1. **Misses.** "Landed on the day without a ledger id" and "Memory notes other sessions wrote" are what other sessions and Jack found, fixed or decided. For each one that fixed or diagnosed a defect or loss that existed before D:
@@ -398,7 +427,7 @@ So write the short fields for a phone:
 
 Round to whole dollars. Write "modelled" or "measured" once per number, not per sentence.
 
-Fingerprints are stable keys, `kind:short-slug`, the same every day for the same problem. That is how the ledger knows it has seen something before. `kind`: bug / ops / data / missed / loss / strategy / experiment / review. `severity`: P0 to P3 (section 6). `impact.basis`: measured / modelled / n/a. To update an existing item, reuse its fingerprint, or set `ledger_id`. Closure statuses: closed / fixed-elsewhere / wontfix / reverted / false-positive.
+Fingerprints are stable keys, `kind:short-slug`, the same every day for the same problem. That is how the ledger knows it has seen something before. `kind`: bug / ops / data / missed / loss / strategy / experiment / review / allocation (a size move from section 14). `severity`: P0 to P3 (section 6). `impact.basis`: measured / modelled / n/a. To update an existing item, reuse its fingerprint, or set `ledger_id`. Closure statuses: closed / fixed-elsewhere / wontfix / reverted / false-positive.
 
 The `compound` entries take the same fields as a finding plus `gap` (the fact that prompted it), `change`, `self_apply` (watch / lesson / playbook, or null when it needs Jack) and `applied` (what you did, for a self-applied one). Their email block reads under "Making the review better".
 

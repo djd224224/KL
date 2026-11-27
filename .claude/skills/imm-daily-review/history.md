@@ -11,6 +11,14 @@ Standing decisions, then dated lessons, newest last. Sessions promote durable li
 - **The moat (11/25):** "the skill's daily iterative process should lead to compounding and building a moat on data, analysis, and process that allows it to continually get better even as the markets get more competitive".
   - Built the same day: moat/family_daily.csv (with pool share from the cycle log), priors.json, the edge watch, missed markets netted by family tax, the review's self-calibration, and the playbook.
   - The durable backup (R-261124-20) was a decision for Jack. The wedged sync was fixed the same morning, then the review landed on main and the 04:30 task was registered.
+- **Capital allocation (11/26, evidence section 14).** Asked "what else", the review showed the numbers below, and to "Build the capital-allocation proposal next?" Jack said "Yes, build it".
+  - **The evidence:** 60% of resting capital sat in Elections at $1.22 net per $1k a day, while Rotten Tomatoes made $29.31 on 1.3% (t 3.9).
+  - **The finding that shaped the design:** an average is not a margin.
+    - The registry's 30-day back-fill held 21 readouts where a scope added 1.3x+ capital (+$927k resting). Their averages predicted +$2,686/day of rewards; the measured change was -$511/day.
+    - Over the 6 cuts, rewards and trading moved as the proportional model said (-$604 vs -$632; +$727 vs +$739).
+  - **So the model is asymmetric:** confident about cuts, and an add is a pre-registered experiment until adds measure positive at the margin.
+  - **The loop:** proposals go to moat/allocation.jsonl. Taken ones become `allocation` findings, the registry reads each shipped one out at 7 days, and that readout recalibrates the next proposal.
+  - **The first live run (11/25 data):** no move cleared the bar. The closest was a Carbon Arc cut, whose p10 was -$0.51/day.
 - **The fair-model scorecard (11/26):** Jack asked "is the data im logging improving my algorithm and trading strategy". The audit found:
   - the bot reads back none of the 29 streams it logs;
   - the monitors, the reward calibration and the review's priors reach it only through people;

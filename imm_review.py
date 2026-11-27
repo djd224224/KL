@@ -217,7 +217,9 @@ STATUSES = ("open", "proposed", "approved", "rejected", "deferred", "shipped", "
 # false-positive (11/26): a finding the review got wrong, closed as such, so
 # its precision is a number rather than a lesson buried in a note
 TERMINAL = {"rejected", "verified", "closed", "fixed-elsewhere", "wontfix", "reverted", "false-positive"}
-KINDS = ("bug", "ops", "data", "missed", "loss", "strategy", "experiment", "review")
+# "allocation" (11/26): a size move from evidence section 14, so its realised /
+# predicted ratio is calibrated apart (review_calibration groups by kind)
+KINDS = ("bug", "ops", "data", "missed", "loss", "strategy", "experiment", "review", "allocation")
 
 
 # ---------------------------------------------------------------------------
@@ -4713,6 +4715,11 @@ def collect(day: date, bootstrap_days: int = 14, only: Optional[List[str]] = Non
     # 2026-11-26); IMM_REVIEW_MODELS=0 turns it off
     if want("models") and os.environ.get("IMM_REVIEW_MODELS", "1") != "0":
         ev["models"] = _section("models", sec_models, day)
+    # where the next dollar of size goes, from the family economics (moat, written
+    # above) and the registry's measured margin (imm_allocation.py, Jack
+    # 2026-11-26); IMM_REVIEW_ALLOCATION=0 turns it off
+    if want("allocation") and os.environ.get("IMM_REVIEW_ALLOCATION", "1") != "0":
+        ev["allocation"] = _section("allocation", sec_allocation, day)
     if want("self"):          # last: it reads the other sections' times and the ledger
         ev["self"] = _section("self", sec_self, day, ev)
     ev["secs"] = round(time.time() - t0, 1)
@@ -5164,6 +5171,7 @@ def render_evidence(ev: dict) -> str:
     render_self(ev.get("self") or {}, a)
     render_registry(ev.get("registry") or {}, a)
     render_models(ev.get("models") or {}, a)
+    render_allocation(ev.get("allocation") or {}, a)
     a("")
     return "\n".join(L)
 
@@ -5171,6 +5179,89 @@ def render_evidence(ev: dict) -> str:
 def sec_models(day: date) -> dict:
     import imm_fair_scorecard  # here, not at the top: it imports this module
     return imm_fair_scorecard.sec_models(day)
+
+
+def sec_allocation(day: date) -> dict:
+    import imm_allocation  # here, not at the top: it imports this module
+    return imm_allocation.sec_allocation(day)
+
+
+def _q_str(q: Optional[dict]) -> str:
+    """A bootstrap's p50 [p10, p90] in $/day."""
+    if not q:
+        return "n/a"
+    return f"{usd(q.get('p50'))} [{usd(q.get('p10'))}, {usd(q.get('p90'))}]"
+
+
+def render_allocation(al: dict, a) -> None:
+    a("\n## 14. Capital allocation (where the next dollar of size goes)")
+    if not al:
+        a("- not collected (IMM_REVIEW_ALLOCATION=0 turns it off)")
+        return
+    if al.get("error"):
+        a(f"- ERROR: {al['error']}")
+        return
+    w, b, tr = al.get("window") or {}, al.get("book") or {}, al.get("track") or {}
+    ru, stp = al.get("rules") or {}, al.get("steps") or {}
+    a(f"FAMILY ECONOMICS: the {w.get('days')} ET days {w.get('from')} to {w.get('to')} (moat/family_daily.csv); "
+      "rewards MODELLED (the dashboard's estimate), trading MEASURED at the last trade. Book: "
+      f"{usd(b.get('rest'), False)} resting a day, net {usd(b.get('net'))} a day, "
+      f"{_fmt(b.get('net_per_1k'))} net per $1k resting a day. An average overstates what the next dollar "
+      "earns, so:")
+    a(f"THE MARGIN, MEASURED: the change registry's readouts in which a scope's resting $ moved "
+      f"{ru.get('move_min')}x or more with the programs' supply within {ru.get('supply_band')}; the "
+      "proportional prediction from the 7 days before against the 7 days after (before/after, not causal).")
+    for name, label in (("adds", "Adds"), ("cuts", "Cuts")):
+        d = tr.get(name) or {}
+        if not d.get("n"):
+            a(f"- {label}: no readout yet")
+            continue
+        a(f"- {label}: {d['n']} readouts, resting {usd(d.get('d_rest'))} a day. Rewards predicted "
+          f"{usd(d.get('pred_rew'))}, measured {usd(d.get('meas_rew'))} a day; trading predicted "
+          f"{usd(d.get('pred_pnl'))}, measured {usd(d.get('meas_pnl'))}. Marginal net per $1k "
+          f"{_fmt(d.get('marginal_per_1k'))} (their average before: {_fmt(d.get('average_per_1k'))}). "
+          + (f"Calibration used: rewards x{_fmt(d.get('c_rew'))}, trading x{_fmt(d.get('c_pnl'))}."
+             if d.get("calibrated") else "Too few to calibrate: the proportional model stands in."))
+        for m in (d.get("moves") or [])[:3]:
+            a(f"  - {m.get('split')} x{_fmt(m.get('k'))} ({_fmt(m.get('rest_b'), 0)} -> {_fmt(m.get('rest_a'), 0)} "
+              f"resting): rewards {_fmt(m.get('rew_b'), 0)} -> {_fmt(m.get('rew_a'), 0)}, trading "
+              f"{_fmt(m.get('pnl_b'), 0)} -> {_fmt(m.get('pnl_a'), 0)} a day; "
+              + "; ".join(s for s in (m.get("subjects") or []) if s))
+    a(f"THE MODEL (MODELLED): a step on one family, cut x{_fmt(stp.get('cut'))} or add x{_fmt(stp.get('add'))}: "
+      "rewards by the bot's share model (rew x k / (k s + 1 - s), s our pool share), trading in proportion, each "
+      "times its direction's calibration; days and readouts resampled together. Net $/day change, "
+      "p50 [p10, p90]:")
+    rows = al.get("families") or []
+    if rows:
+        a("| Family | Resting share | Net per $1k (p10 to p90) | t | Pool share | Trading c/ct | "
+          "Cut: net $/day | Add: net $/day | Changed in 7 days |")
+        a("|---|---:|---:|---:|---:|---:|---:|---:|---|")
+        for r in rows:
+            nq = r.get("net_per_1k_q") or {}
+            rec = "; ".join(f"{c['day'][5:]} {c['key']}" for c in (r.get("recent") or [])[:2])
+            a(f"| {r['family']} | {_fmt((r.get('rest_share') or 0) * 100, 1)}% | {_fmt(r.get('net_per_1k'))} "
+              f"({_fmt(nq.get('p10'))} to {_fmt(nq.get('p90'))}) | {_fmt(r.get('t'))} | {_fmt(r.get('share'), 3)} | "
+              f"{_fmt(r.get('trade_c'))} | {_q_str(r.get('cut'))} | {_q_str(r.get('add'))} | {rec} |")
+    props = al.get("proposals") or []
+    a(f"PROPOSALS (p10 gain above zero, p50 at least {usd(ru.get('min_gain'))}/day, {ru.get('min_days')}+ days of "
+      f"data, no registered change in the last {ru.get('recent_days')} days):")
+    if not props:
+        a("- none clears the bar today")
+    for p in props:
+        a(f"- {p['kind'].upper()} {p['family']} x{_fmt(p['k'])} ({usd(p.get('capital'))} resting a day): "
+          f"net {usd(p['p50'])}/day [{usd(p['p10'])}, {usd(p['p90'])}], P(gain) {_fmt(p.get('p_gain'), 2)}; "
+          f"net per $1k now {_fmt(p.get('net_per_1k'))}, t {_fmt(p.get('t'))}.")
+    ex = al.get("experiment")
+    if ex:
+        a(f"ADD EXPERIMENT (no add clears the bar; the best-measured family): {ex['family']} x{_fmt(ex['k'])} "
+          f"({usd(ex.get('capital'))} resting a day). Net per $1k {_fmt(ex.get('net_per_1k'))} (p10 "
+          f"{_fmt(ex.get('net_per_1k_p10'))}), t {_fmt(ex.get('t'))}. Modelled: {usd(ex.get('proportional'))}/day "
+          f"if the next dollar earned the average, {usd(ex.get('calibrated'))}/day at the adds' measured "
+          "calibration. Only as a pre-registered experiment with a stop rule.")
+    for c in al.get("waits") or []:
+        r0 = (c.get("recent") or [{}])[0]
+        a(f"- WAITS: {c['kind']} {c['family']} would clear the bar ({usd(c['p50'])}/day), but "
+          f"{r0.get('key')} ({r0.get('day')}: {r0.get('subject')}) changed it: read that change out first.")
 
 
 def render_models(md: dict, a) -> None:
